@@ -1,0 +1,18 @@
+pub mod app_icon;
+pub mod app_pick;
+pub mod autostart;
+pub mod fonts;
+pub mod fullscreen;
+pub mod hotkey;
+pub mod legacy_osd;
+pub mod media;
+pub mod monitors;
+pub mod mouse_wheel;
+pub mod restart;
+pub mod shell;
+pub mod single_instance;
+pub mod sound;
+pub mod sound_icons;
+pub mod system_theme;
+
+pub use single_instance::SingleInstance;

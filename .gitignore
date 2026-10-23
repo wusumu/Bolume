@@ -1,0 +1,19 @@
+# ---- Rust 构建产物 ----
+/target
+
+# ---- 发布产物：exe / zip 走 GitHub Releases，不进仓库 ----
+/dist
+
+# ---- 图标设计稿工作目录（PS/AI 源文件、临时导出的 exe、旧命名副本，约 15MB）----
+/icon
+
+# ---- 根目录散落的旧截图：README 用的是 docs/ 里那两张 ----
+/*.png
+
+# ---- 本机环境（.cargo/config.toml 里有本机的 crates 镜像，换机器要重写）----
+/.cargo/config.toml
+*.log
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

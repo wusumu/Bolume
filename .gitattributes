@@ -1,0 +1,7 @@
+# 统一换行符：仓库里存 LF，Windows 检出时也不改成 CRLF（避免整份 diff 变红）
+* text=auto eol=lf
+
+# 二进制资源
+*.ico binary
+*.png binary
+*.exe binary
