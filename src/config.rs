@@ -1048,7 +1048,9 @@ impl StartupProfile {
 /// rev 59：外观模式默认改成「跟随系统」；强调色空着 = 跟随 Windows 的强调色。
 /// rev 60：「松开滑条时播放提示音」多一个子开关 —— 屏幕提示（OSD）里也响（`release_sound_osd`，默认开）。
 /// rev 61：「按住连续触发」多一个子开关 —— 不理会系统的长按重复（`hotkey_ignore_system_repeat`，默认开）。
-const CONFIG_REV: u32 = 61;
+/// rev 62：面板里的音量条粗细（`panel_bar_thickness`）与圆角（`panel_bar_round`）可调，
+/// 默认 6px / 100%（全圆头），老配置读进来画出来和以前一模一样。
+const CONFIG_REV: u32 = 62;
 
 /// 托盘提示最多几行。
 ///
@@ -2916,6 +2918,13 @@ pub const DEFAULT_FLYOUT_WIDTH: u32 = 384;
 /// 音量面板宽度可调范围（逻辑像素）：再窄行里的名字就全被截没了。
 pub const FLYOUT_WIDTH_RANGE: (u32, u32) = (300, 620);
 
+/// 面板里音量条的默认粗细（逻辑像素），和滑条自己的默认值一致。
+pub const DEFAULT_PANEL_BAR_THICKNESS: u32 = 6;
+/// 面板音量条粗细可调范围（逻辑像素）：比 2 还细就看不见了，比 20 粗会顶到名字上。
+pub const PANEL_BAR_THICKNESS_RANGE: (u32, u32) = (2, 20);
+/// 面板音量条的默认圆角：存「半高的百分之几」，100 = 全圆头（胶囊形）。
+pub const DEFAULT_PANEL_BAR_ROUND: u32 = 100;
+
 /// 托盘右键菜单（自绘）默认最大宽度（逻辑像素）。
 ///
 /// 设备名经常是 `Headphones (Meizu HiFi DAC Headphone Amplifier)` 这种，
@@ -3179,6 +3188,17 @@ pub struct Config {
     /// 亮度面板默认也取同一个宽度（`brightness.width = 0` = 跟随它）。
     pub flyout_width: u32,
 
+    /// 面板里音量条的粗细（逻辑像素）。
+    ///
+    /// 只管**面板**（音量 / 亮度两块），屏幕提示条（OSD）的条高归布局编辑器管。
+    pub panel_bar_thickness: u32,
+
+    /// 面板里音量条的圆角，存「半高的百分之几」：100 = 全圆头（默认），0 = 方角。
+    ///
+    /// 和 OSD 的 `bar_round` 一个口径：存百分比而不是像素，改粗细时圆角跟着一起缩放，
+    /// 才不会出现「条变粗了圆角却还是老样子」的方块感。
+    pub panel_bar_round: u32,
+
     /// 音量面板排版：横向（一路一行）/ 竖向（一路一条推子）。
     pub panel_layout: PanelLayout,
 
@@ -3411,6 +3431,8 @@ impl Default for Config {
             editor_bg: "#000000".to_string(),
             editor_panel_w: 268.0,
             flyout_width: DEFAULT_FLYOUT_WIDTH,
+            panel_bar_thickness: DEFAULT_PANEL_BAR_THICKNESS,
+            panel_bar_round: DEFAULT_PANEL_BAR_ROUND,
             panel_layout: PanelLayout::Horizontal,
             vertical_app_names: false,
             vertical_height: 0,
@@ -3487,6 +3509,18 @@ impl Config {
     pub fn flyout_width(&self) -> f32 {
         self.flyout_width
             .clamp(FLYOUT_WIDTH_RANGE.0, FLYOUT_WIDTH_RANGE.1) as f32
+    }
+
+    /// 面板里音量条的粗细（逻辑像素）：钳进可调范围。
+    pub fn panel_bar_thickness(&self) -> f32 {
+        self.panel_bar_thickness
+            .clamp(PANEL_BAR_THICKNESS_RANGE.0, PANEL_BAR_THICKNESS_RANGE.1)
+            as f32
+    }
+
+    /// 面板里音量条的圆角（逻辑像素）：按「半高 × 百分比」算，不会超过半高。
+    pub fn panel_bar_corner(&self) -> f32 {
+        self.panel_bar_thickness() * 0.5 * (self.panel_bar_round.min(100) as f32 / 100.0)
     }
 
     /// 亮度面板宽度（逻辑像素）：默认跟随音量面板（`brightness.width = 0`）。
@@ -4146,6 +4180,28 @@ mod tests {
         assert_eq!(config.osd.part_color(OsdPart::Percent), "");
         config.osd.set_part_color(OsdPart::Db, "   ".into());
         assert_eq!(config.osd.part_color(OsdPart::Db), "");
+    }
+
+    /// 面板音量条的粗细 / 圆角：默认 6px + 全圆头（和以前画出来的一模一样）。
+    #[test]
+    fn panel_bar_look_defaults_and_clamps() {
+        let config = Config::default();
+        assert_eq!(config.panel_bar_thickness(), 6.0);
+        // 圆角 = 半高 × 100%。
+        assert!((config.panel_bar_corner() - 3.0).abs() < f32::EPSILON);
+
+        // 粗细超范围要夹住；圆角跟着新的半高走，不会超过它。
+        let mut config = Config::default();
+        config.panel_bar_thickness = 99;
+        assert_eq!(config.panel_bar_thickness(), 20.0);
+        assert!((config.panel_bar_corner() - 10.0).abs() < f32::EPSILON);
+        config.panel_bar_round = 0;
+        assert_eq!(config.panel_bar_corner(), 0.0);
+
+        // 老配置没有这两个字段：读进来就是默认值，画出来和以前一样。
+        let old: Config = serde_json::from_str("{\"config_rev\": 61}").unwrap();
+        assert_eq!(old.panel_bar_thickness, DEFAULT_PANEL_BAR_THICKNESS);
+        assert_eq!(old.panel_bar_round, DEFAULT_PANEL_BAR_ROUND);
     }
 
     /// 音量条圆角：默认 100（全圆头，和以前一样），比例钳在 0..=1。

@@ -89,3 +89,25 @@ pub fn settings_page(page: &str) {
         }
     });
 }
+
+/// 用系统默认浏览器打开一个网址（设置页「关于 → 项目主页 / 问题反馈」用）。
+///
+/// 和上面几个一样走后台线程：浏览器的冷启动能停一两秒，
+/// 在 UI 线程里直接调会把窗口卡住（更糟的情况见 `spawn_background` 的注释）。
+pub fn open_url(url: &str) {
+    let url = url.to_string();
+    spawn_background(move || {
+        let url = HSTRING::from(url);
+        let operation = HSTRING::from("open");
+        unsafe {
+            ShellExecuteW(
+                None,
+                &operation,
+                &url,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
+        }
+    });
+}

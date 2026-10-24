@@ -829,6 +829,9 @@ impl Brightness {
             self.drag.clone(),
         )
         .fill(theme::accent())
+        // 粗细 / 圆角跟音量面板同一套：两块面板并排放着，条不能一个粗一个细。
+        .thickness(self.cfg().panel_bar_thickness())
+        .corner(self.cfg().panel_bar_corner())
         .enabled(editable)
         .vertical(vertical)
         .height(SLIDER_HEIGHT)

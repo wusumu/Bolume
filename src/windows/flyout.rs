@@ -3,7 +3,7 @@
 //! 布局高度完全由内容决定，窗口高度与内容高度严格一致，避免顶部出现空白带。
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     path::PathBuf,
     rc::Rc,
@@ -324,6 +324,10 @@ pub struct Flyout {
     activity_ticker: bool,
     /// 当前鼠标悬停的应用 key（长名字悬停滚动用）。
     hovered_name: Rc<RefCell<Option<String>>>,
+    /// 应用图标上的全名提示（悬停 400ms 后挂出来），`None` = 没在显示。
+    hover_tip: Rc<RefCell<Option<HoverTip>>>,
+    /// 提示的请求序号：移开 / 换图标就推一格，晚到的定时器看见序号变了就退场。
+    hover_tip_seq: Rc<Cell<u64>>,
     /// 应用条目右键菜单（窗口坐标），None 表示没打开。
     menu: Rc<RefCell<Option<AppMenu>>>,
     /// 设备切换菜单（窗口坐标），None 表示没打开。
@@ -383,6 +387,29 @@ const DEVICE_MENU_ROW: f32 = 32.0;
 const DEVICE_MENU_WIDTH: f32 = 236.0;
 const DEVICE_MENU_PAD: f32 = 4.0;
 
+/// 鼠标停在应用图标上多久才浮出全名提示。
+///
+/// 400ms 是「确实想看一眼」和「只是路过」的分界：贴着走一圈不会满屏乱闪，
+/// 真要认名字时也不至于等得发躁。
+const HOVER_TIP_DELAY: Duration = Duration::from_millis(400);
+/// 提示条左右内边距、高度（逻辑像素）。
+const HOVER_TIP_PAD: f32 = 7.0;
+const HOVER_TIP_HEIGHT: f32 = 19.0;
+
+/// 悬停提示：鼠标停在应用图标上 400ms 后浮出来的一条完整名字。
+#[derive(Clone)]
+struct HoverTip {
+    name: String,
+    /// 光标位置（窗口坐标），换算成左上角在 `hover_tip_layout` 里做。
+    x: f32,
+    y: f32,
+    /// 量出来的文字宽度：提示条按它定宽，短名字不会拖一条长尾巴。
+    text_width: f32,
+    /// 换算后实际画出来的尺寸。
+    width: f32,
+    height: f32,
+}
+
 impl Flyout {
     pub(crate) fn new(
         snapshot: Snapshot,
@@ -404,6 +431,8 @@ impl Flyout {
             activity: ActivityState::new(),
             activity_ticker: false,
             hovered_name: Rc::new(RefCell::new(None)),
+            hover_tip: Rc::new(RefCell::new(None)),
+            hover_tip_seq: Rc::new(Cell::new(0)),
             menu: Rc::new(RefCell::new(None)),
             device_menu: Rc::new(RefCell::new(None)),
             show_hidden: false,
@@ -785,6 +814,8 @@ impl Flyout {
         .peak(peak)
         .muted(muted)
         .fill(theme::accent())
+        .thickness(self.cfg().panel_bar_thickness())
+        .corner(self.cfg().panel_bar_corner())
         .effect(effect)
         .activity(self.activity.clone())
         .limit(ceiling)
@@ -1238,6 +1269,8 @@ impl Flyout {
         .peak(peak)
         .muted(muted)
         .fill(theme::accent())
+        .thickness(self.cfg().panel_bar_thickness())
+        .corner(self.cfg().panel_bar_corner())
         .effect(effect)
         .activity(self.activity.clone())
         .on_change(move |value, window, _| {
@@ -1299,6 +1332,13 @@ impl Flyout {
             theme::text_primary()
         };
         let name_element = self.app_name(&key, name.clone(), name_color, window, cx);
+        // 名字栏放不下就只剩省略号，图标这边再给一个入口：停 400ms 出全名。
+        let icon_element = self.icon_with_tip(
+            format!("app-icon-tip-{key}"),
+            icon_element,
+            Some(name.clone()),
+            cx,
+        );
 
         // 右键菜单：把光标位置和当前隐藏状态记下来，菜单内容在 render 里画。
         let menu_slot = self.menu.clone();
@@ -1342,6 +1382,7 @@ impl Flyout {
                 });
                 // 打开菜单即视为不再悬停，免得名字继续滚动。
                 *this.hovered_name.borrow_mut() = None;
+                *this.hover_tip.borrow_mut() = None;
                 cx.notify();
             },
         );
@@ -1454,13 +1495,28 @@ impl Flyout {
     }
 
     /// 图标按钮：左键切静音，图标本身按静音状态变色 / 变淡。
+    ///
+    /// `tip` 是这颗图标对应的**完整名字**：鼠标在上面停够 `HOVER_TIP_DELAY` 就浮一条
+    /// 提示出来 —— 横排的名字会被省略号截掉，竖排干脆只留图标，想认全名只能靠它。
     fn channel_icon(
         &self,
         id: String,
         element: AnyElement,
         muted: bool,
+        tip: Option<String>,
         on_click: impl Fn(&mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
+        // 悬停监听要拿得到 view 自己（起定时器 + 请求重绘），所以走 `cx.listener`。
+        let hover = match tip {
+            Some(name) => {
+                Some(cx.listener(move |this, hovered: &bool, window, cx| {
+                    this.watch_hover_tip(&name, *hovered, window, cx);
+                }))
+            }
+            None => None,
+        };
+
         div()
             .id(SharedString::from(id))
             .size(self.su(V_ICON_ROW))
@@ -1471,6 +1527,7 @@ impl Flyout {
             .cursor_pointer()
             .when(muted, |style| style.opacity(0.55))
             .hover(|style| style.bg(theme::surface_hover()))
+            .when_some(hover, |style, listener| style.on_hover(listener))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 on_click(window, cx);
@@ -1479,6 +1536,153 @@ impl Flyout {
                 window.refresh();
             })
             .child(element)
+            .into_any_element()
+    }
+
+    /// 悬停计时：停满 `HOVER_TIP_DELAY` 才把提示挂出来，中途移开就作废。
+    ///
+    /// 用序号而不是「取消任务」来作废：gpui 的定时器一旦起来就得跑完，与其去
+    /// 取消，不如让晚到的那一颗发现序号已经变了、自己悄悄退场。
+    fn watch_hover_tip(
+        &mut self,
+        name: &str,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let seq = self.hover_tip_seq.get().wrapping_add(1);
+        self.hover_tip_seq.set(seq);
+        // 移开 / 换到另一颗图标：已经挂出来的那条立刻收掉。
+        let showing = self.hover_tip.borrow_mut().take().is_some();
+        if !hovered {
+            if showing {
+                cx.notify();
+            }
+            return;
+        }
+
+        // 位置和宽度都要在**这一刻**取：定时器跑起来时鼠标早挪走了，
+        // 而量文字宽度又必须有 window。
+        let at = window.mouse_position();
+        let text_width = measure_text_width(name, window);
+        let tip = HoverTip {
+            name: name.to_string(),
+            x: at.x.as_f32(),
+            y: at.y.as_f32(),
+            text_width,
+            width: 0.0,
+            height: HOVER_TIP_HEIGHT,
+        };
+        if showing {
+            cx.notify();
+        }
+
+        let seqs = self.hover_tip_seq.clone();
+        let slot = self.hover_tip.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_TIP_DELAY).await;
+            if seqs.get() != seq {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if seqs.get() != seq {
+                    return;
+                }
+                // 面板已经收起来了就别挂：这条会一直留在那块看不见的窗口里。
+                if !this.visible {
+                    return;
+                }
+                let tip = this.hover_tip_layout(tip);
+                *slot.borrow_mut() = Some(tip);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 给一颗图标加「悬停 400ms 显示全名」的监听。
+    ///
+    /// 只包一层，不加任何内边距 / 尺寸：横排的图标在行里是 flex 的，多一层壳子
+    /// 如果自己撑大，整行宽度就会跟着变。
+    fn icon_with_tip(
+        &self,
+        id: String,
+        element: AnyElement,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(name) = name else {
+            return element;
+        };
+        div()
+            .id(SharedString::from(id))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                this.watch_hover_tip(&name, *hovered, window, cx);
+            }))
+            .child(element)
+            .into_any_element()
+    }
+
+    /// 收起提示：面板藏起来、或者有菜单弹出来的时候用。
+    ///
+    /// 序号一起推一格 —— 已经起来但还没到点的那颗定时器醒来会发现序号变了，自己退场。
+    fn clear_hover_tip(&mut self, cx: &mut Context<Self>) {
+        self.hover_tip_seq
+            .set(self.hover_tip_seq.get().wrapping_add(1));
+        if self.hover_tip.borrow_mut().take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 把光标位置换算成提示条左上角：挂在光标下方，下面放不下就翻到上方，
+    /// 左右再夹进面板宽度里（提示条比面板还长时不至于顶出去）。
+    fn hover_tip_layout(&self, mut tip: HoverTip) -> HoverTip {
+        let width = (tip.text_width + HOVER_TIP_PAD * 2.0).min(self.panel_width() - 8.0);
+        let height = HOVER_TIP_HEIGHT;
+        let panel_width = self.panel_width();
+        let panel_height = self.desired_height();
+        // 左右各留 6px：贴着面板边看着像被裁掉了一半。
+        let max_x = (panel_width - width - 6.0).max(6.0);
+        tip.x = (tip.x - width / 2.0).clamp(6.0, max_x);
+        tip.y = if tip.y + 12.0 + height <= panel_height {
+            tip.y + 12.0
+        } else {
+            (tip.y - height - 8.0).max(4.0)
+        };
+        tip.width = width;
+        tip.height = height;
+        tip
+    }
+
+    /// 悬停提示的浮层：一块小卡片，浮在光标旁边，写全应用名。
+    ///
+    /// 纯 div（不带任何交互）：gpui 只给带监听 / 悬停样式的元素插命中框，
+    /// 所以它不会挡住下面那颗图标的悬停 —— 否则提示一出就把自己的触发源顶掉，
+    /// 鼠标没动也会开始一闪一闪。
+    fn hover_tip_view(&self, tip: HoverTip) -> AnyElement {
+        div()
+            .absolute()
+            .left(px(tip.x))
+            .top(px(tip.y))
+            .w(px(tip.width))
+            .h(px(tip.height))
+            .flex()
+            .flex_none()
+            .items_center()
+            .px(px(HOVER_TIP_PAD))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::surface_elevated())
+            .border_1()
+            .border_color(theme::border())
+            .text_size(self.fs(11.5))
+            .text_color(theme::text_primary())
+            .whitespace_nowrap()
+            .truncate()
+            .child(tip.name)
             .into_any_element()
     }
 
@@ -1540,6 +1744,8 @@ impl Flyout {
         .peak(peak)
         .muted(muted)
         .fill(theme::accent())
+        .thickness(self.cfg().panel_bar_thickness())
+        .corner(self.cfg().panel_bar_corner())
         .effect(self.cfg().activity_effect)
         .activity(self.activity.clone())
         .limit(ceiling)
@@ -1606,6 +1812,8 @@ impl Flyout {
             format!("device-icon-{}", device.id),
             icon_element,
             muted,
+            // 设备那一格只有一张图标，名字就贴在旁边，不用提示。
+            None,
             move |_, _| {
                 let want = toggle_muted(&mute_slot, &mute_key, muted);
                 engine_for_mute.send(AudioCommand::SetDeviceMute {
@@ -1613,6 +1821,7 @@ impl Flyout {
                     muted: want,
                 });
             },
+            cx,
         );
 
         // 右键弹设备菜单：竖排里没有设备名可点，图标右键是唯一入口（和应用的右键一致）。
@@ -1740,6 +1949,8 @@ impl Flyout {
         .peak(peak)
         .muted(muted)
         .fill(theme::accent())
+        .thickness(self.cfg().panel_bar_thickness())
+        .corner(self.cfg().panel_bar_corner())
         .effect(self.cfg().activity_effect)
         .activity(self.activity.clone())
         .vertical(true)
@@ -1799,10 +2010,17 @@ impl Flyout {
             None => icon("music", icon_side, theme::text_tertiary()).into_any_element(),
         };
         let icon_element = with_route_badge(icon_element, app.is_routed());
+        // 竖排默认不写名字，全名只能靠悬停提示看 —— 所以这里一定要给。
+        let tip_name = if app.is_system {
+            lang.pick("系统声音", "System sounds").to_string()
+        } else {
+            app.name.clone()
+        };
         let icon_button = self.channel_icon(
             format!("app-icon-{key}"),
             icon_element,
             muted,
+            Some(tip_name),
             move |_, _| {
                 let want = toggle_muted(&mute_slot, &mute_key, muted);
                 engine_for_mute.send(AudioCommand::SetAppMute {
@@ -1810,6 +2028,7 @@ impl Flyout {
                     muted: want,
                 });
             },
+            cx,
         );
 
         let name = if self.cfg().vertical_app_names {
@@ -1865,6 +2084,7 @@ impl Flyout {
                     width: menu_width,
                 });
                 *this.hovered_name.borrow_mut() = None;
+                *this.hover_tip.borrow_mut() = None;
                 cx.notify();
             },
         );
@@ -2548,6 +2768,8 @@ impl Flyout {
         }
         // 电平状态跟着面板一起清掉，下次打开从头开始量。
         self.activity.reset();
+        // 悬停提示也是：面板都收起来了，这块小卡片留着只会挂在看不见的窗口里。
+        self.clear_hover_tip(cx);
         // 「等快照追上」的挂起值同理：面板都不在了，留着只会在下次弹出时
         // 压着一条旧读数不放。
         self.release_hold.borrow_mut().clear();
@@ -2756,6 +2978,13 @@ impl Render for Flyout {
             .clone()
             .map(|menu| self.device_menu_view(menu, cx));
 
+        // 应用图标上的全名提示（悬停 400ms 才挂出来），压在所有浮层之上。
+        let tip_overlay = self
+            .hover_tip
+            .borrow()
+            .clone()
+            .map(|tip| self.hover_tip_view(tip));
+
         // 入场动画：窗口始终按完整高度摆好，只让内容在窗口里从下往上「长」出来。
         // 不去改原生窗口尺寸，是因为 gpui 的 viewport 缓存会慢一帧，
         // 边改尺寸边绘制时面板下半截会被裁在上一次的尺寸里。
@@ -2812,6 +3041,7 @@ impl Render for Flyout {
                 .child(self.footer(cx))
                 .children(overlay)
                 .children(device_overlay)
+                .children(tip_overlay)
         } else {
             content
                 .child(device_row)
@@ -2832,6 +3062,7 @@ impl Render for Flyout {
                 .child(self.footer(cx))
                 .children(overlay)
                 .children(device_overlay)
+                .children(tip_overlay)
         };
 
         // 面板本体：垂直布局按高度展开，水平布局按宽度展开。

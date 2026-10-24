@@ -35,6 +35,13 @@ use crate::{
 /// 每个动作可以录几组快捷键（配置与界面都按这个数来）。
 const HOTKEY_SLOTS: usize = 3;
 
+/// 项目地址：写在设置页「关于」里，点一下用默认浏览器打开。
+///
+/// 只认这一处，改名换地址只改这里（README 里也是同一个）。
+const PROJECT_URL: &str = "https://github.com/wusumu/Bolume";
+/// 问题反馈（GitHub Issues）。
+const ISSUES_URL: &str = "https://github.com/wusumu/Bolume/issues";
+
 /// 屏幕取色的轮询间隔（和 OSD 编辑器保持一致）。
 const COLOR_PICK_TICK: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -839,6 +846,10 @@ enum NumberField {
     FlyoutWidth,
     /// 音量面板竖向高度（逻辑像素，0 = 自动按内容算）。
     FlyoutVerticalHeight,
+    /// 面板里音量条的粗细（逻辑像素）。
+    PanelBarThickness,
+    /// 面板里音量条的圆角（半高的百分比，100 = 全圆头）。
+    PanelBarRound,
     /// OSD 卡片宽度（逻辑像素）。
     OsdWidth,
     /// OSD 卡片高度（逻辑像素）。
@@ -921,6 +932,8 @@ impl NumberField {
             Self::BrightnessVerticalHeight => config.brightness.vertical_height,
             Self::FlyoutWidth => config.flyout_width,
             Self::FlyoutVerticalHeight => config.vertical_height,
+            Self::PanelBarThickness => config.panel_bar_thickness,
+            Self::PanelBarRound => config.panel_bar_round,
             Self::OsdWidth => config.osd.width,
             Self::OsdHeight => config.osd.height,
             Self::OsdCorner => config.osd.corner,
@@ -991,6 +1004,8 @@ impl NumberField {
                 crate::config::VERTICAL_HEIGHT_RANGE
             }
             Self::FlyoutWidth => crate::config::FLYOUT_WIDTH_RANGE,
+            Self::PanelBarThickness => crate::config::PANEL_BAR_THICKNESS_RANGE,
+            Self::PanelBarRound => (0, 100),
             Self::OsdWidth => (160, 900),
             Self::OsdHeight => (48, 320),
             // 圆角最大到高度一半就够了（再大看不出变化）。
@@ -1049,6 +1064,8 @@ impl NumberField {
             Self::BrightnessVerticalHeight => config.brightness.vertical_height = value,
             Self::FlyoutWidth => config.flyout_width = value,
             Self::FlyoutVerticalHeight => config.vertical_height = value,
+            Self::PanelBarThickness => config.panel_bar_thickness = value,
+            Self::PanelBarRound => config.panel_bar_round = value,
             Self::OsdWidth => config.osd.width = value,
             Self::OsdHeight => config.osd.height = value,
             Self::OsdCorner => config.osd.corner = value,
@@ -1141,6 +1158,8 @@ impl NumberField {
                     format!("{value} px")
                 }
             }
+            Self::PanelBarThickness => format!("{value} px"),
+            Self::PanelBarRound => format!("{value}%"),
             Self::OsdWidth | Self::OsdHeight | Self::OsdCorner => format!("{value} px"),
             Self::OsdOpacity => format!("{value}%"),
             Self::OsdX | Self::OsdY => format!("{value} px"),
@@ -9954,6 +9973,34 @@ impl Settings {
             cx,
         );
 
+        // 音量条的粗细：面板里所有音量条 / 亮度条一起变。
+        let bar_thickness = self.number_row(
+            "panel-bar-thickness",
+            lang.pick("音量条粗细", "Bar thickness"),
+            lang.pick(
+                "面板里音量条有多粗（像素），亮度条跟着一起变；屏幕提示条（OSD）的条高在布局编辑器里调",
+                "How thick the volume bars are, in pixels; the brightness bars follow. The on-screen display's bar size lives in the layout editor",
+            ),
+            NumberField::PanelBarThickness,
+            config,
+            lang,
+            cx,
+        );
+
+        // 音量条的圆角：按「条高的一半」算百分比，跟 OSD 的条圆角一个口径。
+        let bar_round = self.number_row(
+            "panel-bar-round",
+            lang.pick("音量条圆角", "Bar corner"),
+            lang.pick(
+                "按条高的一半算：100% = 全圆头（胶囊形），0% = 方角",
+                "Measured against half the bar height: 100% is a full pill, 0% is square",
+            ),
+            NumberField::PanelBarRound,
+            config,
+            lang,
+            cx,
+        );
+
         // 排版：横排（一路一行）/ 竖排（一路一条立起来的推子）。
         let layout_options: &'static [(u32, &'static str)] = if lang.is_en() {
             &[(0, "Horizontal"), (1, "Vertical")]
@@ -10204,6 +10251,9 @@ impl Settings {
                 // 行高挨着宽度：都是「这一块占多大」。竖排是一列一列摆的，没有行高这回事。
                 rows.push(panel_line_height);
             }
+            // 条的粗细 / 圆角两种排版都有（横排是横条、竖排是立起来的推子），一律摆上。
+            rows.push(bar_thickness);
+            rows.push(bar_round);
             // 字体那几项紧跟布局：改字号时宽度 / 高度会自动跟着变，摆在一起好对照。
             rows.push(panel_font);
             rows.push(panel_font_size);
@@ -12282,6 +12332,22 @@ impl Settings {
                     row(
                         lang.pick("配置文件", "Config file"),
                         self.config_path.to_string(),
+                    ),
+                    // 源码地址写在关于里：软件是绿色版、没有官网，别人想反馈或自己编译
+                    // 只能靠这一串。点「打开」用默认浏览器跳过去。
+                    self.action_row(
+                        "project-home",
+                        lang.pick("项目主页", "Project page"),
+                        PROJECT_URL.to_string(),
+                        lang.pick("打开", "Open"),
+                        |_, _| crate::platform::shell::open_url(PROJECT_URL),
+                    ),
+                    self.action_row(
+                        "project-issues",
+                        lang.pick("问题反馈", "Report an issue"),
+                        format!("{PROJECT_URL}/issues"),
+                        lang.pick("打开", "Open"),
+                        |_, _| crate::platform::shell::open_url(ISSUES_URL),
                     ),
                 ],
             ),
