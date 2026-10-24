@@ -439,6 +439,15 @@ pub fn run(
                 .borrow_mut()
                 .replace(flyout_entity.clone());
 
+            // 预热：先在屏幕外把面板「显示」出来一次，让 DWM 的首次出现淡入
+            // 在看不见的地方用完 —— 否则第一次打开面板时整块卡片是半透明的。
+            {
+                let warm = flyout_entity.clone();
+                cx.defer(move |cx| {
+                    let _ = warm.update(cx, |flyout, window, cx| flyout.warm_up(window, cx));
+                });
+            }
+
             // 托盘右键菜单（「跟随主题」那版）：同样隐藏创建，每次右键按光标位置摆好再露头。
             // 原生菜单模式下它一直藏着，右键交给系统菜单。
             let menu_options = WindowOptions {
@@ -669,13 +678,20 @@ pub fn run(
             // 调试入口：--osd-demo 启动即按当前布局弹一次音量卡片；
             // 加 --osd-demo-media 则弹媒体键那张（播放 / 暂停）。
             // 只画卡片、不碰任何设备音量与播放状态 —— 验 OSD 布局 / 阴影 / 淡出时用。
+            //
+            // `BOLUME_OSD_DEMO_AFTER=1450` 会在第一张之后再弹一次（毫秒，从第一次
+            // 触发算起）：用来验「出场演到一半又被呼出」要接着往回走，不能跳。
             if osd_demo || osd_demo_media {
+                let replay = std::env::var("BOLUME_OSD_DEMO_AFTER")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .filter(|ms| *ms > 0);
                 cx.spawn(async move |cx| {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(400))
                         .await;
-                    cx.update(|cx| {
-                        let request = if osd_demo_media {
+                    let request = || {
+                        if osd_demo_media {
                             crate::windows::osd::OsdRequest::device(
                                 crate::config::OsdFunction::PlayPause,
                             )
@@ -685,9 +701,15 @@ pub fn run(
                                 crate::config::OsdFunction::Volume,
                             )
                             .predicted(osd_demo_value)
-                        };
-                        show_osd(cx, request)
-                    });
+                        }
+                    };
+                    cx.update(|cx| show_osd(cx, request()));
+                    if let Some(after) = replay {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(after))
+                            .await;
+                        cx.update(|cx| show_osd(cx, request()));
+                    }
                 })
                 .detach();
             }
@@ -949,7 +971,7 @@ fn hide_flyout(cx: &mut App) {
     if let Some(handle) = handle {
         let _ = handle.update(cx, |flyout, window, cx| {
             if flyout.is_visible() && !flyout.is_pinned() {
-                flyout.hide(window, cx);
+                flyout.hide_from_blur(window, cx);
             }
         });
     }
@@ -2378,12 +2400,16 @@ pub(crate) fn tooltip_facts(
     }
 }
 
-/// 从配置读托盘数字图标的外观（字体 / 字重 / 字号）。
+/// 从配置读托盘数字图标的外观（字体 / 抗锯齿 / 三档字号宽高字距）。
 fn number_style(cfg: &crate::config::Config) -> crate::tray::NumberStyle {
     crate::tray::NumberStyle {
         font: cfg.tray_number_font.clone(),
-        weight: cfg.tray_number_weight as i32,
-        size_percent: cfg.tray_number_size,
+        antialias: cfg.tray_number_antialias,
+        metrics: [
+            cfg.tray_digit_one,
+            cfg.tray_digit_two,
+            cfg.tray_digit_three,
+        ],
     }
 }
 

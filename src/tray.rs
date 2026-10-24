@@ -15,27 +15,27 @@ use crate::motion::Motion;
 /// 画布尺寸的兜底值（取不到系统指标时用）。
 const CANVAS_FALLBACK: f32 = 16.0;
 
-/// 数字图标的外观：字体族 + 字重 + 数字大小（占图标高度的百分比）。
+/// 数字图标的外观：字体族 + 抗锯齿 + 按位数分档的字号 / 宽高 / 字距。
 ///
-/// 数字是**按目标尺寸直接光栅化**的，所以这三个值一改就是那个字体自己的
+/// 数字是**按目标尺寸直接光栅化**的，所以这些值一改就是那个字体自己的
 /// 字形，不存在「大图缩小」那种糊边和毛刺。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NumberStyle {
     pub font: String,
-    pub weight: i32,
-    /// 数字墨迹高度占画布的百分比（1..=100）；0 表示自动（`AUTO_HEIGHT_RATIO`）。
-    ///
-    /// 用百分比而不是像素：画布本身是跟着 DPI 变的（96 DPI 下 16px、
-    /// 200% 下 32px），写死 px 换个缩放比例观感就全变了。
-    pub size_percent: u32,
+    pub antialias: crate::config::TrayAntialias,
+    /// 一位数（0–9）/ 两位数（10–99）/ 三位数（100）各一套。
+    pub metrics: [crate::config::TrayDigitMetrics; 3],
 }
+
+/// 数字的笔画粗细：托盘上 16px 用 600（半粗）比 400 清楚，旧版默认就是这个。
+const DIGIT_WEIGHT: i32 = 600;
 
 impl Default for NumberStyle {
     fn default() -> Self {
         Self {
             font: crate::config::DEFAULT_NUMBER_FONT.to_string(),
-            weight: 600,
-            size_percent: 0,
+            antialias: Default::default(),
+            metrics: Default::default(),
         }
     }
 }
@@ -46,8 +46,8 @@ impl NumberStyle {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.font.to_lowercase().hash(&mut hasher);
-        self.weight.hash(&mut hasher);
-        self.size_percent.hash(&mut hasher);
+        self.antialias.hash(&mut hasher);
+        self.metrics.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -77,6 +77,18 @@ fn canvas() -> f32 {
 /// 画布边长（供配置迁移把旧的像素值换算成百分比用）。
 pub(crate) fn canvas_size() -> f32 {
     canvas()
+}
+
+/// 系统 DPI（96 / 120 / 144 …）。字号按「点」存，换算成像素要用它。
+pub(crate) fn system_dpi() -> u32 {
+    use std::sync::OnceLock;
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+
+    static DPI: OnceLock<u32> = OnceLock::new();
+    *DPI.get_or_init(|| {
+        let dpi = unsafe { GetDpiForSystem() };
+        if dpi > 0 { dpi } else { 96 }
+    })
 }
 
 pub struct Tray {
@@ -754,15 +766,24 @@ thread_local! {
     static GLYPH_CACHE: RefCell<HashMap<String, Rc<Glyph>>> = RefCell::new(HashMap::new());
 }
 
-/// 按 (字体, 字重, 字号) 取一份已经裁到墨迹包围盒的蒙版。
+/// 按 (字体, 字重, 字号, 抗锯齿) 取一份已经裁到墨迹包围盒的蒙版。
 ///
 /// 关键点：字号就是**最终显示的字号**，画出来多高就是多高，后面不再缩放。
-fn sized_mask(family: &str, weight: i32, font_px: f32, text: &str) -> Rc<TextMask> {
-    let key = format!("{family}\u{1}{weight}\u{1}{font_px:.2}\u{1}{text}");
+fn sized_mask(
+    family: &str,
+    weight: i32,
+    font_px: f32,
+    text: &str,
+    aa: crate::config::TrayAntialias,
+) -> Rc<TextMask> {
+    let key = format!(
+        "{family}\u{1}{weight}\u{1}{font_px:.2}\u{1}{}\u{1}{text}",
+        aa.index()
+    );
     if let Some(cached) = MASK_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
         return cached;
     }
-    let mask = Rc::new(rasterize_with(family, weight, text, font_px));
+    let mask = Rc::new(rasterize_with(family, weight, text, font_px, aa));
     MASK_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, mask.clone());
     });
@@ -770,13 +791,13 @@ fn sized_mask(family: &str, weight: i32, font_px: f32, text: &str) -> Rc<TextMas
 }
 
 /// 「88 的墨迹高度 ÷ 字号」——换字号时字高近似线性变化，量一次就能反推。
-fn ink_ratio(family: &str, weight: i32) -> f32 {
-    let key = format!("{family}\u{1}{weight}");
+fn ink_ratio(family: &str, weight: i32, aa: crate::config::TrayAntialias) -> f32 {
+    let key = format!("{family}\u{1}{weight}\u{1}{}", aa.index());
     if let Some(cached) = INK_RATIO.with(|cache| cache.borrow().get(&key).copied()) {
         return cached;
     }
     const PROBE: f32 = 96.0;
-    let mask = sized_mask(family, weight, PROBE, "88");
+    let mask = sized_mask(family, weight, PROBE, "88", aa);
     let ratio = if mask.height == 0 {
         0.72
     } else {
@@ -803,55 +824,195 @@ fn render_number_icon(percent: u32, muted: bool, dark_ink: bool, style: &NumberS
     } else {
         style.font.as_str()
     };
-    let weight = style.weight.clamp(100, 900);
+    let weight = DIGIT_WEIGHT;
+    let aa = style.antialias;
     let ink = if dark_ink { 20.0 } else { 248.0 };
     let alpha_scale = if muted { 0.4 } else { 1.0 };
 
     let canvas = canvas();
     // 四周各留 1px：贴边的话任务栏会把边缘像素吃掉。
     let box_side = (canvas - 2.0).max(4.0);
-    // 配置值 = 数字墨迹高度占可画区（画布去掉 1px 边）的百分比；0 = 自动。
-    let ratio_percent = if style.size_percent == 0 {
-        AUTO_HEIGHT_RATIO * 100.0
-    } else {
-        style.size_percent.min(100) as f32
-    };
-    let target = (box_side * ratio_percent / 100.0).clamp(4.0, box_side);
 
-    let ink_ratio = ink_ratio(family, weight).max(0.05);
-    let mut font_px = snap_font_px(family, weight, target / ink_ratio);
-    let mut mask = low_res(family, weight, font_px, &text);
-    // 「100」这种三位数比两位数还宽：先压窄；压到 `MIN_SQUEEZE` 还放不下，
-    // 说明字号确实太大 —— 收一点字号再来一次。
-    for _ in 0..12 {
-        if mask.width == 0 || mask.width as f32 <= box_side {
-            break;
-        }
-        let scale = box_side / mask.width as f32;
-        if scale >= MIN_SQUEEZE {
-            mask = Rc::new(squeeze(&mask, scale));
-            break;
-        }
-        font_px *= 0.94;
-        mask = low_res(family, weight, font_px, &text);
-    }
-    // 兜底：循环上限用完还是宽（极端字体），硬压到盒子里，绝不能画出画布。
-    if mask.width > 0 && mask.width as f32 > box_side {
+    // 按位数挑这一档的参数：0–9 一位、10–99 两位、100 三位。
+    let digits = text.chars().count().clamp(1, 3);
+    let metrics = style.metrics[digits - 1];
+    let ratio = ink_ratio(family, weight, aa).max(0.05);
+    let (sx, sy) = (
+        (metrics.width.clamp(10, 300) as f32) / 100.0,
+        (metrics.height.clamp(10, 300) as f32) / 100.0,
+    );
+    // 字距：PS 的 VA 值单位是 1/1000 em，换算成像素要乘字号。
+    let tracking = metrics.tracking.clamp(-500, 1000) as f32 / 1000.0;
+
+    // 字号：0 = 自动（墨迹高度撑到画布的 `AUTO_HEIGHT_RATIO`，旧版观感）；
+    // 否则照「点 × DPI / 72」换算成像素 —— 12 点在 96 DPI 下就是 16px。
+    let auto = metrics.size_pt == 0;
+    let font_px = if auto {
+        let target = (box_side * AUTO_HEIGHT_RATIO).clamp(4.0, box_side);
+        snap_font_px(family, weight, target / ratio, aa)
+    } else {
+        // 用户填的点数照用；只挡一下「填了个比画布大几十倍的数字」——
+        // 那种字号光栅化出来几十兆，而画出来也就是整块图标全糊。
+        (metrics.size_pt.clamp(1, 200) as f32 * system_dpi() as f32 / 72.0)
+            .min(canvas * 4.0)
+    };
+
+    // 光栅化 → 按用户设的水平 / 垂直缩放重采样（100% 时原样返回）。
+    let seed = low_res(family, weight, font_px, &text, aa, font_px * tracking);
+    let mut mask = if (sx - 1.0).abs() > 0.01 || (sy - 1.0).abs() > 0.01 {
+        Rc::new(resample(&seed, sx, sy))
+    } else {
+        seed
+    };
+    // 自动档的字号是按「高度 70% 画布」反推的，两位数 / 三位数注定比盒子宽 ——
+    // 这里只**横向压窄**，高度一点不动。
+    // 手动档一个字都不改：填多少就是多少，超出画布的部分由 `compose_native`
+    // 居中裁掉。以前这里会「压不动就收字号再画」，于是同一个 15 点下
+    // 三位数比两位数矮一截（用户看到的就是「两位数三位数高度不一样」）。
+    if auto && mask.width > 0 && mask.width as f32 > box_side {
         mask = Rc::new(squeeze(&mask, box_side / mask.width as f32));
+    }
+    // 「无」这一档要**最后**再阈一次：4 倍图上已经是硬边，降采样（以及压窄时的
+    // 面积平均）又会给边缘生出灰阶。二值化之后才是真的硬边。
+    if aa.threshold() {
+        mask = Rc::new(harden(&mask));
     }
     compose_native(&mask, ink, alpha_scale)
 }
 
-/// 字高照设、宽度硬塞时最多压到原宽的多少。
+/// 覆盖率二值化（0 或 1）：「无」抗锯齿那一档用。
 ///
-/// 0.6 大概是「窄体」的极限：再压笔画就只剩 1px，配上 4 倍超采样的灰边
-/// 会糊成一片。超过这个比例就说明高度本身太大，得收字号。
-const MIN_SQUEEZE: f32 = 0.60;
+/// 阈值取 0.4 而不是 0.5：半格覆盖的边缘行本来就在墨迹包围盒里，
+/// 按 0.5 砍会把边缘整行吃掉。
+///
+/// 还要再补一道「行保底」：`1` 的笔画末端在最后一行往往只有三成覆盖，
+/// 二值化后那一行全空 —— 同一个字号下「1」就比「0」矮一像素
+/// （用户看到的就是「两位数和三位数高度不一样」）。整行原本有墨却被砍光时，
+/// 保留这一行最强的那一格，高度就对齐了。
+fn harden(mask: &TextMask) -> TextMask {
+    let (width, height) = (mask.width, mask.height);
+    let mut coverage: Vec<f32> = mask
+        .coverage
+        .iter()
+        .map(|value| if *value >= 0.4 { 1.0 } else { 0.0 })
+        .collect();
+    for y in 0..height {
+        let row = y * width;
+        let mut inked = false;
+        let mut kept = false;
+        let mut best = (0usize, 0.0f32);
+        for x in 0..width {
+            let raw = mask.coverage[row + x];
+            // 阈值压得极低：只要这一行原本沾过墨，就不该被二值化整行吃掉。
+            if raw > 0.004 {
+                inked = true;
+            }
+            if coverage[row + x] > 0.5 {
+                kept = true;
+            }
+            if raw > best.1 {
+                best = (x, raw);
+            }
+        }
+        if inked && !kept {
+            coverage[row + best.0] = 1.0;
+        }
+    }
+    TextMask {
+        width,
+        height,
+        coverage,
+    }
+}
+
+/// 宽度 / 高度缩放（PS 的水平 / 垂直缩放）。
+///
+/// 缩小按面积平均（网格对齐、边缘不闪），放大按双线性（比最近邻平滑）。
+/// 只在比例不等于 100% 时调用；100% 原样返回，保证默认那一路和以前逐像素一致。
+fn resample(mask: &TextMask, sx: f32, sy: f32) -> TextMask {
+    if mask.width == 0 || mask.height == 0 {
+        return TextMask {
+            width: 0,
+            height: 0,
+            coverage: Vec::new(),
+        };
+    }
+    let out_w = ((mask.width as f32 * sx).round() as usize).clamp(1, 1024);
+    let out_h = ((mask.height as f32 * sy).round() as usize).clamp(1, 1024);
+    if out_w == mask.width && out_h == mask.height {
+        return TextMask {
+            width: mask.width,
+            height: mask.height,
+            coverage: mask.coverage.clone(),
+        };
+    }
+    let step_x = mask.width as f32 / out_w as f32;
+    let step_y = mask.height as f32 / out_h as f32;
+    let mut coverage = vec![0f32; out_w * out_h];
+    let sample = |x: usize, y: usize| mask.coverage[y * mask.width + x];
+    if step_x >= 1.0 && step_y >= 1.0 {
+        // 缩小：盒式面积平均。
+        for oy in 0..out_h {
+            let y0 = oy as f32 * step_y;
+            let y1 = y0 + step_y;
+            for ox in 0..out_w {
+                let x0 = ox as f32 * step_x;
+                let x1 = x0 + step_x;
+                let mut sum = 0f32;
+                let mut area = 0f32;
+                let mut y = y0.floor() as usize;
+                while (y as f32) < y1 && y < mask.height {
+                    let top = (y as f32).max(y0);
+                    let bottom = ((y + 1) as f32).min(y1);
+                    let dy = (bottom - top).max(0.0);
+                    let mut x = x0.floor() as usize;
+                    while (x as f32) < x1 && x < mask.width {
+                        let left = (x as f32).max(x0);
+                        let right = ((x + 1) as f32).min(x1);
+                        let dx = (right - left).max(0.0);
+                        sum += sample(x, y) * dx * dy;
+                        area += dx * dy;
+                        x += 1;
+                    }
+                    y += 1;
+                }
+                coverage[oy * out_w + ox] = if area > 0.0 {
+                    (sum / area).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+            }
+        }
+    } else {
+        // 放大：双线性（中心对中心）。
+        for oy in 0..out_h {
+            let v = ((oy as f32 + 0.5) * step_y - 0.5).clamp(0.0, (mask.height - 1) as f32);
+            let y0 = v.floor() as usize;
+            let y1 = (y0 + 1).min(mask.height - 1);
+            let fy = v - y0 as f32;
+            for ox in 0..out_w {
+                let u = ((ox as f32 + 0.5) * step_x - 0.5).clamp(0.0, (mask.width - 1) as f32);
+                let x0 = u.floor() as usize;
+                let x1 = (x0 + 1).min(mask.width - 1);
+                let fx = u - x0 as f32;
+                let top = sample(x0, y0) * (1.0 - fx) + sample(x1, y0) * fx;
+                let bottom = sample(x0, y1) * (1.0 - fx) + sample(x1, y1) * fx;
+                coverage[oy * out_w + ox] = (top * (1.0 - fy) + bottom * fy).clamp(0.0, 1.0);
+            }
+        }
+    }
+    TextMask {
+        width: out_w,
+        height: out_h,
+        coverage,
+    }
+}
 
 /// 横向盒式缩放：只改宽度，高度和纵向灰度分布原样保留。
 ///
-/// 不缩放的话两位数永远画不高（见 `render_number_icon` 的注释）；
-/// 这里按面积平均采样，边缘是抗过锯齿的灰度，不会出现硬断的竖直锯齿。
+/// 只给「自动字号」用：自动档的字号按高度反推，两位数 / 三位数必然超宽，
+/// 压窄（而不是收字号）才能让同一档里的数字高度一致。
+/// 手动档不做任何压窄 —— 用户填的宽度、高度、字号就是最终结果。
 fn squeeze(mask: &TextMask, scale: f32) -> TextMask {
     let src_w = mask.width;
     if src_w == 0 || mask.height == 0 || scale >= 0.999 {
@@ -897,8 +1058,16 @@ fn squeeze(mask: &TextMask, scale: f32) -> TextMask {
 /// 4 是超采样倍数：高度对齐到 4 的倍数，降采样后每一行都是满格覆盖，
 /// 上下边缘一样实。**只往小里找**——往大调会让两位数字超出盒子宽度，
 /// 又触发按值缩字号，前功尽弃。
-fn snap_font_px(family: &str, weight: i32, font_px: f32) -> f32 {
-    let key = format!("snap\u{1}{family}\u{1}{weight}\u{1}{font_px:.2}");
+fn snap_font_px(
+    family: &str,
+    weight: i32,
+    font_px: f32,
+    aa: crate::config::TrayAntialias,
+) -> f32 {
+    let key = format!(
+        "snap\u{1}{family}\u{1}{weight}\u{1}{}\u{1}{font_px:.2}",
+        aa.index()
+    );
     if let Some(cached) = INK_RATIO.with(|cache| cache.borrow().get(&key).copied()) {
         return cached;
     }
@@ -907,7 +1076,7 @@ fn snap_font_px(family: &str, weight: i32, font_px: f32) -> f32 {
         .map(|step| font_px - step as f32 * 0.1)
         .find(|candidate| {
             *candidate >= 4.0 && {
-                let probe = glyph(family, weight, *candidate * SUPERSAMPLE as f32, '8');
+                let probe = glyph(family, weight, *candidate * SUPERSAMPLE as f32, '8', aa);
                 probe.mask.height % factor == 0 && probe.mask.height > 0
             }
         })
@@ -930,17 +1099,32 @@ const AUTO_HEIGHT_RATIO: f32 = 0.70;
 /// 按**单个字形**光栅化再拼起来，原因在 `rasterize_glyph` 的注释里：
 /// 整串一起画的话，第二个字会落在非整数的笔位上，降采样后相位不同 ——
 /// 「11」左边那一笔和右边那一笔会长得完全不一样。
-fn low_res(family: &str, weight: i32, font_px: f32, text: &str) -> Rc<TextMask> {
-    let key = format!("lo\u{1}{family}\u{1}{weight}\u{1}{font_px:.2}\u{1}{text}");
+fn low_res(
+    family: &str,
+    weight: i32,
+    font_px: f32,
+    text: &str,
+    aa: crate::config::TrayAntialias,
+    tracking_px: f32,
+) -> Rc<TextMask> {
+    let key = format!(
+        "lo\u{1}{family}\u{1}{weight}\u{1}{font_px:.2}\u{1}{}\u{1}{tracking_px:.2}\u{1}{text}",
+        aa.index()
+    );
     if let Some(cached) = MASK_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
         return cached;
     }
     let px4 = font_px * SUPERSAMPLE as f32;
     let glyphs: Vec<Rc<Glyph>> = text
         .chars()
-        .map(|ch| glyph(family, weight, px4, ch))
+        .map(|ch| glyph(family, weight, px4, ch, aa))
         .collect();
-    let mask = Rc::new(compose_glyphs(&glyphs));
+    let frame = digit_frame(family, weight, px4, aa);
+    let mask = Rc::new(compose_glyphs(
+        &glyphs,
+        tracking_px * SUPERSAMPLE as f32,
+        frame,
+    ));
     MASK_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, mask.clone());
     });
@@ -959,23 +1143,75 @@ struct Glyph {
     advance: f32,
 }
 
-fn glyph(family: &str, weight: i32, font_px4: f32, ch: char) -> Rc<Glyph> {
-    let key = format!("g\u{1}{family}\u{1}{weight}\u{1}{font_px4:.2}\u{1}{ch}");
+fn glyph(
+    family: &str,
+    weight: i32,
+    font_px4: f32,
+    ch: char,
+    aa: crate::config::TrayAntialias,
+) -> Rc<Glyph> {
+    let key = format!(
+        "g\u{1}{family}\u{1}{weight}\u{1}{font_px4:.2}\u{1}{}\u{1}{ch}",
+        aa.index()
+    );
     if let Some(cached) = GLYPH_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
         return cached;
     }
-    let glyph = Rc::new(rasterize_glyph(family, weight, ch, font_px4));
+    let glyph = Rc::new(rasterize_glyph(family, weight, ch, font_px4, aa));
     GLYPH_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, glyph.clone());
     });
     glyph
 }
 
+/// 同一字体 / 字重 / 字号 / 抗锯齿下，所有阿拉伯数字共用的墨迹高度（4 倍像素）。
+///
+/// 圆头数字（0 6 8 9）顶部有 overshoot，比「1」多占一行；只按当前这一串的
+/// 墨迹算行高的话，「11」会比「10」矮一行 —— 同一个两位数在数值变化时整串
+/// 上下跳一像素，看着就是「一高一低」。取 0–9 的并集当统一行高就没有这个问题。
+fn digit_frame(
+    family: &str,
+    weight: i32,
+    font_px4: f32,
+    aa: crate::config::TrayAntialias,
+) -> f32 {
+    let key = format!(
+        "frame\u{1}{family}\u{1}{weight}\u{1}{font_px4:.2}\u{1}{}",
+        aa.index()
+    );
+    if let Some(cached) = INK_RATIO.with(|cache| cache.borrow().get(&key).copied()) {
+        return cached;
+    }
+    let mut top = f32::MAX;
+    let mut bottom = f32::MIN;
+    for ch in '0'..='9' {
+        let glyph = glyph(family, weight, font_px4, ch, aa);
+        if glyph.mask.height == 0 {
+            continue;
+        }
+        top = top.min(glyph.y0);
+        bottom = bottom.max(glyph.y0 + glyph.mask.height as f32);
+    }
+    let height = if bottom > top && top.is_finite() {
+        bottom - top
+    } else {
+        0.0
+    };
+    INK_RATIO.with(|cache| cache.borrow_mut().insert(key, height));
+    height
+}
+
 /// 把几个字形拼成一行：每个字形先从**自己的**包围盒降采样，再按整数像素落位。
 ///
 /// 这样同一个字在任何数值里都是同一张位图（缓存里拿的是同一份），
 /// 「11」的两个 1、「10」的 1、单独的「1」必然长得一模一样。
-fn compose_glyphs(glyphs: &[Rc<Glyph>]) -> TextMask {
+///
+/// `tracking_px` 是字距（4 倍像素域，可为负）：累加到每个字的前进宽度上，
+/// 语义照 Photoshop 的 VA（1/1000 em，由调用方换算好）。
+/// `frame_h` 是这一档数字**共用的行高**（4 倍像素，见 `digit_frame`）：
+/// 行高必须按它来，不能按这一串自己的墨迹算 —— 不然「11」（全是 1）比
+/// 「10」（0 顶部有 overshoot）矮一行，同一个两位数在数值变化时整串会上下跳。
+fn compose_glyphs(glyphs: &[Rc<Glyph>], tracking_px: f32, frame_h: f32) -> TextMask {
     let factor = SUPERSAMPLE as f32;
     if glyphs.is_empty() {
         return TextMask {
@@ -1000,17 +1236,22 @@ fn compose_glyphs(glyphs: &[Rc<Glyph>]) -> TextMask {
         .map(|(top, low)| top + low.height as i32)
         .max()
         .unwrap_or(0);
-    let height = (baseline - tops.iter().copied().min().unwrap_or(0)).max(0) as usize;
+    // 这一串自己的墨迹高度；再和「所有数字共用的行高」取大的那个。
+    let own = (baseline - tops.iter().copied().min().unwrap_or(0)).max(0) as usize;
+    let frame = (frame_h / factor).round().max(0.0) as usize;
+    let height = own.max(frame);
+    // 框底对齐：数字没有下沉部，baseline 就是框底，多出来的高度补到上面去。
+    let pad_top = height as i32 - baseline;
 
     let mut cursor = 0f32;
     let mut placed: Vec<(usize, usize, TextMask)> = Vec::with_capacity(glyphs.len());
     let mut width = 0usize;
     for (index, (glyph, low)) in glyphs.iter().zip(lows).enumerate() {
         let x = (((cursor + glyph.x0) / factor).round().max(0.0)) as usize;
-        let y = (baseline - (tops[index] + low.height as i32)).max(0) as usize;
+        let y = (pad_top + (baseline - (tops[index] + low.height as i32))).max(0) as usize;
         width = width.max(x + low.width);
         placed.push((x, y, low));
-        cursor += glyph.advance;
+        cursor += glyph.advance + tracking_px;
     }
 
     let mut coverage = vec![0f32; width * height];
@@ -1076,7 +1317,10 @@ fn downsample(mask: &TextMask, factor: u32) -> TextMask {
     }
 }
 
-/// 把蒙版 1:1 贴进画布（整数偏移居中），不缩放。
+/// 把蒙版 1:1 贴进画布（居中），不缩放。
+///
+/// 蒙版比画布大时**居中裁**（左右 / 上下各切掉一半）：用户把字号调得比画布还大
+/// 是他的自由，这里不偷偷缩小字形，只是画不下的部分自然落在图标外面。
 fn compose_native(mask: &TextMask, ink: f32, alpha_scale: f32) -> Vec<u8> {
     let canvas = canvas();
     let size = canvas as usize;
@@ -1085,24 +1329,24 @@ fn compose_native(mask: &TextMask, ink: f32, alpha_scale: f32) -> Vec<u8> {
         return buffer;
     }
 
-    let ox = ((size as i32 - mask.width as i32) / 2).max(0) as usize;
-    let oy = ((size as i32 - mask.height as i32) / 2).max(0) as usize;
+    let ox = (size as i32 - mask.width as i32) / 2;
+    let oy = (size as i32 - mask.height as i32) / 2;
 
-    for y in 0..mask.height.min(size) {
-        let ty = oy + y;
-        if ty >= size {
-            break;
+    for y in 0..mask.height {
+        let ty = oy + y as i32;
+        if ty < 0 || ty >= size as i32 {
+            continue;
         }
-        for x in 0..mask.width.min(size) {
-            let tx = ox + x;
-            if tx >= size {
-                break;
+        for x in 0..mask.width {
+            let tx = ox + x as i32;
+            if tx < 0 || tx >= size as i32 {
+                continue;
             }
             let alpha = mask.coverage[y * mask.width + x] * alpha_scale;
             if alpha <= 0.004 {
                 continue;
             }
-            let offset = (ty * size + tx) * 4;
+            let offset = (ty as usize * size + tx as usize) * 4;
             buffer[offset] = ink as u8;
             buffer[offset + 1] = ink as u8;
             buffer[offset + 2] = ink as u8;
@@ -1119,13 +1363,20 @@ fn compose_native(mask: &TextMask, ink: f32, alpha_scale: f32) -> Vec<u8> {
 fn mask_canvas(font_px: f32, text: &str) -> u32 {
     let chars = text.chars().count().max(1) as f32;
     // 每个字符按 1em 宽留位（数字实际约 0.55em），再补上下各半行余量。
+    // 这个画布只是「光栅化用的草稿纸」，画小了字形会被它裁掉，所以给得宽松。
     let side = (font_px * (chars + 1.0)).ceil() + 4.0;
-    side.clamp(8.0, 512.0) as u32
+    side.clamp(8.0, 1024.0) as u32
 }
 
 /// 按指定字体和**最终字号**光栅化一段文字，返回裁好的墨迹包围盒。
-fn rasterize_with(face: &str, weight: i32, text: &str, font_px: f32) -> TextMask {
-    draw_text(face, weight, text, font_px, true).0
+fn rasterize_with(
+    face: &str,
+    weight: i32,
+    text: &str,
+    font_px: f32,
+    aa: crate::config::TrayAntialias,
+) -> TextMask {
+    draw_text(face, weight, text, font_px, true, aa).0
 }
 
 /// 画单个字形（左上对齐），连墨迹位置和前进宽度一起返回。
@@ -1134,9 +1385,15 @@ fn rasterize_with(face: &str, weight: i32, text: &str, font_px: f32) -> TextMask
 /// 这个宽度带小数 —— 第二个字于是落在 4 倍图上不同的子像素相位里，
 /// 降采样后就变成左边 2 像素灰、右边 3 像素黑，同一个「1」两种长相。
 /// 单字画 + 按整数像素落位，同一个字在任何数值里都是同一张位图。
-fn rasterize_glyph(face: &str, weight: i32, ch: char, font_px: f32) -> Glyph {
+fn rasterize_glyph(
+    face: &str,
+    weight: i32,
+    ch: char,
+    font_px: f32,
+    aa: crate::config::TrayAntialias,
+) -> Glyph {
     let text = ch.to_string();
-    let (mask, x0, y0, advance) = draw_text(face, weight, &text, font_px, false);
+    let (mask, x0, y0, advance) = draw_text(face, weight, &text, font_px, false, aa);
     Glyph {
         mask,
         x0,
@@ -1154,22 +1411,24 @@ fn rasterize_glyph(face: &str, weight: i32, ch: char, font_px: f32) -> Glyph {
 ///
 /// 返回 `(墨迹, 墨迹左上角相对画布的位置, 前进宽度)`；
 /// `centered` = 居中画（量字高用的探针），否则左上对齐（拼字用）。
+/// `aa` 决定 GDI 的质量档，以及画完之后要不要按「锐利 / 浑厚」再拉一次灰度。
 fn draw_text(
     face: &str,
     weight: i32,
     text: &str,
     font_px: f32,
     centered: bool,
+    aa: crate::config::TrayAntialias,
 ) -> (TextMask, f32, f32, f32) {
     use std::ffi::c_void;
 
     use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
     use windows::Win32::Graphics::Gdi::{
-        ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS,
-        CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS,
-        DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_TOP, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-        GdiFlush, GetDC, GetTextExtentPoint32W, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC,
-        SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
+        CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
+        DT_SINGLELINE, DT_TOP, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FONT_QUALITY,
+        GdiFlush, GetDC, GetTextExtentPoint32W, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
+        SetTextColor, TRANSPARENT,
     };
     use windows::core::PCWSTR;
 
@@ -1228,7 +1487,7 @@ fn draw_text(
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
+            FONT_QUALITY(aa.quality() as u8),
             0, // DEFAULT_PITCH | FF_DONTCARE
             PCWSTR(face.as_ptr()),
         );
@@ -1267,12 +1526,25 @@ fn draw_text(
             );
             let width = side_usize;
             // BGRA：取最大通道当覆盖率（ClearType 也不会偏色）。
+            // 再按「抗锯齿」那一档改灰度：「无」压成硬边，「锐利 / 浑厚」拉一次曲线。
+            let gamma = aa.gamma();
+            let hard = aa.threshold();
+            let shade = move |raw: f32| -> f32 {
+                if hard {
+                    if raw >= 0.5 { 1.0 } else { 0.0 }
+                } else if (gamma - 1.0).abs() < 0.01 {
+                    raw
+                } else {
+                    raw.powf(gamma)
+                }
+            };
             let coverage = |x: usize, y: usize| {
                 let offset = (y * width + x) * 4;
-                pixels[offset]
+                let raw = pixels[offset]
                     .max(pixels[offset + 1])
                     .max(pixels[offset + 2]) as f32
-                    / 255.0
+                    / 255.0;
+                shade(raw)
             };
             // 墨迹包围盒：阈值压得很低，抗锯齿边缘也算进字形里。
             let (mut x0, mut y0, mut x1, mut y1) = (width, width, 0usize, 0usize);
@@ -1671,18 +1943,18 @@ mod tests {
         }
     }
 
-    /// 「数字大小」是按百分比真长个儿的：85% 比自动高，100% 又比 85% 高。
+    /// 字号是按点真长个儿的：8pt 比「自动」矮，14pt 比「自动」高。
     ///
     /// 老实现里两位数被「宽度放得下」掐着，高度设到 10px 以上就原地不动了；
-    /// 现在超过宽度先横向压窄，所以高度能一直长到可画区（画布减 1px 边）。
+    /// 现在超过宽度先横向压窄，所以字号能一直长到可画区（画布减 1px 边）。
     #[test]
-    fn digit_size_grows_with_percent() {
+    fn digit_size_grows_with_points() {
         let size = super::canvas() as usize;
-        let span = |size_percent: u32| {
-            let style = super::NumberStyle {
-                size_percent,
-                ..super::NumberStyle::default()
-            };
+        let span = |size_pt: u32| {
+            let mut style = super::NumberStyle::default();
+            for metrics in &mut style.metrics {
+                metrics.size_pt = size_pt;
+            }
             let rgba = super::render_number_icon(88, false, false, &style);
             let rows: Vec<usize> = (0..size)
                 .filter(|y| (0..size).any(|x| rgba[(y * size + x) * 4 + 3] > 40))
@@ -1693,18 +1965,18 @@ mod tests {
             )
         };
         let (auto_top, auto_bottom) = span(0);
-        let (mid_top, mid_bottom) = span(85);
-        let (max_top, max_bottom) = span(100);
-        let (auto_h, mid_h, max_h) = (
+        let (small_top, small_bottom) = span(8);
+        let (big_top, big_bottom) = span(14);
+        let (auto_h, small_h, big_h) = (
             auto_bottom - auto_top,
-            mid_bottom - mid_top,
-            max_bottom - max_top,
+            small_bottom - small_top,
+            big_bottom - big_top,
         );
-        assert!(mid_h > auto_h, "85% 没有比自动高：{mid_h} vs {auto_h}");
-        assert!(max_h > mid_h, "100% 没有比 85% 高：{max_h} vs {mid_h}");
-        // 100% 顶到可画区，但四周仍留 1px，不会被任务栏切边。
-        assert!(max_top >= 1, "100% 贴到顶边了：{max_top}");
-        assert!(max_bottom + 1 < size, "100% 贴到底边了：{max_bottom}");
+        assert!(small_h < auto_h, "8pt 没有比自动矮：{small_h} vs {auto_h}");
+        assert!(big_h > auto_h, "14pt 没有比自动高：{big_h} vs {auto_h}");
+        // 大字号顶到可画区，但四周仍留 1px，不会被任务栏切边。
+        assert!(big_top >= 1, "14pt 贴到顶边了：{big_top}");
+        assert!(big_bottom + 1 < size, "14pt 贴到底边了：{big_bottom}");
     }
 
     /// 数字是整数倍降采样出来的，不该留下孤立的毛刺像素。
@@ -1713,12 +1985,15 @@ mod tests {
     /// 就是这种 1~2 像素的孤立碎块。
     #[test]
     fn number_icon_has_no_speckles() {
-        // 自动大小是整数倍降采样；100% 还会再横向压一遍，两条路径都要干净。
-        let styles: Vec<super::NumberStyle> = [0u32, 100]
+        // 自动字号是整数倍降采样；14pt 还会再横向压一遍，两条路径都要干净。
+        let styles: Vec<super::NumberStyle> = [0u32, 14]
             .into_iter()
-            .map(|size_percent| super::NumberStyle {
-                size_percent,
-                ..super::NumberStyle::default()
+            .map(|size_pt| {
+                let mut style = super::NumberStyle::default();
+                for metrics in &mut style.metrics {
+                    metrics.size_pt = size_pt;
+                }
+                style
             })
             .collect();
         let size = super::canvas() as usize;
@@ -1791,8 +2066,8 @@ mod tests {
                         }
                         assert!(
                             count >= 4,
-                            "大小 {}% / percent {percent} 在 ({x},{y}) 有一块只有 {count} 个像素的碎点",
-                            number.size_percent
+                            "字号 {}pt / percent {percent} 在 ({x},{y}) 有一块只有 {count} 个像素的碎点",
+                            number.metrics[1].size_pt
                         );
                     }
                 }
@@ -1836,30 +2111,88 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_digits() {
-        let number = super::NumberStyle::default();
+        use crate::config::TrayDigitMetrics;
         let size = super::canvas() as usize;
-        for percent in [0u32, 1, 9, 10, 11, 12, 18, 20] {
-            let rgba = super::render_number_icon(percent, false, false, &number);
-            println!("=== {percent} ===");
-            for y in 0..size {
-                let mut line = String::new();
-                for x in 0..size {
-                    let a = rgba[(y * size + x) * 4 + 3] as f32 / 255.0;
-                    line.push(if a < 0.02 {
-                        ' '
-                    } else if a < 0.2 {
-                        '.'
-                    } else if a < 0.4 {
-                        ':'
-                    } else if a < 0.6 {
-                        '+'
-                    } else if a < 0.8 {
-                        '*'
-                    } else {
-                        '#'
-                    });
+        // 几组对照，看字号 / 宽 / 高 / 字距 是不是真的各自生效。
+        let cases: [(&str, TrayDigitMetrics, crate::config::TrayAntialias); 6] = [
+            (
+                "自动",
+                TrayDigitMetrics::default(),
+                crate::config::TrayAntialias::Smooth,
+            ),
+            (
+                "12pt",
+                TrayDigitMetrics {
+                    size_pt: 12,
+                    ..TrayDigitMetrics::default()
+                },
+                crate::config::TrayAntialias::Smooth,
+            ),
+            (
+                "12pt 宽60%",
+                TrayDigitMetrics {
+                    size_pt: 12,
+                    width: 60,
+                    ..TrayDigitMetrics::default()
+                },
+                crate::config::TrayAntialias::Smooth,
+            ),
+            (
+                "12pt 高140%",
+                TrayDigitMetrics {
+                    size_pt: 12,
+                    height: 140,
+                    ..TrayDigitMetrics::default()
+                },
+                crate::config::TrayAntialias::Smooth,
+            ),
+            (
+                "12pt 字距200",
+                TrayDigitMetrics {
+                    size_pt: 12,
+                    tracking: 200,
+                    ..TrayDigitMetrics::default()
+                },
+                crate::config::TrayAntialias::Smooth,
+            ),
+            (
+                "12pt 抗锯齿无",
+                TrayDigitMetrics {
+                    size_pt: 12,
+                    ..TrayDigitMetrics::default()
+                },
+                crate::config::TrayAntialias::None,
+            ),
+        ];
+        for (label, metrics, aa) in cases {
+            let mut number = super::NumberStyle::default();
+            number.antialias = aa;
+            for slot in &mut number.metrics {
+                *slot = metrics;
+            }
+            for percent in [1u32, 10, 11, 20, 44, 88, 91, 99, 100] {
+                let rgba = super::render_number_icon(percent, false, false, &number);
+                println!("=== {label} / {percent} ===");
+                for y in 0..size {
+                    let mut line = String::new();
+                    for x in 0..size {
+                        let a = rgba[(y * size + x) * 4 + 3] as f32 / 255.0;
+                        line.push(if a < 0.02 {
+                            ' '
+                        } else if a < 0.2 {
+                            '.'
+                        } else if a < 0.4 {
+                            ':'
+                        } else if a < 0.6 {
+                            '+'
+                        } else if a < 0.8 {
+                            '*'
+                        } else {
+                            '#'
+                        });
+                    }
+                    println!("|{line}|");
                 }
-                println!("|{line}|");
             }
         }
     }
@@ -1871,7 +2204,7 @@ mod tests {
     #[test]
     fn repeated_digit_is_pixel_identical() {
         let family = crate::config::DEFAULT_NUMBER_FONT;
-        let mask = super::low_res(family, 600, 12.7, "11");
+        let mask = super::low_res(family, 600, 12.7, "11", Default::default(), 0.0);
         let inked = |x: usize| (0..mask.height).any(|y| mask.coverage[y * mask.width + x] > 0.02);
         // 按「连续有墨的列」切段：两个字各一段，中间的空白不算。
         let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -1904,6 +2237,25 @@ mod tests {
         }
     }
 
+    /// 同一个字号下，不同数值的整串必须占同一个行高。
+    ///
+    /// 圆头数字（0 6 8 9）顶部有 overshoot，比「1」高一行；只按当前这一串算行高的话，
+    /// 「11」会比「10」矮一行，托盘上数字就会随着音量上下跳一像素（用户看到的是
+    /// 「一高一低」）。`digit_frame` 取 0–9 的并集当统一行高。
+    #[test]
+    fn digits_share_one_line_height() {
+        let family = crate::config::DEFAULT_NUMBER_FONT;
+        let one = super::low_res(family, 600, 16.0, "11", Default::default(), 0.0);
+        for text in ["1", "10", "20", "44", "88", "91", "99", "100"] {
+            let mask = super::low_res(family, 600, 16.0, text, Default::default(), 0.0);
+            assert_eq!(
+                mask.height, one.height,
+                "「{text}」的行高 {} 和「11」的 {} 不一样",
+                mask.height, one.height
+            );
+        }
+    }
+
     /// 同一个数字在不同数值里必须是同一张位图。
     ///
     /// 坑在「按宽度收字号」：两位数的宽度不一样，收完字体后「10」的 1 会比
@@ -1911,9 +2263,9 @@ mod tests {
     #[test]
     fn same_digit_is_stable_across_values() {
         let family = crate::config::DEFAULT_NUMBER_FONT;
-        let one = super::low_res(family, 600, 12.7, "1");
+        let one = super::low_res(family, 600, 12.7, "1", Default::default(), 0.0);
         for text in ["10", "12", "21"] {
-            let mask = super::low_res(family, 600, 12.7, text);
+            let mask = super::low_res(family, 600, 12.7, text, Default::default(), 0.0);
             // 落位是「整数像素 + 相对基线」，所以总能找到一处整数偏移对上。
             let matched = (0..mask.width).any(|dx| {
                 (0..mask.height).any(|dy| {

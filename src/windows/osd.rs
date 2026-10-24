@@ -25,7 +25,9 @@ use crate::{
     },
     config::{Config, ConfigStore, OsdAlign, OsdAnchor, OsdConfig, OsdFunction, OsdPart},
     i18n::Lang,
-    ui::{SliderDragState, VolumeSlider, icon, theme, wheel_direction},
+    ui::{
+        SliderDragState, VolumeSlider, anim::SystemMotion, icon, theme, wheel_direction,
+    },
 };
 
 /// 卡片里长文本（标题 / 副标题）右边至少留多少空隙。
@@ -35,8 +37,50 @@ use crate::{
 /// `part_rect` 会用更小的 `available` 把宽度压窄，看起来就是「挤压」。
 pub const PAD_RIGHT: f32 = 10.0;
 
-/// 每次淡入淡出的推进间隔（约 60Hz）。
-const TICK: Duration = Duration::from_millis(16);
+/// 动画的推进间隔（250Hz 的定时器，实际受系统计时精度限制）。
+///
+/// 以前是 16ms（≈60Hz），但那种节奏下「滑上来」看着明显一格一格的 —— 系统那条
+/// 音量条是按合成帧给的，比 60Hz 顺得多。这里 4ms 一拍，且动画期间只挪窗口 +
+/// 改整窗不透明度（不重绘内容），所以加密不会带来额外绘制开销。
+const TICK: Duration = Duration::from_millis(4);
+
+/// 这一次要不要走入场动画。
+///
+/// 系统风格不看两个时长设置（节奏由系统那套定），只看总开关；
+/// 自己那套还是「时长为 0 就别卡在 In 里」。
+fn animates_in(cfg: &OsdConfig) -> bool {
+    cfg.animate && (cfg.anim_style.is_system() || cfg.fade_in_ms > 0)
+}
+
+/// 这块屏的整屏底部（逻辑像素，含任务栏占的那一条）。
+fn screen_bottom(monitor: u32) -> f32 {
+    let list = crate::platform::monitors::monitors();
+    let chosen = if monitor == 0 {
+        list.iter()
+            .find(|info| info.is_primary)
+            .or_else(|| list.first())
+    } else {
+        list.get(monitor as usize - 1)
+            .or_else(|| list.iter().find(|info| info.is_primary))
+    };
+    match chosen {
+        Some(info) => (info.bounds.1 + info.bounds.3).max(info.work.1 + info.work.3),
+        None => 1080.0,
+    }
+}
+
+/// 系统风格下这一轮要从屏幕底往上滑多远（不是系统风格就是 0）。
+///
+/// 起点让**窗口顶边贴到屏幕底**：整块卡片完全在屏幕外，往上滑的路上被任务栏
+/// 挡住（配合 `behind_taskbar`），才是系统那种「从任务栏后面出来」的样子。
+/// 以前按「卡片高度 + 10」算，卡片矮的时候起点还留在屏幕内，看起来就是从半空冒出来。
+fn system_slide(cfg: &OsdConfig, monitor: u32, window_top: f32) -> f32 {
+    if cfg.anim_style.is_system() {
+        (screen_bottom(monitor) - window_top).max(0.0)
+    } else {
+        0.0
+    }
+}
 
 /// OSD 当前显示的是哪一路音量。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -975,6 +1019,24 @@ pub struct Osd {
     /// 带 `{ss}` 这种变量的文字每帧都可能不一样，但一秒才变一次；
     /// 存一份上次的样子，只有真变了才重画，别拿 16ms 一帧去重绘时钟。
     time_text: Vec<(OsdPart, String)>,
+    /// 系统风格下卡片当前要往下让多远（逻辑像素）；0 = 在位。
+    ///
+    /// 跟系统的音量条一样：出现时从下方滑上来、消失时滑回去，
+    /// 直接挪窗口位置（卡片和影子一起走，不会被窗口裁掉一块）。
+    offset: f32,
+    /// 窗口贴哪儿（左上角 + 尺寸）：`place` 算好存这儿，位移每帧在它上面加减。
+    base: (f32, f32, f32, f32),
+    /// 上一次真正写进窗口的位移，用来跳过没变化的帧。
+    last_offset: f32,
+    /// 系统风格下这一轮的起始位移（窗口顶边贴到屏幕底，整块卡片在屏幕外）。
+    slide: f32,
+    /// 正在跑的那段滑动（独立线程按合成帧推进）；None = 没有动画在跑。
+    slide_run: Option<crate::windows::platform::SlideHandle>,
+    /// 这一轮淡入从哪个不透明度开始。
+    ///
+    /// 正常是从 0（全透明露头），「淡出演到一半又被呼出」时是那一瞬间的读数 ——
+    /// 于是卡片从半透明接着变实，不会先跳成全透明再涨一遍。
+    fade_from: f32,
     /// 这扇窗固定贴在哪块屏上（`None` = 照配置里的 `monitor` 走）。
     ///
     /// 「全部显示器」时每块屏一扇窗，各自钉在自己那块上；
@@ -1058,6 +1120,12 @@ impl Osd {
             visible: false,
             ticker: false,
             frame: (0.0, 0.0),
+            offset: 0.0,
+            base: (0.0, 0.0, 0.0, 0.0),
+            last_offset: f32::NAN,
+            slide: 0.0,
+            slide_run: None,
+            fade_from: 0.0,
             wheel_last_at: None,
             slider: SliderDragState::new(),
             dragging: false,
@@ -1124,6 +1192,34 @@ impl Osd {
     pub fn present(&mut self, request: OsdRequest, window: &mut Window, cx: &mut Context<Self>) {
         // 新的一次显示：上一轮「收预览」的强制淡出到此为止（用户又按了音量键之类）。
         self.dismissing = false;
+        // 入场（预热 / 滑入）还没走完又来了一次：这一下只换内容，
+        // 位置、透明度、相位一律不动 —— 否则每按一下卡片都会从底下重新升一次。
+        // 判定条件是「相位还在入场里」且「滑动线程确实在跑」。
+        let entering = matches!(self.phase, Phase::Warmup { .. } | Phase::In(_))
+            && self.slide_run.is_some();
+        // 出场（滑走 / 淡出）演到一半又来了一次：从**这一刻的位置和不透明度**接着
+        // 反向回来，不能跳回原位、更不能把 alpha 一把拉到 1 —— 那一下就是「卡一下」。
+        let leaving = matches!(self.phase, Phase::Out(_));
+        let resume = if leaving {
+            let (offset, alpha) = match self.slide_run.as_ref() {
+                Some(handle) => (handle.offset(), handle.alpha()),
+                None => (self.offset, self.alpha),
+            };
+            // 旧线程可能还在往屏幕外拽，先叫停；位置由下面这一段接管。
+            if let Some(old) = self.slide_run.take() {
+                old.cancel();
+            }
+            Some((offset.max(0.0), alpha.clamp(0.0, 1.0)))
+        } else {
+            // 上一次的滑动线程停掉 —— 它可能正往屏幕外滑，不取消的话会把窗口
+            // 继续往下拽。入场期间例外：那一轮要继续跑完。
+            if !entering {
+                if let Some(old) = self.slide_run.take() {
+                    old.cancel();
+                }
+            }
+            None
+        };
         // 模板按这次触发的操作选：媒体键弹媒体键模板，音量 / 静音弹音量模板。
         let cfg = self.cfg_for(request.function);
         self.state = self.build_state(&request, &cfg);
@@ -1142,46 +1238,117 @@ impl Osd {
         // 同一次绘制就把新内容提交了，不会露出旧 surface。
         let warmup = if reactivate { WARMUP } else { Duration::ZERO };
         let guarded = !warmup.is_zero();
+        // 系统风格：这一次从「卡片整个在下方」的位置开始，窗口先摆到起点再显示。
+        let enters = animates_in(&cfg);
         if guarded {
             // 先保持全透明，等首帧画完再淡入。
             self.alpha = 0.0;
             self.last_alpha = 0.0;
+            self.fade_from = 0.0;
             self.phase = Phase::Warmup {
                 until: now + warmup,
             };
+        } else if let Some((offset, alpha)) = resume {
+            // 出场中被打断：位置和不透明度都留在刚才那一刻，交给 `tick` / 新的
+            // 滑动从这里往回走。
+            self.offset = offset;
+            self.alpha = alpha;
+            self.fade_from = alpha;
+            self.phase = Phase::In(now);
         } else if reactivate {
-            self.phase = if cfg.animate && cfg.fade_in_ms > 0 {
+            self.phase = if self.slide > 0.0 {
                 Phase::In(now)
             } else {
+                self.offset = 0.0;
                 Phase::Hold {
                     until: now + Duration::from_millis(cfg.hold_ms as u64),
                 }
             };
-            self.alpha = if cfg.animate && cfg.fade_in_ms > 0 {
-                0.0
-            } else {
-                1.0
-            };
+            self.fade_from = 0.0;
+            self.alpha = if enters { 0.0 } else { 1.0 };
         } else if matches!(self.phase, Phase::Warmup { .. }) {
             // 首帧还没画完又来了一次：内容已经换好，别把淡入再往后推。
             self.alpha = 0.0;
         } else {
             // 连续调节：不重新淡入，只把停留时间往后推。
+            self.offset = 0.0;
             self.alpha = 1.0;
+            self.fade_from = 1.0;
             self.phase = Phase::Hold {
                 until: now + Duration::from_millis(cfg.hold_ms as u64),
             };
         }
-        self.place(window, cx, &cfg);
-        if guarded {
-            // 显示之前先把窗口压成全透明：DWM 在 Show 的一瞬间就会把旧 surface 摆出来，
-            // 哪怕只有一帧，也会在淡入开头看出上一次的内容。
-            crate::windows::platform::set_opacity(window, 0.0);
-            self.last_alpha = 0.0;
+        if entering {
+            // 入场还在走：只保留上面换好的内容，窗口位置和整窗透明度都交给
+            // 那一轮的滑动线程，别插手。
+        } else if let Some((offset, alpha)) = resume {
+            // 接力：`place` 按「目标位置 + 刚停下的位移」摆，一次 SetWindowPos
+            // 就落在当前的画面上（尺寸不变时等于没挪），不会闪回原位。
+            self.place(window, cx, &cfg);
+            // 上一轮没记过「到屏幕底多远」（比如刚切到系统风格）就现算一个：
+            // 这一段接力和它之后的出场都要按这个距离走。
+            if self.slide <= 0.5 {
+                self.slide = system_slide(&cfg, self.monitor.unwrap_or(cfg.monitor), self.base.1);
+            }
+            let slide = self.slide.max(offset);
+            if enters && slide > 0.5 {
+                // 动画期间压在任务栏后面：滑过任务栏的那一段被它挡住。
+                crate::windows::platform::behind_taskbar(window);
+                self.start_slide(
+                    window,
+                    &cfg,
+                    crate::windows::platform::SlideMode::Enter,
+                    offset,
+                    alpha,
+                );
+            } else {
+                // 淡入淡出档：原地淡回来，位置交给 `tick` 归零。
+                self.offset = 0.0;
+                self.last_offset = f32::NAN;
+                self.alpha = if enters { alpha } else { 1.0 };
+                self.apply_alpha(window, &cfg);
+                crate::windows::platform::bring_to_front(window);
+            }
+        } else {
+            // 位置和透明度这一轮归滑动线程管，`place` 先按目标位置摆好。
+            self.offset = 0.0;
+            self.place(window, cx, &cfg);
+            // **摆好之后**才知道「从屏幕底到这里有多远」—— 提前算会拿到上一次的位置。
+            let slide = system_slide(&cfg, self.monitor.unwrap_or(cfg.monitor), self.base.1);
+            // 「这一轮从多远起步」：系统风格下恒按「卡片到屏幕底」算。
+            // **出场也用同一个量**滑出去 —— 以前连着按第二下时把它清成 0，
+            // 出场就退化成纯淡出（用户：「触发完再按一次，消失动画变成淡出了」）。
+            self.slide = if enters && cfg.anim_style.is_system() {
+                slide
+            } else {
+                0.0
+            };
+            if guarded {
+                // 显示之前先把窗口压成全透明：DWM 在 Show 的一瞬间就会把旧 surface
+                // 摆出来，哪怕只有一帧，也会在淡入开头看出上一次的内容。
+                crate::windows::platform::set_opacity(window, 0.0);
+                self.last_alpha = 0.0;
+            }
+            crate::windows::platform::set_visible(window, true);
+            // 只有「从隐藏状态重新露头」才滑进来；连续调节时卡片就在屏幕上，
+            // 再滑一次就变成每按一下都从底下冒上来了（`self.slide` 仍然记着，
+            // 出场还要按它滑下去）。
+            if self.slide > 0.0 && reactivate {
+                // 动画期间压在任务栏后面：滑过任务栏的那一段被它挡住，
+                // 才像系统那样「从任务栏背后升起来」。到位后再提到最上层。
+                crate::windows::platform::behind_taskbar(window);
+                self.start_slide(
+                    window,
+                    &cfg,
+                    crate::windows::platform::SlideMode::Enter,
+                    self.slide,
+                    0.0,
+                );
+            } else {
+                crate::windows::platform::bring_to_front(window);
+            }
+            self.apply_alpha(window, &cfg);
         }
-        crate::windows::platform::set_visible(window, true);
-        crate::windows::platform::bring_to_front(window);
-        self.apply_alpha(window, &cfg);
         self.visible = true;
         cx.notify();
         // 立刻要一帧：OSD 窗口是 NOACTIVATE 的，不给它一条 WM_PAINT，
@@ -1353,15 +1520,128 @@ impl Osd {
         y = y.clamp(ay, (ay + ah - card_h).max(ay));
         // 卡片在窗口里居中，所以窗口再往左上让出 pad，卡片本体才落在锚点上。
         let (x, y) = (x - pad, y - pad);
-        crate::windows::platform::set_frame(
-            window,
-            gpui::Bounds::new(point(px(x), px(y)), size(px(width), px(height))),
-            window.scale_factor(),
-        );
+        self.base = (x, y, width, height);
+        // 强制写一遍：新位置可能刚好和上一次的位移抵消成同一个值。
+        self.last_offset = f32::NAN;
+        self.sync_position(window);
         if (width, height) != self.frame {
             self.frame = (width, height);
             window.bounds_changed(cx);
         }
+    }
+
+    /// 把「最终位置 + 当前位移」写进窗口。
+    ///
+    /// 系统风格下卡片是从下方滑上来的：直接把整扇窗往下挪，卡片和投影一起走，
+    /// 不用在窗口里裁一块（裁的话影子会被切掉一截）。
+    fn sync_position(&mut self, window: &Window) {
+        let (x, y, width, height) = self.base;
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        if !self.last_offset.is_nan() && (self.offset - self.last_offset).abs() < 0.3 {
+            return;
+        }
+        self.last_offset = self.offset;
+        crate::windows::platform::set_frame(
+            window,
+            gpui::Bounds::new(point(px(x), px(y + self.offset)), size(px(width), px(height))),
+            window.scale_factor(),
+        );
+    }
+
+    /// 起一段滑动（入场 / 出场）。
+    ///
+    /// 位移和整窗不透明度都交给独立线程按合成帧推进 —— gpui 的定时器实际是 16ms
+    /// 粒度，165Hz 屏上看着就是一格一格。线程「跑完了」的标志存在 `slide_run` 里，
+    /// 由 `tick` 收尾（转 Hold / 收起来）。
+    ///
+    /// `from` / `from_alpha` 是这一段的起点：正常入场是「整个在下面的距离、完全透明」；
+    /// 出场演到一半被呼出时就是那一刻的位置和不透明度，于是它是接着往回走，
+    /// 不是重新从底下升一遍。
+    fn start_slide(
+        &mut self,
+        window: &Window,
+        cfg: &OsdConfig,
+        mode: crate::windows::platform::SlideMode,
+        from: f32,
+        from_alpha: f32,
+    ) {
+        use crate::windows::platform::{SlideMode, SlideRun};
+        let motion = SystemMotion::osd(self.slide);
+        // 接力入场（出场演到一半又按了一下）：位置和不透明度都只剩一小截，
+        // 还按整段节奏走就成了「卡片慢慢蹭回来」—— 按剩多少把时间常数和淡入
+        // 时长一起收短，回来的手感和出去的 140ms 对得上。
+        let (tau_ms, fade_delay_ms, fade_ms, total_ms) =
+            if mode == SlideMode::Enter && from_alpha > 0.01 {
+                let remain = (1.0 - from_alpha).clamp(0.0, 1.0);
+                let span = if self.slide > 0.5 {
+                    (from / self.slide).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let resume = SystemMotion {
+                    slide: motion.slide,
+                    tau_ms: motion.tau_ms * span.clamp(0.35, 1.0),
+                    fade_delay_ms: 0.0,
+                    fade_ms: motion.fade_ms * remain.clamp(0.3, 1.0),
+                    exit_ms: motion.exit_ms,
+                };
+                (
+                    resume.tau_ms,
+                    resume.fade_delay_ms,
+                    resume.fade_ms,
+                    resume.enter_total_ms(),
+                )
+            } else {
+                (
+                    motion.tau_ms,
+                    motion.fade_delay_ms,
+                    motion.fade_ms,
+                    match mode {
+                        SlideMode::Enter => motion.enter_total_ms(),
+                        SlideMode::Exit => motion.exit_ms,
+                    },
+                )
+            };
+        let run = SlideRun {
+            mode,
+            to: (self.base.0, self.base.1),
+            direction: (0.0, 1.0),
+            from: match mode {
+                SlideMode::Enter => from,
+                SlideMode::Exit => 0.0,
+            },
+            end: match mode {
+                SlideMode::Enter => 0.0,
+                SlideMode::Exit => self.slide,
+            },
+            tau_ms,
+            fade_delay_ms,
+            fade_ms,
+            total_ms,
+            opacity: cfg.alpha(),
+            from_alpha,
+        };
+        self.slide_run = Some(crate::windows::platform::run_slide(window, run));
+    }
+
+    /// 收起来：藏窗口 + 停 ticker（淡出 / 滑出都走这里）。
+    fn hide_now(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.phase = Phase::Hidden;
+        self.visible = false;
+        self.dismissing = false;
+        self.hold = None;
+        self.fade_from = 0.0;
+        // 不 `set_visible(false)`：隐藏再显示会让 DWM 给窗口补一段出现淡入，
+        // 那一次滑入就变半透明。直接把窗口挪到屏幕外（下面）就是「看不见」。
+        self.offset = if self.slide > 0.5 { self.slide } else { 0.0 };
+        crate::windows::platform::set_opacity(window, 0.0);
+        self.last_alpha = 0.0;
+        self.sync_position(window);
+        self.ticker = false;
+        cx.notify();
+        false
     }
 
     fn apply_alpha(&mut self, window: &Window, cfg: &OsdConfig) {
@@ -1370,6 +1650,7 @@ impl Osd {
             self.last_alpha = alpha;
             crate::windows::platform::set_opacity(window, alpha);
         }
+        self.sync_position(window);
     }
 
     fn kick_ticker(&mut self, cx: &mut Context<Self>) {
@@ -1432,6 +1713,25 @@ impl Osd {
         let cfg = self.cfg();
         let now = Instant::now();
 
+        // 滑动线程在跑：位置和整窗不透明度都归它管，这里只等它跑完再收尾。
+        // （自己那套淡入淡出走下面的状态机，不经过这里。）
+        if let Some(flag) = self.slide_run.clone() {
+            if !flag.is_done() {
+                return true;
+            }
+            self.slide_run = None;
+            if matches!(self.phase, Phase::Out(_)) {
+                return self.hide_now(window, cx);
+            }
+            self.offset = 0.0;
+            self.alpha = 1.0;
+            self.phase = Phase::Hold {
+                until: now + Duration::from_millis(cfg.hold_ms as u64),
+            };
+            self.apply_alpha(window, &cfg);
+            return true;
+        }
+
         // 自定义 / 状态文字里有 `{ss}` 这类变量：这一格跳了就重画一张。
         if self.refresh_time_text(&cfg) {
             cx.notify();
@@ -1440,6 +1740,7 @@ impl Osd {
 
         // 钉住：一直显示，不进入淡出，也不用管悬停。
         if self.pinned {
+            self.offset = 0.0;
             self.alpha = 1.0;
             self.phase = Phase::Hold {
                 until: now + Duration::from_secs(3600),
@@ -1451,11 +1752,14 @@ impl Osd {
         // 等首帧：这段时间窗口是全透明的，新内容画完才开始淡入。
         // 放在悬停判断之前 —— 否则指针正好停在卡片上会把 warmup 抢成「直接实心显示」。
         if let Phase::Warmup { until } = self.phase {
+            // 等首帧的时间窗口停在起点，还没开始往上滑。
+            self.offset = self.slide;
             self.alpha = 0.0;
             if now >= until {
-                if cfg.animate && cfg.fade_in_ms > 0 {
+                if animates_in(&cfg) {
                     self.phase = Phase::In(now);
                 } else {
+                    self.offset = 0.0;
                     self.alpha = 1.0;
                     self.phase = Phase::Hold {
                         until: now + Duration::from_millis(cfg.hold_ms as u64),
@@ -1485,6 +1789,7 @@ impl Osd {
         // **松手 / 移开之后照常倒计时淡出** —— 只有「操作期间」才不算。
         // 「收预览」（设置页关窗）这轮例外：鼠标就算停在卡片上也照常走完淡出。
         if !self.dismissing && ((self.hovered && cfg.hover_hold) || self.dragging) {
+            self.offset = 0.0;
             self.alpha = 1.0;
             self.phase = Phase::Hold {
                 until: now + Duration::from_millis(cfg.hold_ms as u64),
@@ -1502,20 +1807,51 @@ impl Osd {
             // 上面已经单独处理并 return 了，这里只为穷尽匹配。
             Phase::Warmup { .. } => {}
             Phase::In(start) => {
-                let duration = cfg.fade_in_ms as f32 / 1000.0;
                 let elapsed = now.duration_since(start).as_secs_f32();
-                if duration <= 0.0 || elapsed >= duration {
-                    self.alpha = 1.0;
-                    self.phase = Phase::Hold {
-                        until: now + Duration::from_millis(cfg.hold_ms as u64),
-                    };
+                // 这一轮从哪涨上来：正常是 0，出场被打断时是那一刻的读数。
+                let from = self.fade_from.clamp(0.0, 1.0);
+                if cfg.anim_style.is_system() {
+                    // 系统那套：位移指数缓出 + 同时淡入，两条曲线各走各的。
+                    let motion = SystemMotion::osd(self.slide);
+                    let (offset, alpha) = motion.enter(elapsed * 1000.0);
+                    self.offset = offset;
+                    self.alpha = from + (1.0 - from) * alpha;
+                    if elapsed * 1000.0 >= motion.enter_total_ms() {
+                        self.offset = 0.0;
+                        self.alpha = 1.0;
+                        self.phase = Phase::Hold {
+                            until: now + Duration::from_millis(cfg.hold_ms as u64),
+                        };
+                        // 滑到位了：从任务栏后面提回最上层，别让它一直压在任务栏下面。
+                        crate::windows::platform::bring_to_front(window);
+                    }
                 } else {
-                    self.alpha = (elapsed / duration).clamp(0.0, 1.0);
+                    self.offset = 0.0;
+                    let duration = cfg.fade_in_ms as f32 / 1000.0;
+                    if duration <= 0.0 || elapsed >= duration {
+                        self.alpha = 1.0;
+                        self.phase = Phase::Hold {
+                            until: now + Duration::from_millis(cfg.hold_ms as u64),
+                        };
+                    } else {
+                        self.alpha = from + (1.0 - from) * (elapsed / duration).clamp(0.0, 1.0);
+                    }
                 }
             }
             Phase::Hold { until } => {
+                self.offset = 0.0;
                 self.alpha = 1.0;
                 if now >= until {
+                    // 系统风格：出场也交给滑动线程（滑下去 + 快淡出）。
+                    if cfg.anim_style.is_system() && cfg.animate && self.slide > 0.5 {
+                        self.start_slide(
+                            window,
+                            &cfg,
+                            crate::windows::platform::SlideMode::Exit,
+                            0.0,
+                            self.alpha,
+                        );
+                    }
                     self.phase = Phase::Out(now);
                 }
             }
@@ -1523,36 +1859,34 @@ impl Osd {
                 // 关掉「淡入淡出」之后这一幕必须立刻收：以前这里不看开关，
                 // 出来是「啪」一下、消失却还慢慢淡 240ms，一快一慢很别扭
                 // （`fade_in` 那边三处都判了 `animate`，只有这里漏了）。
-                let duration = if cfg.animate {
-                    cfg.fade_out_ms as f32 / 1000.0
-                } else {
-                    0.0
-                };
                 let elapsed = now.duration_since(start).as_secs_f32();
-                if duration <= 0.0 || elapsed >= duration {
-                    self.alpha = 0.0;
+                if cfg.anim_style.is_system() && cfg.animate {
+                    // 系统那套：滑回下方 + 快淡出（实测约 140ms）。
+                    let motion = SystemMotion::osd(self.slide);
+                    let (offset, alpha) = motion.exit(elapsed * 1000.0);
+                    self.offset = offset;
+                    self.alpha = alpha;
                 } else {
-                    self.alpha = (1.0 - elapsed / duration).clamp(0.0, 1.0);
+                    self.offset = 0.0;
+                    let duration = if cfg.animate {
+                        cfg.fade_out_ms as f32 / 1000.0
+                    } else {
+                        0.0
+                    };
+                    if duration <= 0.0 || elapsed >= duration {
+                        self.alpha = 0.0;
+                    } else {
+                        self.alpha = (1.0 - elapsed / duration).clamp(0.0, 1.0);
+                    }
                 }
             }
         }
 
         self.apply_alpha(window, &cfg);
         if matches!(self.phase, Phase::Out(_)) && self.alpha <= 0.0 {
-            self.phase = Phase::Hidden;
-            self.visible = false;
-            // 收起来了，这一轮「关窗即收」的任务也算完成。
-            self.dismissing = false;
-            // 收起来了就不能留着这轮的手势记录：下次再弹出来（可能是很久以后、
-            // 音量早就被别的东西改过）沿用旧基准会把判据一下子判成「快照动过」。
-            self.hold = None;
-            crate::windows::platform::set_visible(window, false);
-            // 藏好之后保持全透明：下次显示的第一帧不能是实心的。
-            crate::windows::platform::set_opacity(window, 0.0);
-            self.last_alpha = 0.0;
-            self.ticker = false;
-            cx.notify();
-            return false;
+            // 收起来了，这一轮「关窗即收」的任务也算完成；这轮的手势记录一并清掉
+            // （下次弹出来可能很久以后，沿用旧基准会把判据一下子判成「快照动过」）。
+            return self.hide_now(window, cx);
         }
         true
     }
@@ -1922,6 +2256,7 @@ impl Render for Osd {
             .items_center()
             .justify_center()
             .child(card)
+            .into_any_element()
     }
 }
 

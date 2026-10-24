@@ -27,7 +27,7 @@ use crate::{
     config::{Config, ConfigStore},
     i18n::Lang,
     ui::{
-        ActivityState, Entrance, SliderDragState, VolumeSlider, anim, device_icon_resolved, icon,
+        ActivityState, Entrance, EntranceMotion, SliderDragState, VolumeSlider, anim, device_icon_resolved, icon,
         load_png_rgba, theme, volume_icon_name, wheel_direction,
     },
 };
@@ -341,6 +341,20 @@ pub struct Flyout {
     last_hidden: Option<Instant>,
     /// 入场动画（与显示器窗口共用 `ui::anim::Entrance`，两扇窗必须同步长出来）。
     anim: Entrance,
+    /// 窗口该停的位置（逻辑像素，左上角 + 宽高）：`update_frame` 算好存这儿，
+    /// 系统风格的滑入每帧在它上面加位移。
+    base_frame: (f32, f32, f32, f32),
+    /// 正在跑的那段滑动（独立线程按合成帧推进）；None = 没动画在跑。
+    slide: Option<crate::windows::platform::SlideHandle>,
+    /// 静止时窗口停在哪：0 = 在位，`slide_distance` = 整个在屏幕外。
+    /// 打断时拿它当「上一段停下的位置」。
+    rest_offset: f32,
+    /// 上一次「因为失焦而收起」的时刻。
+    ///
+    /// 托盘那一下点击会先让面板失焦收起、几十毫秒后才轮到 Toggle，
+    /// 只有这种「刚被失焦收掉」的情况才需要挡一下；快捷键连按是用户明确的
+    /// 反复开关，不能被挡住（否则按快一点就变成「只出一次」）。
+    blur_hidden_at: Option<Instant>,
     /// 任务栏贴在哪条边：面板贴同一条边，并从那一侧向屏幕内展开。
     edge: crate::windows::platform::TaskbarEdge,
     visible: bool,
@@ -439,6 +453,10 @@ impl Flyout {
             last_height: 0.0,
             last_hidden: None,
             anim: Entrance::new(),
+            base_frame: (0.0, 0.0, 0.0, 0.0),
+            slide: None,
+            rest_offset: 0.0,
+            blur_hidden_at: None,
             edge: crate::windows::platform::taskbar_edge(),
             visible: false,
             apps_scroll: gpui::ScrollHandle::new(),
@@ -2634,7 +2652,8 @@ impl Flyout {
         crate::windows::platform::set_topmost(window, pinned);
         if pinned {
             // 已经开着也要重新顶一下：别的置顶窗口可能正压在它上面。
-            crate::windows::platform::bring_to_front(window);
+            // 但仍排在任务栏之后 —— 钉住是「别收起」，不是「盖住任务栏」。
+            crate::windows::platform::present_behind_taskbar(window);
         }
         cx.notify();
     }
@@ -2705,6 +2724,170 @@ impl Flyout {
         .detach();
     }
 
+    /// 这一轮走哪套动画。
+    fn entrance_motion(&self) -> EntranceMotion {
+        match self.config.borrow().get().popup_anim_style {
+            crate::config::PopupAnimStyle::System => EntranceMotion::System,
+            crate::config::PopupAnimStyle::Fade => EntranceMotion::Fade,
+        }
+    }
+
+    /// 系统风格：整扇窗从「完全在屏幕外」滑到目标位置要走多远（正数）。
+    ///
+    /// 起点就贴着屏幕那条边（任务栏在下面时 = 屏幕底）：窗口顶边对齐屏幕底，
+    /// 整块卡片完全在屏幕外，往上滑的这一路上被任务栏挡住 —— 系统自己就是这么出来的。
+    /// 不是「面板高度 + 固定值」：面板高矮差很多时，那种算法会让开口忽高忽低。
+    fn slide_distance(&self, cx: &mut Context<Self>) -> f32 {
+        let (x, y, width, height) = self.base_frame;
+        if width <= 0.0 || height <= 0.0 {
+            return 0.0;
+        }
+        let area = cx
+            .primary_display()
+            .map(|display| display.bounds())
+            .unwrap_or_else(|| {
+                gpui::Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.)))
+            });
+        let (ax, ay) = (area.origin.x.as_f32(), area.origin.y.as_f32());
+        let (aw, ah) = (area.size.width.as_f32(), area.size.height.as_f32());
+        match self.edge {
+            TaskbarEdge::Bottom => (ay + ah - y).max(0.0),
+            TaskbarEdge::Top => (y + height - ay).max(0.0),
+            TaskbarEdge::Left => (x + width - ax).max(0.0),
+            TaskbarEdge::Right => (ax + aw - x).max(0.0),
+        }
+    }
+
+    /// 把「目标位置 + 当前位移」写进窗口（系统风格专用）。
+    ///
+    /// 位移方向跟着任务栏那一条边走：底 / 顶任务栏是上下，左右任务栏是左右。
+    fn apply_slide(&self, window: &Window, offset: f32) {
+        let (x, y, width, height) = self.base_frame;
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let (dx, dy) = match self.edge {
+            TaskbarEdge::Bottom => (0.0, offset),
+            TaskbarEdge::Top => (0.0, -offset),
+            TaskbarEdge::Left => (-offset, 0.0),
+            TaskbarEdge::Right => (offset, 0.0),
+        };
+        crate::windows::platform::set_origin(window, x + dx, y + dy, window.scale_factor());
+    }
+
+    /// 起一段「从屏幕外滑进来」的动画。
+    ///
+    /// 交给一条独立线程 + `DwmFlush` 按合成帧推进（gpui 自己的定时器是 16ms 粒度，
+    /// 165Hz 屏上看着就是一格一格）。这期间不重绘：内容一帧都不变，只是整扇窗在移动。
+    /// 造一段滑动：`from` → `end`，方向和曲线跟着这一档动画走。
+    ///
+    /// 三档最终都是「整扇窗平移」这一种物理动作，区别只在曲线和时长：
+    /// - `System`：系统的指数曲线（时间常数按用户设的速度等比缩放）；
+    /// - `Unfold`：ease-out，走满用户设的时长（以前那种「内容长出来」，
+    ///   现在改成整块滑进来 —— 一样是从任务栏那侧冒出来，但没有裁切容器、
+    ///   也不碰整窗不透明度，帧率跟着屏幕刷新走）；
+    /// - `Fade`：一点位移都不走，只做整窗淡入淡出。
+    fn slide_plan(
+        &self,
+        mode: crate::windows::platform::SlideMode,
+        motion: EntranceMotion,
+        config_ms: u32,
+        from: f32,
+        end: f32,
+    ) -> crate::windows::platform::SlideRun {
+        use crate::windows::platform::{SlideMode, SlideRun};
+        let (x, y) = (self.base_frame.0, self.base_frame.1);
+        let direction = match self.edge {
+            TaskbarEdge::Bottom => (0.0, 1.0),
+            TaskbarEdge::Top => (0.0, -1.0),
+            TaskbarEdge::Left => (-1.0, 0.0),
+            TaskbarEdge::Right => (1.0, 0.0),
+        };
+        // 用户设的时长；`BOLUME_ANIM_MS` 还能整体放慢，方便逐帧截图核对。
+        let total = anim::entrance_duration(config_ms).as_secs_f32() * 1000.0;
+        let base = SlideRun {
+            mode,
+            to: (x, y),
+            direction,
+            from,
+            end,
+            tau_ms: 0.0,
+            fade_delay_ms: 0.0,
+            fade_ms: 0.0,
+            total_ms: total,
+            opacity: crate::ui::theme::ui_opacity(),
+            // 入场从全透明淡进来，出场从实心淡出去（中途接力由调用方改这一项）。
+            from_alpha: if mode == SlideMode::Exit { 1.0 } else { 0.0 },
+        };
+        match motion {
+            EntranceMotion::System => {
+                let m = anim::SystemMotion::panel_scaled(end.max(from), total);
+                let entering = mode == SlideMode::Enter;
+                let slides = m.slide > 0.5;
+                SlideRun {
+                    from: if slides { from } else { 0.0 },
+                    end: if slides { end } else { 0.0 },
+                    tau_ms: m.tau_ms,
+                    fade_delay_ms: m.fade_delay_ms,
+                    fade_ms: if entering { m.fade_ms } else { 0.0 },
+                    total_ms: if entering {
+                        m.enter_total_ms()
+                    } else {
+                        m.exit_ms
+                    },
+                    ..base
+                }
+            }
+            EntranceMotion::Fade => SlideRun {
+                // 原地淡入淡出：一点位移都不走。
+                from: 0.0,
+                end: 0.0,
+                fade_delay_ms: 0.0,
+                fade_ms: total,
+                total_ms: total,
+                ..base
+            },
+        }
+    }
+
+    /// 起一段滑动，跑完自己收尾。
+    ///
+    /// 收尾时先核对「`self.slide` 还是不是这一段」—— 被打断后新一轮已经接管，
+    /// 旧线程的完成回调不能把新动画的状态抹掉。
+    fn start_slide(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+        run: crate::windows::platform::SlideRun,
+    ) {
+        use crate::windows::platform::SlideMode;
+        let mode = run.mode;
+        let end = run.end;
+        let handle = crate::windows::platform::run_slide(window, run);
+        self.slide = Some(handle.clone());
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(20))
+                    .await;
+                if handle.is_done() {
+                    break;
+                }
+            }
+            let _ = view.update(cx, |this, cx| {
+                if this.slide.as_ref().map(|now| now.same_run(&handle)) != Some(true) {
+                    return;
+                }
+                this.slide = None;
+                this.anim.finish();
+                this.rest_offset = if mode == SlideMode::Exit { end } else { 0.0 };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         self.activity.reset();
@@ -2717,42 +2900,71 @@ impl Flyout {
         // 动画开关：设置里「弹出动画」关掉，或者系统要求减少动态效果，都直接铺满。
         let animate = self.config.borrow().get().popup_animation && !cx.reduce_motion();
         let config_ms = self.config.borrow().get().popup_animation_ms;
-        self.anim.begin(animate, config_ms);
+        let motion = self.entrance_motion();
         // 窗口几何变更必须放到本帧绘制结束之后：鼠标事件是在绘制期间派发的，
         // 此时直接 SetWindowPos 会撞上 gpui 内部正在借用的渲染器。
         cx.defer_in(window, move |this, window, cx| {
-            this.update_frame(window, cx);
-            // 先整窗透明再显示：窗口一露头 DWM 就会画出圆角框和阴影，
-            // 此时内容（动画第一帧）还没提交，不透明的话会闪一下空框。
-            // 透明度随后跟着入场进度拉起来，见 `Entrance::tick`。
-            this.anim.set_alpha(window, 0.0);
-            crate::windows::platform::set_visible(window, true);
-            crate::windows::platform::bring_to_front(window);
-            crate::windows::platform::activate(window);
-            if animate {
-                // 从「真的显示出来」那一刻开始计时。
-                this.anim.start();
-                let session = this.anim.session();
-                // 兜底：正常情况由逐帧回调推进，但窗口被遮挡 / 合成器不给帧时
-                // 回调可能不续，到点强制收尾，绝不让面板停在半截高度。
-                let deadline = this.anim.fallback_after();
-                let view = cx.entity().downgrade();
-                cx.spawn(async move |_, cx| {
-                    cx.background_executor().timer(deadline).await;
-                    let _ = view.update(cx, |this, cx| {
-                        if this.anim.settle(session) {
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
-            } else {
-                // 关掉动画：内容已经完整摆好、缓存里就是完整画面，直接给满不透明度。
-                // 顺序不能反 —— 反过来就又回到「不透明空窗先出现」。
-                this.anim.set_alpha(window, 1.0);
-            }
+            this.enter(window, cx, animate, config_ms, motion);
             cx.notify();
         });
+        // `defer_in` 要等「下一帧绘制完」才执行；空闲时 gpui 不给帧，
+        // 这一段可能一直挂着。主动敲一下重绘，defer 立刻就能跑。
+        crate::windows::platform::post_repaint(window);
+    }
+
+    /// 真正把面板摆出来：能从半路接力（打断），也能从屏幕外起步。
+    fn enter(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        animate: bool,
+        config_ms: u32,
+        motion: EntranceMotion,
+    ) {
+        use crate::windows::platform::SlideMode;
+        // 上一段还在跑（正在收起 / 正在滑入）：从它停下的位置接力，
+        // 不重新摆位 —— 这就是「没出完就能收回」和「收回一半又弹出」的底子。
+        let resume = self.slide.take().map(|handle| {
+            let offset = handle.offset();
+            handle.cancel();
+            offset
+        });
+        let from = match resume {
+            Some(offset) => offset,
+            None => {
+                // 滑入那两档要从屏幕外起步：一步落到屏幕外，
+                // 中间不留「在目标位置停一帧」的机会（否则会闪一下完整面板）。
+                let parked = animate && motion != EntranceMotion::Fade;
+                self.update_frame_parked(window, cx, parked);
+                if parked {
+                    self.slide_distance(cx)
+                } else {
+                    0.0
+                }
+            }
+        };
+        self.anim.begin_with(animate, motion, from);
+        // 淡入淡出先把不透明度压到 0；滑入那两档**不能**碰整窗 alpha ——
+        // 一碰 DWM 就会补一段约 200ms 的出现淡入，动画里卡片一直是半透明的。
+        if animate {
+            // 只有「淡入淡出」需要先压成全透明；滑入那两档一律不碰整窗 alpha。
+            if motion == EntranceMotion::Fade {
+                crate::windows::platform::set_opacity(window, 0.0);
+            }
+        } else {
+            // 关掉动画：直接给满（上一次可能是淡出档，窗口还停在 alpha = 0）。
+            crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
+        }
+        crate::windows::platform::set_visible(window, true);
+        crate::windows::platform::activate(window);
+        // 一直排在任务栏之后：滑过任务栏的那一段和底部那圈阴影都被任务栏挡住。
+        crate::windows::platform::present_behind_taskbar(window);
+        if animate {
+                let run = self.slide_plan(SlideMode::Enter, motion, config_ms, from, 0.0);
+            self.start_slide(window, cx, run);
+            } else {
+            self.rest_offset = 0.0;
+        }
     }
 
     pub fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2777,44 +2989,148 @@ impl Flyout {
         *self.menu.borrow_mut() = None;
         *self.device_menu.borrow_mut() = None;
         self.engine.send(AudioCommand::SetVisible(false));
-        // 隐藏前先把内容收成 1px 再画一帧：系统是拿「上一次提交的画面」
-        // 来显示窗口的，缓存里若是完整面板，下次弹出会先闪一整块再开始动画。
-        // 关掉动画（或系统要求减少动态效果）时反之要留完整画面，
-        // 否则显示瞬间反而只有一条边，还得等下一帧才铺满。
         let animate = self.config.borrow().get().popup_animation && !cx.reduce_motion();
         let config_ms = self.config.borrow().get().popup_animation_ms;
-        self.anim.begin(animate, config_ms);
-        cx.notify();
-        cx.defer_in(window, |this, window, _| {
-            crate::windows::platform::set_visible(window, false);
-            // 藏好之后保持全透明，**不要**复位成 1.0：
-            // 窗口隐藏的这段时间里，DWM 手上就是「alpha = 0」这个属性；
-            // 下次 ShowWindow 的第一帧因此也是全透明的。
-            // 若复位成 1.0，DWM 会先用不透明状态合成一帧再收到新的 alpha，
-            // 那一帧就是用户看到的「先闪一道黑边框」。
-            // QcClip 的隐藏动画最后一帧同样停在 0（`visibility_animation_opacity`
-            // 显示/隐藏都收敛到 0/1），从不复位。
-            this.anim.set_alpha(window, 0.0);
+        let close_anim = self.config.borrow().get().panel_close_animation;
+        let motion = self.entrance_motion();
+        cx.defer_in(window, move |this, window, cx| {
+            this.leave(window, cx, animate && close_anim, config_ms, motion);
+            cx.notify();
         });
+        // 同上：别让收起也白等一帧。
+        crate::windows::platform::post_repaint(window);
+    }
+
+    /// 让面板退场。
+    ///
+    /// **怎么出就怎么回**：滑入的那两档收回也是滑出去（同一套曲线、同一个方向），
+    /// 淡入的那一档收回就是淡出。正在滑入时接到收起，就从当前位置接着往下滑，
+    /// 不会先跳回起点。
+    fn leave(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        animate: bool,
+        config_ms: u32,
+        motion: EntranceMotion,
+    ) {
+        use crate::windows::platform::SlideMode;
+        let from = match self.slide.take() {
+            Some(handle) => {
+                let offset = handle.offset();
+                handle.cancel();
+                offset
+            }
+            None => self.rest_offset,
+        };
+        if !animate {
+            // 关掉收起动画：先照旧把窗口挪到屏幕外（`park_window` 读 anim.slide()），
+            // 再清掉这一轮的参数。
+            self.park_window(window);
+            self.anim.finish();
+            return;
+        }
+        let end = if motion == EntranceMotion::Fade {
+            0.0
+        } else {
+            self.slide_distance(cx)
+        };
+        let run = self.slide_plan(SlideMode::Exit, motion, config_ms, from, end);
+        self.start_slide(window, cx, run);
+    }
+
+    /// 启动时先在屏幕外把窗口「显示」出来一次。
+    ///
+    /// 目的不是显示面板，是让 DWM 把「窗口第一次出现」那段约 200ms 的淡入
+    /// 在看不见的地方用完 —— 否则用户第一次打开面板时，滑入的整个过程卡片都是
+    /// 半透明的（看起来就像后面垫了一层）。
+    pub fn warm_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible {
+            return;
+        }
+        self.update_frame(window, cx);
+        let slide = self.slide_distance(cx);
+        self.anim.begin_with(false, self.entrance_motion(), 0.0);
+        self.rest_offset = slide;
+        // 屏幕外全程保持**不透明**：整窗 alpha 一动，DWM 就会给窗口补一段
+        // 出现淡入，滑入时卡片就是半透明的。
+        crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
+        self.apply_slide(window, slide);
+        crate::windows::platform::set_visible(window, true);
+        crate::windows::platform::present_behind_taskbar(window);
+        cx.notify();
+    }
+
+    /// 把窗口停到「屏幕外」（或全透明）—— 收起的终点。
+    ///
+    /// 不 `ShowWindow(SW_HIDE)`：一隐藏，下次显示 DWM 又会补一段出现淡入。
+    fn park_window(&mut self, window: &Window) {
+        match self.anim.motion() {
+            EntranceMotion::Fade => {
+                crate::windows::platform::set_opacity(window, 0.0);
+                self.rest_offset = 0.0;
+            }
+            _ => {
+                let slide = self.slide_distance_plain();
+                self.apply_slide(window, slide);
+                self.rest_offset = slide;
+            }
+        }
+    }
+
+    /// 收起后要停到多远（就是这一轮 `begin_with` 记下的位移，不再查显示器）。
+    fn slide_distance_plain(&self) -> f32 {
+        let (_, _, width, height) = self.base_frame;
+        if width <= 0.0 || height <= 0.0 {
+            return 0.0;
+        }
+        self.anim.slide()
     }
 
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.visible {
+            // 正在滑入也没关系：`leave` 会从当前位置接着往下收。
             self.hide(window, cx);
             return;
         }
         // 托盘图标那一下点击：失焦先把面板收起来，紧接着 Toggle 才到，
         // 此时 visible 已经是 false，不再挡一下就会「收不起来、又弹回去」。
-        if let Some(hidden) = self.last_hidden {
+        // 只挡这种「刚被失焦收掉」的；快捷键连按（上一次是 toggle 收的）不挡。
+        if let Some(hidden) = self.blur_hidden_at {
             if hidden.elapsed() < TOGGLE_SUPPRESS {
                 return;
             }
         }
+        // 从半路弹回来（收起动画还没播完就再按一次）：`enter` 接着当前位置往上滑。
         self.show(window, cx);
+    }
+
+    /// 失焦收起（托盘点击 / 点到别处）。
+    ///
+    /// 打一个时间戳：紧跟其后的 Toggle 是「同一次点击」的回声，要挡住；
+    /// 键盘连按则是真的想反复开关，走 `toggle` 不经过这里。
+    pub fn hide_from_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.blur_hidden_at = Some(Instant::now());
+        self.hide(window, cx);
     }
 
     /// 面板贴右下角（任务栏上沿）定位，高度随内容精确变化。
     pub fn update_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_frame_parked(window, cx, false);
+    }
+
+    /// 同上，`parked` = 这次落位直接落到**屏幕外**（系统风格的起点）。
+    ///
+    /// 面板收起之后窗口停在屏幕外、而且**是可见的**（不隐藏就不会触发 DWM 的出现淡入）。
+    /// 如果打开时先按目标位置摆一次再挪出去，那一帧就会被合成出来 ——
+    /// 用户看到的就是「先闪一下弹出来的面板，然后才开始滑」。
+    /// 所以这里一步到位：算完目标位置，直接按起点落位。
+    pub fn update_frame_parked(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        parked: bool,
+    ) {
         let (width, height) = self.panel_size();
         self.last_height = height;
         let area = cx
@@ -2879,9 +3195,32 @@ impl Flyout {
                 _ => {}
             }
         }
+        self.base_frame = (
+            origin.x.as_f32(),
+            origin.y.as_f32(),
+            width,
+            height,
+        );
+        // 起点：整扇窗刚好在屏幕外（底/顶任务栏按高度，左右按宽度）。
+        let placed = if parked {
+            let screen = cx
+                .primary_display()
+                .map(|display| display.bounds())
+                .unwrap_or(area);
+            let (sx, sy) = (screen.origin.x.as_f32(), screen.origin.y.as_f32());
+            let (sw, sh) = (screen.size.width.as_f32(), screen.size.height.as_f32());
+            match self.edge {
+                TaskbarEdge::Bottom => point(origin.x, px(sy + sh)),
+                TaskbarEdge::Top => point(origin.x, px(sy - height)),
+                TaskbarEdge::Left => point(px(sx - width), origin.y),
+                TaskbarEdge::Right => point(px(sx + sw), origin.y),
+            }
+        } else {
+            origin
+        };
         crate::windows::platform::set_frame(
             window,
-            gpui::Bounds::new(origin, size(px(width), px(height))),
+            gpui::Bounds::new(placed, size(px(width), px(height))),
             window.scale_factor(),
         );
         // 记一笔自己的位置：亮度面板要贴着这一侧摆。
@@ -2985,20 +3324,10 @@ impl Render for Flyout {
             .clone()
             .map(|tip| self.hover_tip_view(tip));
 
-        // 入场动画：窗口始终按完整高度摆好，只让内容在窗口里从下往上「长」出来。
-        // 不去改原生窗口尺寸，是因为 gpui 的 viewport 缓存会慢一帧，
-        // 边改尺寸边绘制时面板下半截会被裁在上一次的尺寸里。
-        // 面板没显示时不动窗口透明度，免得和 hide 里的复位互相打架。
-        let progress = if self.visible {
-            self.anim.tick(window)
-        } else {
-            self.anim.progress()
-        };
+        // 尺寸永远是「完整那一份」：三档动画都是整扇窗在屏幕上滑（或者原地淡），
+        // 内容一帧都不裁不缩 —— 裁切会多一层容器、还要每帧重绘整块面板。
         let full_height = self.desired_height();
-        let visible_height = anim::anim_height(progress, full_height);
-        // 任务栏在左/右时改成从那一侧横向拉开：宽度插值，内容按原尺寸被裁切。
         let full_width = self.panel_width();
-        let visible_width = (full_width * progress).clamp(0.0, full_width);
 
         // 圆角由内容自己裁：关掉 DWM 非客户区渲染后系统不再做窗口圆角，
         // 这里用 rounded + overflow_hidden 顶上，四角外保持透明。
@@ -3065,70 +3394,25 @@ impl Render for Flyout {
                 .children(tip_overlay)
         };
 
-        // 面板本体：垂直布局按高度展开，水平布局按宽度展开。
+        // 面板本体：竖向排版就是整窗高度，横向排版就是整窗宽度。
         let panel = match self.edge {
-            TaskbarEdge::Bottom => div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .top(px(visible_height - full_height))
-                .h(px(full_height))
-                .child(content),
-            TaskbarEdge::Top => div()
+            TaskbarEdge::Bottom | TaskbarEdge::Top => div()
                 .absolute()
                 .left_0()
                 .right_0()
                 .top_0()
                 .h(px(full_height))
                 .child(content),
-            TaskbarEdge::Left => div()
+            TaskbarEdge::Left | TaskbarEdge::Right => div()
                 .absolute()
                 .top_0()
                 .bottom_0()
                 .left_0()
                 .w(px(full_width))
                 .child(content),
-            TaskbarEdge::Right => div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(visible_width - full_width))
-                .w(px(full_width))
-                .child(content),
         };
 
-        // 裁切层：贴住任务栏那条边，另一侧随进度让开。
-        let clip = match self.edge {
-            TaskbarEdge::Bottom => div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .h(px(visible_height)),
-            TaskbarEdge::Top => div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .top_0()
-                .h(px(visible_height)),
-            TaskbarEdge::Left => div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .w(px(visible_width)),
-            TaskbarEdge::Right => div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .w(px(visible_width)),
-        };
-
-        div()
-            .size_full()
-            .relative()
-            .child(clip.overflow_hidden().child(panel))
+        div().size_full().relative().child(panel)
     }
 }
 

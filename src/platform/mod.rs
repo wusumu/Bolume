@@ -14,5 +14,6 @@ pub mod single_instance;
 pub mod sound;
 pub mod sound_icons;
 pub mod system_theme;
+pub mod winver;
 
 pub use single_instance::SingleInstance;

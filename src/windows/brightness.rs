@@ -22,7 +22,7 @@ use crate::{
     config::{BrightnessPlacement, BrightnessPreset, ConfigStore, DisplayNameMode},
     display::{DisplayCommand, DisplayEngine, DisplayInfo},
     i18n::Lang,
-    ui::{Entrance, SliderDragState, VolumeSlider, anim, icon, theme, wheel_direction},
+    ui::{Entrance, EntranceMotion, SliderDragState, VolumeSlider, anim, icon, theme, wheel_direction},
 };
 
 /// 面板宽度不再写死：用户可调（`config.brightness.width`），
@@ -196,6 +196,13 @@ pub struct Brightness {
     pub error: Rc<RefCell<Option<String>>>,
     visible: bool,
     last_height: f32,
+    /// 窗口该停的位置（逻辑像素，左上角 + 宽高）：`update_frame` 算好存这儿，
+    /// 系统风格的滑入每帧在它上面加位移。
+    base_frame: (f32, f32, f32, f32),
+    /// 正在跑的那段滑动（独立线程按合成帧推进）；None = 没动画在跑。
+    slide: Option<crate::windows::platform::SlideHandle>,
+    /// 静止时窗口停在哪：0 = 在位，`slide_distance` = 整个在屏幕外。
+    rest_offset: f32,
     /// 入场动画：和音量面板共用 `ui::anim::Entrance`，两扇窗必须同时长出来。
     anim: Entrance,
     /// 上一次处理滚轮的时刻：`on_scroll_wheel` 在同一帧里可能被派发好几遍，
@@ -224,6 +231,9 @@ impl Brightness {
             error,
             visible: false,
             last_height: 0.0,
+            base_frame: (0.0, 0.0, 0.0, 0.0),
+            slide: None,
+            rest_offset: 0.0,
             anim: Entrance::new(),
             wheel_last_at: None,
         }
@@ -401,6 +411,142 @@ impl Brightness {
         }
     }
 
+    /// 这一轮走哪套动画（跟音量面板同一份配置）。
+    fn entrance_motion(&self) -> EntranceMotion {
+        match self.cfg().popup_anim_style {
+            crate::config::PopupAnimStyle::System => EntranceMotion::System,
+            crate::config::PopupAnimStyle::Fade => EntranceMotion::Fade,
+        }
+    }
+
+    /// 系统风格：整扇窗从屏幕底滑到目标位置要走多远。
+    ///
+    /// 和音量面板取同一个起点（屏幕底），两扇窗一起从屏幕外升上来才像一套动画；
+    /// 各自的终点不同，所以距离也不同。
+    fn slide_distance(&self, cx: &mut Context<Self>) -> f32 {
+        let (_, y, width, height) = self.base_frame;
+        if width <= 0.0 || height <= 0.0 {
+            return 0.0;
+        }
+        let area = cx
+            .primary_display()
+            .map(|display| display.bounds())
+            .unwrap_or_else(|| {
+                gpui::Bounds::new(
+                    gpui::point(px(0.), px(0.)),
+                    gpui::size(px(1920.), px(1080.)),
+                )
+            });
+        let bottom = (area.origin.y + area.size.height).as_f32();
+        (bottom - y).max(0.0)
+    }
+
+    /// 把「目标位置 + 当前位移」写进窗口。
+    fn apply_slide(&self, window: &Window, offset: f32) {
+        let (x, y, width, height) = self.base_frame;
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        crate::windows::platform::set_origin(
+            window,
+            x,
+            y + offset,
+            window.scale_factor(),
+        );
+    }
+
+    /// 起一段「从屏幕底滑上来」的动画（独立线程 + 合成帧节流，和音量面板同一套）。
+    /// 造一段滑动：`from` → `end`，曲线和时长跟着这一档动画走
+    /// （和音量面板同一份规划，方向固定「贴着屏幕底上下」）。
+    fn slide_plan(
+        &self,
+        mode: crate::windows::platform::SlideMode,
+        motion: EntranceMotion,
+        config_ms: u32,
+        from: f32,
+        end: f32,
+    ) -> crate::windows::platform::SlideRun {
+        use crate::windows::platform::{SlideMode, SlideRun};
+        let total = anim::entrance_duration(config_ms).as_secs_f32() * 1000.0;
+        let base = SlideRun {
+            mode,
+            to: (self.base_frame.0, self.base_frame.1),
+            direction: (0.0, 1.0),
+            from,
+            end,
+            tau_ms: 0.0,
+            fade_delay_ms: 0.0,
+            fade_ms: 0.0,
+            total_ms: total,
+            opacity: crate::ui::theme::ui_opacity(),
+            // 入场从全透明淡进来，出场从实心淡出去（中途接力由调用方改这一项）。
+            from_alpha: if mode == SlideMode::Exit { 1.0 } else { 0.0 },
+        };
+        match motion {
+            EntranceMotion::System => {
+                let m = anim::SystemMotion::panel_scaled(end.max(from), total);
+                let entering = mode == SlideMode::Enter;
+                let slides = m.slide > 0.5;
+                SlideRun {
+                    from: if slides { from } else { 0.0 },
+                    end: if slides { end } else { 0.0 },
+                    tau_ms: m.tau_ms,
+                    fade_delay_ms: m.fade_delay_ms,
+                    fade_ms: if entering { m.fade_ms } else { 0.0 },
+                    total_ms: if entering {
+                        m.enter_total_ms()
+                    } else {
+                        m.exit_ms
+                    },
+                    ..base
+                }
+            }
+            EntranceMotion::Fade => SlideRun {
+                from: 0.0,
+                end: 0.0,
+                fade_delay_ms: 0.0,
+                fade_ms: total,
+                total_ms: total,
+                ..base
+            },
+        }
+    }
+
+    /// 起一段滑动，跑完自己收尾（被打断后旧回调不许动新一轮的状态）。
+    fn start_slide(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+        run: crate::windows::platform::SlideRun,
+    ) {
+        use crate::windows::platform::SlideMode;
+        let mode = run.mode;
+        let end = run.end;
+        let handle = crate::windows::platform::run_slide(window, run);
+        self.slide = Some(handle.clone());
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(20))
+                    .await;
+                if handle.is_done() {
+                    break;
+                }
+            }
+            let _ = view.update(cx, |this, cx| {
+                if this.slide.as_ref().map(|now| now.same_run(&handle)) != Some(true) {
+                    return;
+                }
+                this.slide = None;
+                this.anim.finish();
+                this.rest_offset = if mode == SlideMode::Exit { end } else { 0.0 };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         // 上次拖动的预览值到这次就不作数了，全部以真实回读为准。
@@ -409,40 +555,66 @@ impl Brightness {
         self.edit_replace = false;
         // 每次打开都重读一遍：显示器自己的按钮、游戏全屏切换都可能改过亮度。
         self.engine.send(DisplayCommand::Refresh);
-        // 动画开关与时长跟音量面板取自同一份配置，曲线也走同一个 `Entrance`，
-        // 两扇窗才会一起长出来、一起收回去。
+        // 动画开关与时长跟音量面板取自同一份配置、同一套曲线，两扇窗一起走。
         let animate = self.cfg().popup_animation && !cx.reduce_motion();
         let config_ms = self.cfg().popup_animation_ms;
-        self.anim.begin(animate, config_ms);
+        let motion = self.entrance_motion();
         // 窗口几何变更同样放到本帧绘制之后（和面板一致）。
         cx.defer_in(window, move |this, window, cx| {
-            this.update_frame(window, cx);
-            // 先整窗透明再显示：窗口一露头 DWM 就会画圆角框和阴影，
-            // 此时内容（动画第一帧）还没提交，不透明的话会闪一下空框。
-            this.anim.set_alpha(window, 0.0);
-            crate::windows::platform::set_visible(window, true);
-            // 只提到最上层，不抢焦点：抢了焦点音量面板会立刻因为失焦收起。
-            crate::windows::platform::bring_to_front(window);
-            if animate {
-                this.anim.start();
-                let session = this.anim.session();
-                // 兜底：合成器不给帧时到点强制收尾，绝不停在半截高度。
-                let deadline = this.anim.fallback_after();
-                let view = cx.entity().downgrade();
-                cx.spawn(async move |_, cx| {
-                    cx.background_executor().timer(deadline).await;
-                    let _ = view.update(cx, |this, cx| {
-                        if this.anim.settle(session) {
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
-            } else {
-                this.anim.set_alpha(window, 1.0);
-            }
+            this.enter(window, cx, animate, config_ms, motion);
             cx.notify();
         });
+        // `defer_in` 要等「下一帧绘制完」才执行；空闲时 gpui 不给帧，
+        // 这一段就会一直挂着 —— 实测按下到开始滑动要多等 280ms。
+        // 主动敲一下重绘，defer 立刻就能跑。
+        crate::windows::platform::post_repaint(window);
+    }
+
+    /// 把窗口摆出来（能从半路接力）。
+    fn enter(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        animate: bool,
+        config_ms: u32,
+        motion: EntranceMotion,
+    ) {
+        use crate::windows::platform::SlideMode;
+        let resume = self.slide.take().map(|handle| {
+            let offset = handle.offset();
+            handle.cancel();
+            offset
+        });
+        let from = match resume {
+            Some(offset) => offset,
+            None => {
+                let parked = animate && motion != EntranceMotion::Fade;
+                self.update_frame_parked(window, cx, parked);
+                if parked {
+                    self.slide_distance(cx)
+                } else {
+                    0.0
+                }
+            }
+        };
+        self.anim.begin_with(animate, motion, from);
+        // 滑入那两档不碰整窗 alpha（一碰 DWM 就补一段出现淡入，卡片会半透明）。
+        if animate {
+            if motion == EntranceMotion::Fade {
+                crate::windows::platform::set_opacity(window, 0.0);
+            }
+        } else {
+            crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
+        }
+        crate::windows::platform::set_visible(window, true);
+        // 只提到最上层、不抢焦点：抢了焦点音量面板会立刻因为失焦收起。
+        crate::windows::platform::present_behind_taskbar(window);
+        if animate {
+            let run = self.slide_plan(SlideMode::Enter, motion, config_ms, from, 0.0);
+            self.start_slide(window, cx, run);
+        } else {
+            self.rest_offset = 0.0;
+        }
     }
 
     pub fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -453,24 +625,73 @@ impl Brightness {
         self.editing = None;
         self.edit_replace = false;
         self.drag_values.borrow_mut().clear();
-        // 收起前先把画面收成 0 高度再画一帧：系统拿「上一次提交的画面」显示窗口，
-        // 缓存里若是完整内容，下次弹出会先闪一整块再开始动画。
+        // 收起和音量面板同一套：怎么出就怎么回（滑出 / 淡出），播完停在屏幕外。
         let animate = self.cfg().popup_animation && !cx.reduce_motion();
         let config_ms = self.cfg().popup_animation_ms;
-        self.anim.begin(animate, config_ms);
-        cx.notify();
-        cx.defer_in(window, |this, window, _| {
-            crate::windows::platform::set_visible(window, false);
-            // 藏好后停在全透明：下次显示不会先闪一帧不透明的空窗（和面板一致）。
-            this.anim.set_alpha(window, 0.0);
+        let close_anim = self.cfg().panel_close_animation;
+        let motion = self.entrance_motion();
+        cx.defer_in(window, move |this, window, cx| {
+            this.leave(window, cx, animate && close_anim, config_ms, motion);
+            cx.notify();
         });
+        // 同上：别让收起也白等一帧。
+        crate::windows::platform::post_repaint(window);
     }
 
-    /// 贴着音量面板摆好：贴哪一侧由配置决定（左 / 右 / 上 / 下）。
-    ///
-    /// 音量面板自己贴任务栏所在的角落，所以「外侧」那两侧（右下角的面板上、
-    /// 右/下）根本放不下 —— 这时候翻到对面去，绝不压到面板上。
+    /// 让窗口退场：正在滑入时接到收起，就从当前位置接着往下滑。
+    fn leave(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        animate: bool,
+        config_ms: u32,
+        motion: EntranceMotion,
+    ) {
+        use crate::windows::platform::SlideMode;
+        let from = match self.slide.take() {
+            Some(handle) => {
+                let offset = handle.offset();
+                handle.cancel();
+                offset
+            }
+            None => self.rest_offset,
+        };
+        if !animate {
+            self.park_window(window);
+            self.anim.finish();
+            return;
+        }
+        let end = if motion == EntranceMotion::Fade {
+            0.0
+        } else {
+            self.slide_distance(cx)
+        };
+        let run = self.slide_plan(SlideMode::Exit, motion, config_ms, from, end);
+        self.start_slide(window, cx, run);
+    }
+
+    /// 把窗口停到屏幕外并压成全透明（不隐藏）。
+    fn park_window(&mut self, window: &Window) {
+        if self.anim.motion() == EntranceMotion::Fade {
+            crate::windows::platform::set_opacity(window, 0.0);
+            self.rest_offset = 0.0;
+        } else {
+            self.apply_slide(window, self.anim.slide());
+            self.rest_offset = self.anim.slide();
+        }
+    }
+
     pub fn update_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_frame_parked(window, cx, false);
+    }
+
+    /// 同上，`parked` = 直接落到屏幕外（系统风格的起点），别在目标位置停一帧。
+    pub fn update_frame_parked(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        parked: bool,
+    ) {
         let cfg = self.cfg();
         let displays = self.displays.borrow().len();
         let (width, height) = panel_size(&cfg, displays);
@@ -539,9 +760,22 @@ impl Brightness {
         let x = x.clamp(min_x, max_x);
         let y = y.clamp(min_y, max_y);
 
+        self.base_frame = (x, y, width, height);
+        let placed_y = if parked {
+            let screen = cx
+                .primary_display()
+                .map(|display| display.bounds())
+                .unwrap_or(area);
+            screen.origin.y.as_f32() + screen.size.height.as_f32()
+        } else {
+            y
+        };
         crate::windows::platform::set_frame(
             window,
-            gpui::Bounds::new(gpui::point(px(x), px(y)), gpui::size(px(width), px(height))),
+            gpui::Bounds::new(
+                gpui::point(px(x), px(placed_y)),
+                gpui::size(px(width), px(height)),
+            ),
             window.scale_factor(),
         );
         window.bounds_changed(cx);
@@ -613,15 +847,8 @@ impl Render for Brightness {
                     .children(blocks),
             );
 
-        // 入场动画：窗口按完整高度摆好，只让内容从底边往上「长」出来 ——
-        // 和音量面板同一套裁切方式（改原生窗口尺寸会让 gpui 的 viewport 缓存慢一帧）。
-        let progress = if self.visible {
-            self.anim.tick(window)
-        } else {
-            self.anim.progress()
-        };
+        // 尺寸永远是完整那一份：三档动画都是整扇窗在滑（或原地淡），内容不裁不缩。
         let full_height = self.last_height.max(1.0);
-        let visible_height = anim::anim_height(progress, full_height);
 
         div().size_full().relative().child(
             div()
@@ -629,17 +856,8 @@ impl Render for Brightness {
                 .left_0()
                 .right_0()
                 .bottom_0()
-                .h(px(visible_height))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .top(px(visible_height - full_height))
-                        .h(px(full_height))
-                        .child(content),
-                ),
+                .h(px(full_height))
+                .child(content),
         )
     }
 }

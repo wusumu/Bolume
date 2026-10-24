@@ -8,7 +8,7 @@ pub mod swatch;
 pub mod theme;
 pub mod wheel;
 
-pub use anim::Entrance;
+pub use anim::{Entrance, EntranceMotion};
 pub use assets::{
     Assets, DEVICE_ICON_CHOICES, DeviceIconChoice, device_icon_resolved, icon, load_png_rgba,
     volume_icon_name,

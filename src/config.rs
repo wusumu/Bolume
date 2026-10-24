@@ -1050,7 +1050,93 @@ impl StartupProfile {
 /// rev 61：「按住连续触发」多一个子开关 —— 不理会系统的长按重复（`hotkey_ignore_system_repeat`，默认开）。
 /// rev 62：面板里的音量条粗细（`panel_bar_thickness`）与圆角（`panel_bar_round`）可调，
 /// 默认 6px / 100%（全圆头），老配置读进来画出来和以前一模一样。
-const CONFIG_REV: u32 = 62;
+/// rev 63：弹出动画可以选「跟随系统」（`popup_anim_style` / `osd.anim_style`），
+/// 默认仍是各自原来那套，老配置读进来行为不变。
+/// rev 64：动画方式各多一档（面板加「淡入淡出」、屏幕提示加「向上展开」），
+/// 面板收起也加了动画（`panel_close_animation`，默认开）。
+/// rev 65：默认弹出时长 400 → 200ms（淡入淡出那档太拖），动画支持打断。
+/// rev 66：删掉面板的「从任务栏展开」和屏幕提示的「向上展开」两档动画
+/// （老配置靠 serde alias 落到 system），屏幕提示的显示器改成「手动选择 + 下拉」。
+/// rev 67：托盘数字重做 —— 去掉「字重 / 数字大小」，改成照 PS 字符面板那套
+/// （`tray_number_antialias` + 三位数的 `tray_digit_one/two/three`：
+/// 字号 / 宽度 / 高度 / 字距）。老配置的「数字大小」百分比换算成一个字号搬过去。
+const CONFIG_REV: u32 = 67;
+
+/// 面板弹出动画的风格。
+///
+/// `System` 照 Windows 自己弹音量面板的样子：整块从任务栏背后滑进来
+/// （Windows 11 上实测是「指数缓出的位移」，见 `ui::anim::SystemMotion`）。
+/// `Fade` 是就地淡入淡出。
+///
+/// rev 66 删掉了原来那档「从任务栏展开」（裁内容那种）。老配置里写着
+/// `unfold` 的，反序列化时按 `alias` 落到 `System`（最接近的观感），
+/// 下次保存就写成 `system`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PopupAnimStyle {
+    /// 跟系统的音量面板一样（整块从屏幕底、任务栏背后滑上来），
+    /// 曲线照系统的指数衰减，速度按设置里的毫秒等比缩放。
+    #[default]
+    #[serde(alias = "unfold")]
+    System,
+    /// 就地淡入淡出：位置不动，只把整窗不透明度拉起来。
+    Fade,
+}
+
+impl PopupAnimStyle {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::System => 0,
+            Self::Fade => 1,
+        }
+    }
+
+    pub fn from_index(value: u32) -> Self {
+        match value {
+            1 => Self::Fade,
+            _ => Self::System,
+        }
+    }
+
+
+    /// 这一档是不是「照系统来」。
+    pub fn is_system(self) -> bool {
+        matches!(self, Self::System)
+    }
+}
+
+/// OSD 的出现 / 消失动画风格。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OsdAnimStyle {
+    /// 就地淡入淡出（默认，和以前一样）。
+    #[default]
+    Fade,
+    /// 跟系统的音量条一模一样：从下方滑上来 + 淡入，消失时滑回去 + 淡出。
+    #[serde(alias = "unfold")]
+    System,
+}
+
+impl OsdAnimStyle {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Fade => 0,
+            Self::System => 1,
+        }
+    }
+
+    pub fn from_index(value: u32) -> Self {
+        match value {
+            1 => Self::System,
+            _ => Self::Fade,
+        }
+    }
+
+    /// 这一档是不是「整扇窗平移」（滑上来 / 滑下去）。
+    pub fn is_system(self) -> bool {
+        matches!(self, Self::System)
+    }
+}
 
 /// 托盘提示最多几行。
 ///
@@ -1084,13 +1170,179 @@ pub const DEFAULT_LOG_SCROLL_STEP_DB: f32 = 2.0;
 pub const LOG_SCROLL_STEP_RANGE_DB: (f32, f32) = (0.1, 20.0);
 
 /// 弹出动画默认时长（毫秒）。对照 QcClip 的 `NORMAL_SHOW_ANIMATION_DURATION`。
-pub const DEFAULT_POPUP_ANIMATION_MS: u32 = 400;
+pub const DEFAULT_POPUP_ANIMATION_MS: u32 = 200;
 
-/// 数字图标默认字体族：Win11 托盘的数字样子。
-pub const DEFAULT_NUMBER_FONT: &str = "Segoe UI";
+/// 数字图标默认字体族。
+///
+/// 2026-10-25 起按用户自己调好的那套（Arial）当默认：Arial 的数字笔画粗细
+/// 在 16px 托盘上比 Segoe UI 更「立」，配下面的 20 点 + 宽高缩放默认值正好。
+pub const DEFAULT_NUMBER_FONT: &str = "Arial";
+
+/// 托盘数字的抗锯齿方式，照 Photoshop 字符面板底部那七档。
+///
+/// GDI 本身只有「不抗锯齿 / 灰度抗锯齿 / ClearType」三类质量档，
+/// 这里七档是「质量档 + 灰度曲线」拼出来的近似：`Sharp` 把边缘压陡、
+/// `Strong` 让笔画更实（PS 的「浑厚」就是把笔画加粗一档）。
+///
+/// 默认是 `Sharp`（灰度抗锯齿 + 边缘压陡）：16px 的托盘上比「平滑」清楚一档，
+/// 而且灰度抗锯齿逐像素稳定 —— ClearType（`WindowsLcd`）会让同一字形随子像素
+/// 相位微变，滑动音量条时数字会轻轻抖。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayAntialias {
+    /// 无：硬边，只有全黑 / 全透明两种像素。
+    None,
+    /// 锐利：抗锯齿但边缘压陡（默认）。
+    #[default]
+    Sharp,
+    /// 犀利：抗锯齿，边缘比「平滑」略细。
+    Crisp,
+    /// 浑厚：笔画更实、更粗。
+    Strong,
+    /// 平滑：普通灰度抗锯齿。
+    Smooth,
+    /// Windows LCD：ClearType 子像素抗锯齿。
+    WindowsLcd,
+    /// Windows：交给 GDI 自己挑（`DEFAULT_QUALITY`）。
+    Windows,
+}
+
+impl TrayAntialias {
+    /// 界面上那七档的顺序（存的是下标）。
+    pub const ALL: [TrayAntialias; 7] = [
+        TrayAntialias::None,
+        TrayAntialias::Sharp,
+        TrayAntialias::Crisp,
+        TrayAntialias::Strong,
+        TrayAntialias::Smooth,
+        TrayAntialias::WindowsLcd,
+        TrayAntialias::Windows,
+    ];
+
+    pub fn index(self) -> u32 {
+        Self::ALL
+            .iter()
+            .position(|item| *item == self)
+            .unwrap_or(1) as u32
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        Self::ALL.get(index as usize).copied().unwrap_or_default()
+    }
+
+    /// 这一档用的 GDI 质量值（`CreateFontW` 的 `fdwQuality`）。
+    pub fn quality(self) -> i32 {
+        match self {
+            // 硬边：让 GDI 直接给 1-bit 字形。
+            Self::None => 1, // NONANTIALIASED_QUALITY
+            // 灰度抗锯齿，边缘浓淡由 `gamma` 再调。
+            Self::Sharp | Self::Crisp | Self::Smooth => 4, // ANTIALIASED_QUALITY
+            // 子像素抗锯齿（取最大通道当覆盖率，不会有彩边）。
+            Self::Strong | Self::WindowsLcd => 5, // CLEARTYPE_QUALITY
+            Self::Windows => 0,                   // DEFAULT_QUALITY
+        }
+    }
+
+    /// 覆盖率的灰度曲线指数：>1 让边缘更快变黑（更锐），<1 让边缘更实（更厚）。
+    pub fn gamma(self) -> f32 {
+        match self {
+            Self::Sharp => 1.40,
+            Self::Crisp => 1.15,
+            Self::Strong => 0.78,
+            Self::Smooth => 1.0,
+            _ => 1.0,
+        }
+    }
+
+    /// 是否把覆盖率阈值化成 0 / 1（「无」这一档）。
+    pub fn threshold(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// 某一档位数（一位数 / 两位数 / 三位数）的托盘数字外观。
+///
+/// 单位尽量照 Photoshop 字符面板：字号是**点**，宽度 / 高度是**百分比**
+/// （100% 就是字形本来的宽高），字距是 **1/1000 em**（PS 的 VA 值）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TrayDigitMetrics {
+    /// 字号（点）。显示时按 `点 × DPI / 72` 换算成像素，0 = 自动
+    /// （墨迹高度撑到画布的 70%，这是旧版「自动」的观感）。
+    #[serde(default)]
+    pub size_pt: u32,
+    /// 水平缩放（%）：100 是字形原本的宽度。
+    #[serde(default = "default_hundred")]
+    pub width: u32,
+    /// 垂直缩放（%）。
+    #[serde(default = "default_hundred")]
+    pub height: u32,
+    /// 字距（1/1000 em，PS 的 VA 值，可为负）。
+    #[serde(default)]
+    pub tracking: i32,
+}
+
+fn default_hundred() -> u32 {
+    100
+}
+
+impl Default for TrayDigitMetrics {
+    fn default() -> Self {
+        Self {
+            size_pt: 0,
+            width: 100,
+            height: 100,
+            tracking: 0,
+        }
+    }
+}
+
+/// 一位数（0–9）的默认外观：20 点、宽高各 60%。
+///
+/// 这套是用户 2026-10-25 调好、要求当默认的：字号统一 20 点，靠宽高缩放把
+/// 一位数 / 两位数 / 三位数各自压到合适的宽度，比逐档改字号好维护。
+fn default_tray_digit_one() -> TrayDigitMetrics {
+    TrayDigitMetrics {
+        size_pt: 20,
+        width: 60,
+        height: 60,
+        tracking: 0,
+    }
+}
+
+/// 两位数的默认外观（20 点、45%）。
+fn default_tray_digit_two() -> TrayDigitMetrics {
+    TrayDigitMetrics {
+        size_pt: 20,
+        width: 45,
+        height: 45,
+        tracking: 0,
+    }
+}
+
+/// 三位数（100）的默认外观（20 点、33%）。
+fn default_tray_digit_three() -> TrayDigitMetrics {
+    TrayDigitMetrics {
+        size_pt: 20,
+        width: 33,
+        height: 33,
+        tracking: 0,
+    }
+}
+
+impl TrayDigitMetrics {
+    /// 字号范围（点）：0 = 自动，1..=200。16px 的画布上 12 点就满了。
+    pub const SIZE_RANGE: (u32, u32) = (0, 200);
+    /// 宽 / 高缩放范围（%）。
+    pub const SCALE_RANGE: (u32, u32) = (10, 300);
+    /// 字距范围（1/1000 em）。
+    pub const TRACKING_RANGE: (i32, i32) = (-500, 1000);
+}
 
 /// 旧版本写进配置文件的默认值：读到它就说明用户没主动改过，迁移到新默认。
 const LEGACY_POPUP_ANIMATION_MS: u32 = 140;
+
+/// rev 65 之前的默认值。4xx 那档在淡入淡出上明显拖沓，读到它同样当「没改过」。
+const LEGACY_POPUP_ANIMATION_MS_400: u32 = 400;
 
 /// 一个全局快捷键：修饰符位 + 虚拟键码。
 ///
@@ -2185,6 +2437,11 @@ pub struct OsdConfig {
 
     /// 动画开关；关掉就直接出现、直接消失。
     pub animate: bool,
+    /// 动画风格：就地淡入淡出，还是照系统音量条「滑上来 + 淡入」。
+    ///
+    /// 选 `System` 时下面两个时长不再生效（用系统那套节奏）。
+    #[serde(default)]
+    pub anim_style: OsdAnimStyle,
     /// 淡入 / 淡出时长（毫秒）。
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
@@ -2419,6 +2676,7 @@ impl Default for OsdConfig {
             monitor_mode: OsdMonitorMode::Single,
             detailed: false,
             animate: true,
+            anim_style: OsdAnimStyle::default(),
             fade_in_ms: 150,
             fade_out_ms: 240,
             hold_ms: 1400,
@@ -3079,17 +3337,24 @@ pub struct Config {
     /// 数字是按目标尺寸**原生光栅化**的（不是画一张大图再缩小），
     /// 所以换个字体立刻就是那个字体自己的字形，不会糊。
     pub tray_number_font: String,
-    /// 数字图标的字重：300 细 / 400 常规 / 600 半粗 / 700 粗。
+    /// 托盘数字的抗锯齿方式（照 Photoshop 字符面板那七档）。
+    #[serde(default)]
+    pub tray_number_antialias: TrayAntialias,
+    /// **老字段（≤ rev 66）**：数字墨迹占图标高度的百分比。
     ///
-    /// 500（中）在托盘那个尺寸上和 400 看不出区别，rev 32 起从选项里去掉，
-    /// 存着 500 的老配置按 400 处理。
-    pub tray_number_weight: u32,
-    /// 数字大小：托盘数字的墨迹高度占图标高度的百分比（1..=100）。0 = 自动。
-    ///
-    /// 以前这里存的是像素，但图标画布本身就随 DPI 变（96 DPI 下 16px），
-    /// 写死 px 在高缩放下就不对了；而且两位数在那个盒子里根本长不到那么高，
-    /// 于是「调到 10px 以上没反应」。rev 10 起改成百分比（见 `ConfigStore::load`）。
+    /// 只是个迁移用的入口 —— 读进来换算成 `tray_digit_*` 的字号，之后不再写盘
+    /// （`skip_serializing`），配置文件里会自然消失。
+    #[serde(default, skip_serializing)]
     pub tray_number_size: u32,
+    /// 一位数（0–9）的托盘数字外观。
+    #[serde(default = "default_tray_digit_one")]
+    pub tray_digit_one: TrayDigitMetrics,
+    /// 两位数（10–99）的托盘数字外观。
+    #[serde(default = "default_tray_digit_two")]
+    pub tray_digit_two: TrayDigitMetrics,
+    /// 三位数（100）的托盘数字外观。
+    #[serde(default = "default_tray_digit_three")]
+    pub tray_digit_three: TrayDigitMetrics,
 
     /// 应用图标从 ICO 里取哪一档（16 / 32 / 64），同时决定列表里的显示尺寸。
     pub app_icon_size: u32,
@@ -3104,8 +3369,16 @@ pub struct Config {
 
     /// 面板弹出动画（从任务栏上沿向上展开）。
     pub popup_animation: bool,
-    /// 弹出动画时长（毫秒）：越大越慢。
+    /// 弹出动画时长（毫秒）：越大越慢。只在 [`PopupAnimStyle::Unfold`] 下有用。
     pub popup_animation_ms: u32,
+    /// 弹出方式：自己那套「从任务栏上沿展开」，还是照系统面板整块滑进来。
+    #[serde(default)]
+    pub popup_anim_style: PopupAnimStyle,
+    /// 收起（消失）时也走一段动画：滑下去 / 淡出之后再藏。默认开。
+    ///
+    /// 「弹出动画」总闸关掉时这一项自然也不生效。
+    #[serde(default = "default_true")]
+    pub panel_close_animation: bool,
 
     /// 松开音量滑条时播放一声轻响。默认开：拖到满意的位置松手，有一声确认更踏实。
     pub release_sound: bool,
@@ -3329,7 +3602,7 @@ pub struct Config {
     pub ui_font: String,
     /// 界面字重（100..900，400 = 常规）。
     ///
-    /// 和托盘的 `tray_number_weight` 分开存：两个字体本来就是独立的。
+    /// 只影响设置窗自己的文字（托盘数字从 rev 67 起没有字重设置，笔画固定 600）。
     pub ui_font_weight: u32,
     /// 界面对比度（百分比，100 = 主题原样）。
     ///
@@ -3402,12 +3675,17 @@ impl Default for Config {
             tray_motion: TrayMotion::default(),
             tray_motion_gain: DEFAULT_TRAY_MOTION_GAIN,
             tray_number_font: DEFAULT_NUMBER_FONT.to_string(),
-            tray_number_weight: 600,
+            tray_number_antialias: TrayAntialias::default(),
             tray_number_size: 0,
+            tray_digit_one: default_tray_digit_one(),
+            tray_digit_two: default_tray_digit_two(),
+            tray_digit_three: default_tray_digit_three(),
             app_icon_size: 32,
             app_name_capitalize: true,
             popup_animation: true,
             popup_animation_ms: DEFAULT_POPUP_ANIMATION_MS,
+            popup_anim_style: PopupAnimStyle::default(),
+            panel_close_animation: true,
             release_sound: true,
             release_sound_osd: true,
             tray_menu: TrayMenuConfig::default(),
@@ -3828,6 +4106,12 @@ impl ConfigStore {
             config.popup_animation_ms = DEFAULT_POPUP_ANIMATION_MS;
             migrated = true;
         }
+        // rev 65：默认从 400ms 收到 200ms —— 400 那档在「淡入淡出」上肉眼可见地拖。
+        // 同样只动「还是旧默认值」的配置，用户自己调过的原样保留。
+        if config.config_rev < 65 && config.popup_animation_ms == LEGACY_POPUP_ANIMATION_MS_400 {
+            config.popup_animation_ms = DEFAULT_POPUP_ANIMATION_MS;
+            migrated = true;
+        }
         // rev 2 改了两个默认值：对数刻度默认关闭、托盘图标默认用喇叭。
         // 老配置里写的是当时的默认值，一并升级过来，不然「默认」改了也看不出效果。
         if config.config_rev < 2 {
@@ -3993,12 +4277,7 @@ impl ConfigStore {
                     config.app_block.fullscreen = true;
                 }
             }
-            // rev 32：托盘数字的字重去掉了「中（500）」—— 16px 下和 400 分不出来。
-            // 存着 500 的老配置落到最近的「常规」上；新的动态图标 / 界面字体都是
-            // 带 serde 默认值的字段，读进来就是「不启用 / 跟随系统」，不用搬数据。
-            if config.config_rev < 32 && config.tray_number_weight == 500 {
-                config.tray_number_weight = 400;
-            }
+            // rev 32（及以前）的托盘数字字重在 rev 67 之后不再是设置项，那条迁移随之作废。
             // rev 31：托盘右键菜单多了一套自绘外观（`tray_menu_style` / `tray_menu_max_width`），
             // 两个字段都有 serde 默认值，老配置读进来就是「跟随主题 + 420px」，不用搬数据。
             // rev 30：托盘右键多了「重启」。老配置的菜单树里没有这一项的话补一个
@@ -4018,6 +4297,25 @@ impl ConfigStore {
                 config.tray_number_size = ((config.tray_number_size as f32 / box_side) * 100.0)
                     .round()
                     .clamp(1.0, 100.0) as u32;
+            }
+            // rev 67：托盘数字重做成「字号 / 宽度 / 高度 / 字距」，按位数分三档。
+            // 老配置只有一个「占图标高度的百分比」：按当时的墨迹高度反推一个字号
+            // （`墨迹 ÷ 0.72` 就是字号像素，再按 DPI 换成点），三档都填同一个值 ——
+            // 调过数字大小的人升级后看到的还是那个大小。0 是「自动」，保持自动。
+            if config.config_rev < 67 && config.tray_number_size > 0 {
+                let box_side = (crate::tray::canvas_size() - 2.0).max(4.0);
+                let ink_px = box_side * config.tray_number_size.min(100) as f32 / 100.0;
+                let font_px = ink_px / 0.72;
+                let pt = (font_px * 72.0 / crate::tray::system_dpi() as f32)
+                    .round()
+                    .clamp(1.0, 200.0) as u32;
+                for metrics in [
+                    &mut config.tray_digit_one,
+                    &mut config.tray_digit_two,
+                    &mut config.tray_digit_three,
+                ] {
+                    metrics.size_pt = pt;
+                }
             }
             // rev 11：新增「显示器亮度」段，默认关闭（老配置读进来就是关着的）。
             // rev 12：亮度段里多了「悬停滚轮」开关与段数，老配置走默认（开、50 段）。
@@ -4649,6 +4947,28 @@ mod tests {
         let old: Config = serde_json::from_str(r#"{"config_rev": 49}"#).unwrap();
         assert_eq!(old.editor_bg, "#000000");
         assert_eq!(old.editor_panel_w, 268.0);
+    }
+
+    /// 托盘数字的出厂外观：用户 2026-10-25 调好的那套（Arial / 锐利 / 20 点 +
+    /// 宽高按位数缩放）。老配置缺这三个字段时也必须落到这一套，不能落到「自动」。
+    #[test]
+    fn tray_digits_default_to_the_tuned_look() {
+        let config = Config::default();
+        assert_eq!(config.tray_number_font, "Arial");
+        assert_eq!(config.tray_number_antialias, super::TrayAntialias::Sharp);
+        let one = config.tray_digit_one;
+        assert_eq!((one.size_pt, one.width, one.height), (20, 60, 60));
+        let two = config.tray_digit_two;
+        assert_eq!((two.size_pt, two.width, two.height), (20, 45, 45));
+        let three = config.tray_digit_three;
+        assert_eq!((three.size_pt, three.width, three.height), (20, 33, 33));
+
+        // 老配置文件里没有这三项：serde 的 default 必须给同一套值。
+        let old: Config = serde_json::from_str(r#"{"config_rev": 66}"#).unwrap();
+        assert_eq!(old.tray_digit_one.width, 60);
+        assert_eq!(old.tray_digit_two.width, 45);
+        assert_eq!(old.tray_digit_three.width, 33);
+        assert_eq!(old.tray_number_antialias, super::TrayAntialias::Sharp);
     }
 
     /// rev 10：托盘数字从「像素高度」改成「占可画区的百分比」，老值要按同一块画布换算。
@@ -5486,6 +5806,84 @@ mod tests {
     ///
     /// 老配置里没有这一项：默认值和「新装」的答案要分清 —— 新装是开，
     /// 老配置则按主开关搬（主开关关着的人不该因为升级在 OSD 里听见声音）。
+    #[test]
+    fn rev64_close_animation_defaults_on() {
+        let dir = std::env::temp_dir().join(format!("bolume-rev64-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("old.json");
+        std::fs::write(&path, r#"{"config_rev": 63, "popup_animation": true}"#)
+            .expect("写临时配置");
+        let config = ConfigStore::load(path.clone()).get().clone();
+        assert!(config.panel_close_animation, "老配置升上来默认带收起动画");
+        assert_eq!(config.popup_anim_style, PopupAnimStyle::System);
+        assert_eq!(config.osd.anim_style, OsdAnimStyle::Fade);
+        // 现在那两档能存能读。
+        let path = dir.join("new.json");
+        std::fs::write(
+            &path,
+            r#"{"config_rev": 66, "popup_anim_style": "fade", "osd": {"anim_style": "system"}}"#,
+        )
+        .expect("写临时配置");
+        let config = ConfigStore::load(path.clone()).get().clone();
+        assert_eq!(config.popup_anim_style, PopupAnimStyle::Fade);
+        assert_eq!(config.osd.anim_style, OsdAnimStyle::System);
+        assert_eq!(PopupAnimStyle::from_index(1), PopupAnimStyle::Fade);
+        assert_eq!(OsdAnimStyle::from_index(1), OsdAnimStyle::System);
+        assert_eq!(PopupAnimStyle::Fade.index(), 1);
+        assert_eq!(OsdAnimStyle::System.index(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// rev 66：面板的「从任务栏展开」和屏幕提示的「向上展开」两档删掉了。
+    ///
+    /// 老配置里写着 `unfold` 的靠 serde alias 落到最接近的那一档（面板 → system，
+    /// 屏幕提示 → system），读进来不报错、下次保存就写成新名字。
+    #[test]
+    fn rev66_removed_styles_fall_back_to_system() {
+        let dir = std::env::temp_dir().join(format!("bolume-rev66-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("old.json");
+        std::fs::write(
+            &path,
+            r#"{"config_rev": 65, "popup_anim_style": "unfold", "osd": {"anim_style": "unfold"}}"#,
+        )
+        .expect("写临时配置");
+        let config = ConfigStore::load(path.clone()).get().clone();
+        assert_eq!(config.popup_anim_style, PopupAnimStyle::System);
+        assert_eq!(config.osd.anim_style, OsdAnimStyle::System);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rev63_animation_styles_default_to_the_old_ones() {
+        let dir = std::env::temp_dir().join(format!("bolume-rev63-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // 老配置里没有这两项：读进来还是各自原来那套，行为不变。
+        let old = dir.join("old.json");
+        std::fs::write(&old, r#"{"config_rev": 62, "popup_animation": true}"#)
+            .expect("写临时配置");
+        let config = ConfigStore::load(old.clone()).get().clone();
+        assert_eq!(config.popup_anim_style, PopupAnimStyle::System);
+        assert_eq!(config.osd.anim_style, OsdAnimStyle::Fade);
+
+        // 存成 follow system 之后能原样读回来。
+        let sys = dir.join("sys.json");
+        std::fs::write(
+            &sys,
+            r#"{"config_rev": 63, "popup_anim_style": "system", "osd": {"anim_style": "system"}}"#,
+        )
+        .expect("写临时配置");
+        let config = ConfigStore::load(sys.clone()).get().clone();
+        assert!(config.popup_anim_style.is_system());
+        assert!(config.osd.anim_style.is_system());
+        assert_eq!(config.popup_anim_style.index(), 0, "System 是现在第一档");
+        assert_eq!(PopupAnimStyle::from_index(0), PopupAnimStyle::System);
+        assert_eq!(OsdAnimStyle::from_index(9), OsdAnimStyle::Fade, "认不出的按默认");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rev60_release_sound_osd_follows_the_master() {
         let dir = std::env::temp_dir().join(format!("bolume-rev60-{}", std::process::id()));

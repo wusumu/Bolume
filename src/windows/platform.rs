@@ -9,7 +9,8 @@ use windows::Win32::{
         DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmSetWindowAttribute,
     },
     UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect, HWND_NOTOPMOST,
+        FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect,
+        HWND_NOTOPMOST,
         HWND_TOP, HWND_TOPMOST, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA, SWP_FRAMECHANGED,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
         SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_CAPTION,
@@ -302,6 +303,303 @@ pub fn set_visible(window: &Window, visible: bool) {
     unsafe {
         let _ = ShowWindow(hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
     }
+}
+
+/// 滑动动画的方向：滑进来，还是滑出去。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlideMode {
+    /// 从当前位置滑到目标位置。
+    Enter,
+    /// 从当前位置滑出屏幕。
+    Exit,
+}
+
+/// 一段「整扇窗从当前位置滑到某处」的动画参数。
+#[derive(Clone, Copy, Debug)]
+pub struct SlideRun {
+    /// 滑进来还是滑出去。
+    pub mode: SlideMode,
+    /// 目标位置（逻辑像素，窗口左上角）。
+    pub to: (f32, f32),
+    /// 位移方向：`offset` 为正时往哪边挪。底任务栏 = (0, 1)（从下方上来）。
+    pub direction: (f32, f32),
+    /// 这一段从多远的地方起步。
+    ///
+    /// 打断时就是上一段停下的位置 —— 于是「没出完就收起」是从半路往下滑，
+    /// 而不是跳回起点再来一次。
+    pub from: f32,
+    /// 这一段要走到多远：`Enter` 是 0，`Exit` 是滑出屏幕的距离。
+    pub end: f32,
+    /// 位移的指数时间常数（毫秒）。
+    pub tau_ms: f32,
+    /// 淡入延迟与时长（毫秒）；`fade_ms = 0` 表示这一段不碰整窗透明度。
+    pub fade_delay_ms: f32,
+    pub fade_ms: f32,
+    /// 整段动画多长（毫秒）。
+    pub total_ms: f32,
+    /// 用户设的界面不透明度（动画结束时收敛到它）。
+    pub opacity: f32,
+    /// 这一段开始时的整窗不透明度。
+    ///
+    /// 正常入场是 0（从全透明淡进来）、正常出场是 1（从实心淡出去）。
+    /// 出场演到一半又被呼出时，这里就是那一刻的不透明度 —— 从半透明接着淡回实心，
+    /// 不会先跳到 0 再涨（那一下看着就是「闪」）。
+    pub from_alpha: f32,
+}
+
+/// 一段滑动动画的句柄：问它跑到哪了 / 跑完没有，或者让它立刻停下。
+#[derive(Clone)]
+pub struct SlideHandle {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 当前停在哪（f32 的 bit 表示）：下一段动画从这里接力。
+    offset: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// 当前整窗不透明度（f32 的 bit 表示，不含用户设的界面不透明度）：
+    /// 出场演到一半被呼出时，新的一段就从这儿接着淡回来。
+    alpha: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl SlideHandle {
+    /// 跑完了吗（已经停在终点位置）。
+    pub fn is_done(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 是不是同一段动画（用来判断「这条完成回调是不是已经过期了」）。
+    pub fn same_run(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.done, &other.done)
+    }
+
+    /// 现在停在多远的地方（逻辑像素，正数 = 还没归位）。
+    pub fn offset(&self) -> f32 {
+        f32::from_bits(self.offset.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// 现在的不透明度是多少（0.0 ~ 1.0，不含界面不透明度设置）。
+    pub fn alpha(&self) -> f32 {
+        f32::from_bits(self.alpha.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// 让它别跑了：线程下一帧就退出，**不会再动窗口**。
+    ///
+    /// 面板收起 / 被新的一次触发顶掉时必须调用，否则旧线程会接着把
+    /// 窗口往它自己的终点拽。取消后 [`Self::offset`] 仍然是它最后画的位置，
+    /// 正好拿来当下一段的起点。
+    pub fn cancel(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 在后台线程里把窗口从 `from` 滑到 `end`，返回一个句柄。
+///
+/// **为什么不走 `background_executor().timer()`**：gpui 的定时器实际按 16ms 一醒
+/// （实测采样间隔稳定在 15～16ms），滑 240px 就是每帧 4～20px，看着一格一格。
+/// 系统自己的面板跟的是合成帧，165Hz 屏上就是 165 帧。
+///
+/// 这里直接用一条独立线程 + `DwmFlush()`：它在下一帧合成完成后返回，于是每一帧
+/// 都和屏幕刷新对齐。整段动画期间不动 gpui 的渲染（内容一帧都不变），
+/// 只改窗口位置和分层不透明度 —— 那些都是可以跨线程调用的 Win32 API。
+pub fn run_slide(window: &Window, run: SlideRun) -> SlideHandle {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let offset = Arc::new(AtomicU32::new(run.from.to_bits()));
+    let alpha = Arc::new(AtomicU32::new(run.from_alpha.to_bits()));
+    let handle = SlideHandle {
+        done: done.clone(),
+        cancel: cancel.clone(),
+        offset: offset.clone(),
+        alpha: alpha.clone(),
+    };
+    let Some(hwnd) = hwnd_of(window) else {
+        done.store(true, Ordering::SeqCst);
+        return handle;
+    };
+    let scale = window.scale_factor();
+    let raw = hwnd.0 as isize;
+    let flag = done.clone();
+
+    std::thread::spawn(move || {
+        use windows::Win32::Foundation::COLORREF;
+        use windows::Win32::Graphics::Dwm::DwmFlush;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
+        };
+
+        let hwnd = HWND(raw as *mut _);
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if run.fade_ms > 0.0 {
+                // 要淡入才挂分层属性，后面每帧只改 alpha。
+                if style & WS_EX_LAYERED.0 as isize == 0 {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+                }
+            } else if style & WS_EX_LAYERED.0 as isize != 0 {
+                // 纯位移：把分层属性摘掉。带着它，DWM 会把这个「刚显示出来的分层
+                // 窗口」当成一次出现，补一段约 200ms 的淡入 —— 动画里格子一直
+                // 半透明，就是「后面那层半透明」的真身。摘掉之后窗口就是不透明的。
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+                // 改扩展样式必须再来一次 FRAMECHANGED 才真的生效。
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_FRAMECHANGED
+                        | SWP_NOMOVE
+                        | SWP_NOSIZE
+                        | SWP_NOZORDER
+                        | SWP_NOACTIVATE
+                        | SWP_NOOWNERZORDER,
+                );
+            }
+        }
+
+        let place = |offset: f32, alpha: f32| {
+            let x = run.to.0 + run.direction.0 * offset;
+            let y = run.to.1 + run.direction.1 * offset;
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    (x * scale).round() as i32,
+                    (y * scale).round() as i32,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
+                );
+                // 只有真的要淡入淡出（`fade_ms > 0`）才碰分层 alpha。
+                if run.fade_ms > 0.0 {
+                    let byte = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), byte, LWA_ALPHA);
+                }
+            }
+        };
+
+        let start = Instant::now();
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                // 停在这一帧的位置上，别再动窗口 —— 下一段动画从这儿接力。
+                flag.store(true, Ordering::SeqCst);
+                return;
+            }
+            let ms = start.elapsed().as_secs_f32() * 1000.0;
+            let p = (ms / run.total_ms.max(1.0)).clamp(0.0, 1.0);
+            let offset_now = match run.mode {
+                // 指数衰减：一上来就走掉大半、尾巴拖长（系统面板实测就是这条）。
+                SlideMode::Enter => run.from * (-ms / run.tau_ms.max(1.0)).exp(),
+                // 出场是加速下沉（系统音量条实测约 140ms）。
+                SlideMode::Exit => run.from + (run.end - run.from) * p * p,
+            };
+            let alpha_now = if run.fade_ms <= 0.0 {
+                1.0
+            } else {
+                match run.mode {
+                    // 淡入从「这一段开始时不透明度」涨到 1：中途接力时就是
+                    // 「从半透明继续变实」，不会先掉到 0 再涨（那一下就是闪）。
+                    SlideMode::Enter => {
+                        let p = ((ms - run.fade_delay_ms) / run.fade_ms).clamp(0.0, 1.0);
+                        run.from_alpha + (1.0 - run.from_alpha) * p
+                    }
+                    SlideMode::Exit => run.from_alpha * (1.0 - p),
+                }
+            };
+            offset.store(offset_now.to_bits(), Ordering::SeqCst);
+            alpha.store(alpha_now.to_bits(), Ordering::SeqCst);
+            place(offset_now, alpha_now * run.opacity);
+            if ms >= run.total_ms {
+                break;
+            }
+            // 等下一帧合成完成：帧率就跟着屏幕刷新走（60 / 120 / 165Hz 都自动适配）。
+            unsafe {
+                let _ = DwmFlush();
+            }
+        }
+        // 收尾：`Enter` 精确落在目标位置；`Exit` 停在滑出去的位置。
+        let last = match run.mode {
+            SlideMode::Enter => 0.0,
+            SlideMode::Exit => run.end,
+        };
+        offset.store(last.to_bits(), Ordering::SeqCst);
+        let last_alpha: f32 = if run.mode == SlideMode::Enter {
+            1.0
+        } else {
+            0.0
+        };
+        alpha.store(last_alpha.to_bits(), Ordering::SeqCst);
+        place(last, if run.mode == SlideMode::Enter { run.opacity } else { 0.0 });
+        flag.store(true, Ordering::SeqCst);
+    });
+
+    handle
+}
+
+/// 只挪窗口位置（不改尺寸、不动 z 序），给逐帧动画用。
+///
+/// 和 [`set_frame`] 的区别是它不查 `GetWindowRect` / `GetClientRect` 的边框差值：
+/// 面板 / 提示条都摘掉了 `WS_THICKFRAME` / `WS_CAPTION`，客户区就等于窗口矩形。
+/// 动画一帧一次调用，少两次查询差别很明显（实测掉帧就是它们堆出来的）。
+pub fn set_origin(window: &Window, x: f32, y: f32, scale: f32) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            (x * scale).round() as i32,
+            (y * scale).round() as i32,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
+        );
+    }
+}
+
+/// 把窗口插到**任务栏后面**（z 序低于 `Shell_TrayWnd`）。
+///
+/// 系统自己的音量面板就是从任务栏背后升起来的：划过任务栏的那一段被任务栏挡住，
+/// 看起来才是「从任务栏后面出来」而不是「浮在任务栏上面」。两边都是 topmost，
+/// 所以插到任务栏之后仍然留在 topmost 组里，只是排在任务栏下面。
+pub fn behind_taskbar(window: &Window) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    unsafe {
+        let taskbar = FindWindowW(windows::core::w!("Shell_TrayWnd"), None);
+        if taskbar.is_err() || taskbar.as_ref().map(|h| h.0.is_null()).unwrap_or(true) {
+            // 没有任务栏（被 explorer 重启/第三方任务栏替代）就退化成普通置前，
+            // 否则面板可能被别的置顶窗口压在下面点不到。
+            bring_to_front(window);
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            Some(taskbar.unwrap()),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+/// 把面板摆到「最前面、但排在任务栏之后」的位置。
+///
+/// 两步缺一不可：
+///   1. `bring_to_front` 同时做两件事 —— 把窗口设成 TOPMOST（面板创建时并不带这个属性），
+///      并排到 topmost 组最前；少了它，别的置顶小工具会压在面板上面。
+///   2. `behind_taskbar` 再把它插到任务栏之后 —— 于是它比所有普通置顶窗口都靠前、
+///      只低于任务栏，滑过任务栏的那一段和底部那圈阴影都被任务栏挡住。
+pub fn present_behind_taskbar(window: &Window) {
+    bring_to_front(window);
+    behind_taskbar(window);
 }
 
 /// 整个窗口的不透明度（0.0 ~ 1.0），照搬 QcClip 的 `set_window_opacity`。

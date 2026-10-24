@@ -18,7 +18,8 @@ use crate::{
     config::{
         ActivityEffect, AppBlockEntry, AppBlockKind, BrightnessPlacement, Config, ConfigStore,
         DisplayNameMode, Hotkey, HotkeySlots, MAX_TOOLTIP_LINE_CHARS, MAX_TOOLTIP_LINES, OsdAnchor,
-        OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout, TrayIconStyle, TrayMotion,
+        OsdAnimStyle, OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout, PopupAnimStyle,
+        TrayIconStyle, TrayMotion,
     },
     display::DisplayInfo,
     i18n::Lang,
@@ -343,6 +344,8 @@ enum DevicePicker {
     AddDeviceState,
     /// 手动往「启动时设置应用音量」的名单里加一个应用。
     AddAppVolume,
+    /// 屏幕提示「手动选择显示器」那行的下拉（列所有显示器）。
+    OsdMonitor,
 }
 
 /// 托盘提示的编辑目标：正常状态 / 静音状态，各有一份模板。
@@ -809,9 +812,23 @@ fn preview_osd_state(lang: Lang, cfg: &OsdConfig) -> OsdState {
     }
 }
 
+/// 托盘数字某一档位数的某一项外观（PS 字符面板那四件套）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+enum TrayDigitMetric {
+    /// 字号（点，0 = 自动）。
+    SizePt,
+    /// 水平缩放（%）。
+    Width,
+    /// 垂直缩放（%）。
+    Height,
+    /// 字距（1/1000 em，可为负）。
+    Tracking,
+}
+
 /// 设置页里可以手动输入的数值字段。
 ///
-/// 这些都是 uint 小数字（音量步进、托盘数字大小），没有自由文本输入控件
+/// 这些都是 uint 小数字（音量步进、托盘数字字号），没有自由文本输入控件
 /// 也能做：点一下数字框就进入「打字」状态，按键由 `handle_edit_key` 接手。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
@@ -822,8 +839,8 @@ enum NumberField {
     WheelStep,
     /// 对数滚轮步进，**单位 dB，内部按十分之一 dB 存**（`value = dB × 10`）。
     LogWheelStep,
-    /// 托盘数字图标的大小（占图标高度的百分比，0 = 自动）。
-    NumberSize,
+    /// 托盘数字：第 `digits` 档（1 / 2 / 3 位）的某一项外观。
+    TrayDigit(u8, TrayDigitMetric),
     /// 启动时设置的主音量（百分比）。
     StartupVolume,
     /// 设备最大音量上限（百分比）。
@@ -906,6 +923,15 @@ impl NumberField {
             Self::PanelFontSize => (config.panel_font_size * 10.0).round() as i32,
             Self::PanelLetterSpacing => (config.panel_letter_spacing * 10.0).round() as i32,
             Self::PanelLineHeight => config.panel_line_height.round() as i32,
+            Self::TrayDigit(digits, metric) => {
+                let metrics = tray_digit_metrics(config, digits);
+                match metric {
+                    TrayDigitMetric::SizePt => metrics.size_pt as i32,
+                    TrayDigitMetric::Width => metrics.width as i32,
+                    TrayDigitMetric::Height => metrics.height as i32,
+                    TrayDigitMetric::Tracking => metrics.tracking,
+                }
+            }
             _ => self.value_nonneg(config) as i32,
         }
     }
@@ -917,11 +943,12 @@ impl NumberField {
             Self::PanelFontSize | Self::PanelLetterSpacing | Self::PanelLineHeight => {
                 unreachable!("面板字体字段走有符号的那一层")
             }
+            // 托盘数字四件套也走有符号的那一层（字距能填负数）。
+            Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
             Self::HotkeyStep => config.hotkey_volume_step,
             Self::WheelStep => config.scroll_wheel_step,
             // 十分之一 dB：0.1 dB 是读数（一位小数）能表达的最小变化。
             Self::LogWheelStep => (config.log_scroll_wheel_step * 10.0).round().max(0.0) as u32,
-            Self::NumberSize => config.tray_number_size,
             Self::StartupVolume => config.startup.master_volume,
             Self::VolumeCap => config.volume_cap.percent,
             Self::HotkeyStepDb => config.hotkey_volume_step,
@@ -972,6 +999,17 @@ impl NumberField {
             ),
             // 0 = 跟着字号自动算；上限只是挡天文数字，正常想填多少填多少。
             Self::PanelLineHeight => (0, crate::config::PANEL_LINE_HEIGHT_MAX as i32),
+            Self::TrayDigit(_, metric) => match metric {
+                TrayDigitMetric::SizePt => (
+                    crate::config::TrayDigitMetrics::SIZE_RANGE.0 as i32,
+                    crate::config::TrayDigitMetrics::SIZE_RANGE.1 as i32,
+                ),
+                TrayDigitMetric::Width | TrayDigitMetric::Height => (
+                    crate::config::TrayDigitMetrics::SCALE_RANGE.0 as i32,
+                    crate::config::TrayDigitMetrics::SCALE_RANGE.1 as i32,
+                ),
+                TrayDigitMetric::Tracking => crate::config::TrayDigitMetrics::TRACKING_RANGE,
+            },
             _ => {
                 let (low, high) = self.range_nonneg();
                 (low as i32, high as i32)
@@ -985,13 +1023,13 @@ impl NumberField {
             Self::PanelFontSize | Self::PanelLetterSpacing | Self::PanelLineHeight => {
                 unreachable!("面板字体字段走有符号的那一层")
             }
+            Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
             Self::HotkeyStep => (1, 100),
             Self::WheelStep => (1, 100),
             Self::LogWheelStep => (
                 (crate::config::LOG_SCROLL_STEP_RANGE_DB.0 * 10.0).round() as u32,
                 (crate::config::LOG_SCROLL_STEP_RANGE_DB.1 * 10.0).round() as u32,
             ),
-            Self::NumberSize => (0, 100),
             Self::StartupVolume => (0, 100),
             // 上限压到 0 就等于常驻静音，没有意义；最低给 5%。
             Self::VolumeCap => (5, 100),
@@ -1039,6 +1077,16 @@ impl NumberField {
             Self::PanelFontSize => config.panel_font_size = value as f32 / 10.0,
             Self::PanelLetterSpacing => config.panel_letter_spacing = value as f32 / 10.0,
             Self::PanelLineHeight => config.panel_line_height = value as f32,
+            // 字距能填负数，所以托盘数字这几项走有符号这一层。
+            Self::TrayDigit(digits, metric) => {
+                let metrics = tray_digit_metrics_mut(config, digits);
+                match metric {
+                    TrayDigitMetric::SizePt => metrics.size_pt = value.max(0) as u32,
+                    TrayDigitMetric::Width => metrics.width = value.max(0) as u32,
+                    TrayDigitMetric::Height => metrics.height = value.max(0) as u32,
+                    TrayDigitMetric::Tracking => metrics.tracking = value,
+                }
+            }
             // 一行都不给负数：夹一下再往下传，免得手改配置文件写出负数。
             _ => self.apply_nonneg(config, value.max(0) as u32),
         }
@@ -1053,7 +1101,7 @@ impl NumberField {
             Self::HotkeyStep => config.hotkey_volume_step = value,
             Self::WheelStep => config.scroll_wheel_step = value,
             Self::LogWheelStep => config.log_scroll_wheel_step = value as f32 / 10.0,
-            Self::NumberSize => config.tray_number_size = value,
+            Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
             Self::StartupVolume => config.startup.master_volume = value,
             Self::VolumeCap => config.volume_cap.percent = value,
             Self::HotkeyStepDb => config.hotkey_volume_step = value,
@@ -1127,13 +1175,21 @@ impl NumberField {
             Self::BrightnessScrollStep => format!("{value}%"),
             // 存的是十分之一 dB，显示成一位小数。
             Self::LogWheelStep => format!("{:.1} dB", value as f32 / 10.0),
-            Self::NumberSize => {
-                if value == 0 {
-                    lang.pick("自动", "Auto").to_string()
-                } else {
-                    format!("{value}%")
+            Self::TrayDigit(_, metric) => match metric {
+                // 0 是「自动」，比一个具体点数更好懂。
+                TrayDigitMetric::SizePt => {
+                    if value == 0 {
+                        lang.pick("自动", "Auto").to_string()
+                    } else if lang.is_en() {
+                        format!("{value} pt")
+                    } else {
+                        // 和 Photoshop 的中文界面一致：字号叫「点」。
+                        format!("{value} 点")
+                    }
                 }
-            }
+                TrayDigitMetric::Width | TrayDigitMetric::Height => format!("{value}%"),
+                TrayDigitMetric::Tracking => format!("{value}"),
+            },
             // 0 = 跟随音量面板，比写死一个数字更好懂。
             Self::BrightnessWidth => {
                 if value == 0 {
@@ -1250,10 +1306,11 @@ impl NumberField {
             ) {
                 return 200.min(high);
             }
+            // 托盘数字的字号 0 是「自动」（≈旧版观感）；往上一次给 12pt（16px 画布上正好）。
+            if matches!(self, Self::TrayDigit(_, TrayDigitMetric::SizePt)) {
+                return 12.min(high);
+            }
             return 80.min(high);
-        }
-        if self == Self::NumberSize && current == 0 && direction < 0 {
-            return 60;
         }
         let next = current + direction * self.step_size();
         next.clamp(low, high)
@@ -1285,14 +1342,44 @@ impl NumberField {
             // 面板字号 / 字间距内部是「十分之一像素」，走 5 = 半像素，
             // 正好是字体字号框里最常用的一档（11.5 / 12 / 12.5）。
             Self::PanelFontSize | Self::PanelLetterSpacing => 5,
+            // 托盘数字：字号按 1pt 走（16px 画布上一档约 1.3px），宽高按 5%，
+            // 字距按 10（= 1/100 em，16px 下约 0.16px 一档）。
+            Self::TrayDigit(_, TrayDigitMetric::SizePt) => 1,
+            Self::TrayDigit(_, TrayDigitMetric::Width | TrayDigitMetric::Height) => 5,
+            Self::TrayDigit(_, TrayDigitMetric::Tracking) => 10,
             _ => 1,
         }
+    }
+
+    /// 改这个字段要不要重画托盘图标（数字相关的都要）。
+    fn touches_tray(self) -> bool {
+        matches!(self, Self::TrayDigit(..))
+    }
+}
+
+/// 取某一档位数（1 / 2 / 3 位）的托盘数字外观。
+fn tray_digit_metrics(config: &Config, digits: u8) -> crate::config::TrayDigitMetrics {
+    match digits {
+        1 => config.tray_digit_one,
+        2 => config.tray_digit_two,
+        _ => config.tray_digit_three,
+    }
+}
+
+/// 同上，可变引用（写配置用）。
+fn tray_digit_metrics_mut(
+    config: &mut Config,
+    digits: u8,
+) -> &mut crate::config::TrayDigitMetrics {
+    match digits {
+        1 => &mut config.tray_digit_one,
+        2 => &mut config.tray_digit_two,
+        _ => &mut config.tray_digit_three,
     }
 }
 
 /// 内部值（十分之一）→ 显示文字：`115` → `11.5`，`120` → `12`。
-fn tenths_text(value: i32) -> String {
-    let sign = if value < 0 { "-" } else { "" };
+fn tenths_text(value: i32) -> String {    let sign = if value < 0 { "-" } else { "" };
     let abs = value.unsigned_abs();
     if abs % 10 == 0 {
         format!("{sign}{}", abs / 10)
@@ -1335,7 +1422,8 @@ impl FontTarget {
 
     fn set_weight(self, config: &mut Config, weight: u32) {
         match self {
-            Self::TrayNumber => config.tray_number_weight = weight,
+            // 托盘数字从 rev 67 起不再有字重设置（笔画粗细固定 600）。
+            Self::TrayNumber => {}
             Self::Ui => config.ui_font_weight = weight,
             Self::Panel => config.panel_font_weight = weight,
         }
@@ -2427,9 +2515,106 @@ impl Settings {
             .into_any_element()
     }
 
+    /// 托盘数字某一档位数的一整组外观（字号 / 宽度 / 高度 / 字距）。
+    ///
+    /// 一行放四个小格子而不是四行 —— 三档位数一共十二项，按 `number_row` 那样
+    /// 一行一个要占一整屏。
+    fn digit_metrics_group(
+        &self,
+        digits: u8,
+        title: &'static str,
+        config: &Config,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cells = [
+            (TrayDigitMetric::SizePt, lang.pick("字号", "Size")),
+            (TrayDigitMetric::Width, lang.pick("宽度", "Width")),
+            (TrayDigitMetric::Height, lang.pick("高度", "Height")),
+            (TrayDigitMetric::Tracking, lang.pick("字距", "Tracking")),
+        ];
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .rounded(px(theme::RADIUS_ROW));
+        for (metric, label) in cells {
+            row = row.child(self.digit_metric_cell(digits, metric, label, config, lang, cx));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(
+                div()
+                    .text_size(theme::fs(12.))
+                    .text_color(theme::text_secondary())
+                    .child(title),
+            )
+            .child(row)
+            .into_any_element()
+    }
+
+    /// 上面那一组里的一个小格子：`标签 + 数字框`（点数字进入输入）。
+    fn digit_metric_cell(
+        &self,
+        digits: u8,
+        metric: TrayDigitMetric,
+        label: &'static str,
+        config: &Config,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let field = NumberField::TrayDigit(digits, metric);
+        let current = field.value(config);
+        let editing = match &self.editing {
+            Some((active, buffer)) if *active == field => Some(buffer.as_str()),
+            _ => None,
+        };
+        let text = match editing {
+            Some(buffer) => format!("{buffer}▏"),
+            None => field.display(current, lang),
+        };
+        let active = editing.is_some();
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                div()
+                    .text_size(theme::fs(11.))
+                    .text_color(theme::text_tertiary())
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "tray-digit-{digits}-{metric:?}"
+                    )))
+                    .w(px(64.))
+                    .flex_none()
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .bg(theme::track())
+                    .cursor_pointer()
+                    .when(active, |style| style.bg(theme::accent()))
+                    .text_size(theme::fs(12.5))
+                    .text_color(theme::text_primary())
+                    .text_center()
+                    .truncate()
+                    .hover(|style| style.opacity(0.8))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.begin_edit(field, window, cx)
+                    }))
+                    .child(text),
+            )
+            .into_any_element()
+    }
+
     /// 落一个数值：夹到合法区间、写盘、立刻重画。
-    fn set_number(
-        &mut self,
+    fn set_number(        &mut self,
         field: NumberField,
         value: i32,
         window: &mut Window,
@@ -2445,8 +2630,8 @@ impl Settings {
         let _ = store
             .borrow_mut()
             .update(|config| field.apply(config, value));
-        if field == NumberField::NumberSize {
-            // 托盘数字的大小变了，图标得照新的尺寸重新光栅化。
+        if field.touches_tray() {
+            // 托盘数字的外观变了，图标得照新的字号 / 宽高 / 字距重新光栅化。
             crate::gui::refresh_tray_icon(cx);
         }
         if field == NumberField::VolumeCap {
@@ -8373,26 +8558,23 @@ impl Settings {
             ));
         }
 
-        // 显示器：具体几台走 `monitor`（0 = 主显示器），另外两项走 `monitor_mode`。
-        // 下拉里用两个不会和序号撞车的值表示那两项。
+        // 显示器：三段固定模式 + 「手动选择」（选中后下面才展开显示器下拉）。
+        //
+        // 以前是把每台显示器都摊成一个分段按钮，屏一多就横向铺不下；
+        // 现在固定四项，具体哪一台走下面那行下拉（`DevicePicker::OsdMonitor`）。
+        // 分段按钮上用两个不会和显示器序号撞车的值表示后两个模式。
         const MONITOR_CURSOR: u32 = 1_000;
         const MONITOR_ALL: u32 = 1_001;
-        let mut monitor_options: Vec<(u32, String)> =
-            vec![(0, lang.pick("主显示器", "Primary").to_string())];
-        monitor_options.extend(crate::windows::osd::display_options());
-        monitor_options.push((
-            MONITOR_CURSOR,
-            lang.pick("跟随鼠标所在显示器", "Follow the cursor's display")
-                .to_string(),
-        ));
-        monitor_options.push((
-            MONITOR_ALL,
-            lang.pick("全部显示器", "All displays").to_string(),
-        ));
+        const MONITOR_MANUAL: u32 = 1_002;
+        // 指定了某一台（`monitor != 0`）就是「手动选择」，`monitor == 0` 是主显示器。
+        let manual = config.osd.monitor_mode == crate::config::OsdMonitorMode::Single
+            && config.osd.monitor != 0;
         let monitor = {
             let store = self.config.clone();
             let selected = match config.osd.monitor_mode {
-                crate::config::OsdMonitorMode::Single => config.osd.monitor,
+                crate::config::OsdMonitorMode::Single => {
+                    if config.osd.monitor == 0 { 0 } else { MONITOR_MANUAL }
+                }
                 crate::config::OsdMonitorMode::Cursor => MONITOR_CURSOR,
                 crate::config::OsdMonitorMode::All => MONITOR_ALL,
             };
@@ -8400,26 +8582,75 @@ impl Settings {
                 "osd-monitor",
                 lang.pick("显示器", "Display"),
                 lang.pick(
-                    "提示条出现在哪块屏幕上；全部显示器会每块屏各弹一张",
-                    "Which screen the card appears on; All displays shows one card per screen",
+                    "提示条出现在哪块屏幕上；「手动选择」选中后下面会多一行下拉，全部显示器会每块屏各弹一张",
+                    "Which screen the card appears on. \"Pick a display\" opens a dropdown below; All displays shows one card per screen",
                 ),
-                monitor_options,
+                vec![
+                    (0, lang.pick("主显示器", "Primary").to_string()),
+                    (
+                        MONITOR_MANUAL,
+                        lang.pick("手动选择", "Pick a display").to_string(),
+                    ),
+                    (
+                        MONITOR_CURSOR,
+                        lang.pick("跟随鼠标", "Follow cursor").to_string(),
+                    ),
+                    (
+                        MONITOR_ALL,
+                        lang.pick("全部显示器", "All displays").to_string(),
+                    ),
+                ],
                 selected,
                 move |value, window, cx| {
-                    let mode = match value {
-                        MONITOR_CURSOR => crate::config::OsdMonitorMode::Cursor,
-                        MONITOR_ALL => crate::config::OsdMonitorMode::All,
-                        _ => crate::config::OsdMonitorMode::Single,
-                    };
-                    let _ = store.borrow_mut().update(|config| {
-                        config.osd.monitor_mode = mode;
-                        if mode == crate::config::OsdMonitorMode::Single {
-                            config.osd.monitor = value;
+                    let _ = store.borrow_mut().update(|config| match value {
+                        MONITOR_CURSOR => {
+                            config.osd.monitor_mode = crate::config::OsdMonitorMode::Cursor;
+                        }
+                        MONITOR_ALL => {
+                            config.osd.monitor_mode = crate::config::OsdMonitorMode::All;
+                        }
+                        MONITOR_MANUAL => {
+                            config.osd.monitor_mode = crate::config::OsdMonitorMode::Single;
+                            // 还没挑过具体哪台：先落到第一台，下拉才有东西可显示。
+                            if config.osd.monitor == 0 {
+                                if let Some((first, _)) =
+                                    crate::windows::osd::display_options().first()
+                                {
+                                    config.osd.monitor = *first;
+                                }
+                            }
+                        }
+                        _ => {
+                            config.osd.monitor_mode = crate::config::OsdMonitorMode::Single;
+                            config.osd.monitor = 0;
                         }
                     });
                     refresh_ui(window, cx);
                 },
             )
+        };
+
+        // 手动选择时才出现：一行下拉，显示当前那台，点开选。
+        let monitor_pick = if manual {
+            let current = crate::windows::osd::display_options()
+                .into_iter()
+                .find(|(value, _)| *value == config.osd.monitor)
+                .map(|(_, name)| name)
+                .unwrap_or_default();
+            Some(self.device_picker_row(
+                "osd-monitor-pick",
+                lang.pick("选择显示器", "Choose a display"),
+                lang.pick(
+                    "点开挑具体哪一台；选完下拉自动收起",
+                    "Click to pick the exact display; the list closes once you choose",
+                ),
+                &current,
+                lang.pick("选择显示器", "Choose a display"),
+                DevicePicker::OsdMonitor,
+                cx,
+            ))
+        } else {
+            None
         };
 
         let open_editor = self.action_row(
@@ -8515,9 +8746,15 @@ impl Settings {
             ),
         ];
 
+        // 标题跟着风格走：选了「跟随系统」之后，这一项管的已经不是「淡入淡出」了。
+        let animate_title = if config.osd.anim_style.is_system() {
+            lang.pick("弹出动画", "Popup animation")
+        } else {
+            lang.pick("淡入淡出", "Fade")
+        };
         let animate = self.toggle_row(
             "osd-animate",
-            lang.pick("淡入淡出", "Fade"),
+            animate_title,
             lang.pick(
                 "关掉就直接出现、直接消失",
                 "Turn off to appear and disappear instantly",
@@ -8525,8 +8762,39 @@ impl Settings {
             config.osd.animate,
             self.bind(|config| config.osd.animate = !config.osd.animate),
         );
+        // 动画风格：就地淡入淡出，还是照系统音量条「滑上来 + 淡入」。
+        let anim_style = if config.osd.animate {
+            let store = self.config.clone();
+            Some(self.choice_row_owned(
+                "osd-anim-style",
+                lang.pick("动画风格", "Animation style"),
+                lang.pick(
+                    "「跟随系统」和 Windows 自己的音量条一样从下方滑上来，消失时滑回去",
+                    "\"Follow system\" slides up from below like the Windows volume bar, and slides back out",
+                ),
+                vec![
+                    (0, lang.pick("淡入淡出", "Fade").to_string()),
+                    (1, lang.pick("跟随系统", "Follow system").to_string()),
+                ],
+                config.osd.anim_style.index(),
+                move |value, window, cx| {
+                    let _ = store.borrow_mut().update(|config| {
+                        config.osd.anim_style = OsdAnimStyle::from_index(value)
+                    });
+                    refresh_ui(window, cx);
+                },
+            ))
+        } else {
+            None
+        };
         let mut fade_rows: Vec<AnyElement> = Vec::new();
         if config.osd.animate {
+            if let Some(style_row) = anim_style {
+                fade_rows.push(style_row);
+            }
+        }
+        // 「跟随系统」的时长由系统那套定，两个数字框这时候不摆出来。
+        if config.osd.animate && !config.osd.anim_style.is_system() {
             let fade_in = self.number_row(
                 "osd-fade-in",
                 lang.pick("淡入时长", "Fade in"),
@@ -8712,6 +8980,9 @@ impl Settings {
         }
 
         let mut position_rows = vec![position, monitor];
+        if let Some(pick) = monitor_pick {
+            position_rows.push(pick);
+        }
         position_rows.extend(coordinate_rows);
 
         vec![
@@ -9747,7 +10018,7 @@ impl Settings {
         // 整个设置窗的字体：和「设置窗字号」摆在一起。
         let ui_font = self.font_picker_row(config, lang, FontTarget::Ui, cx);
 
-        // 界面字重：和数字字重同一套四档，但影响整窗文字。
+        // 界面字重：四档（细 / 常规 / 半粗 / 粗），只影响整窗文字。
         let ui_weight = {
             let store = self.config.clone();
             let weight_options = Self::weight_options(lang);
@@ -9785,33 +10056,69 @@ impl Settings {
             cx,
         );
 
-        let number_weight = {
+        // 抗锯齿方式：照 Photoshop 字符面板底部那七档。
+        let antialias = {
             let store = self.config.clone();
-            let weight_options = Self::weight_options(lang);
+            let options: &'static [(u32, &'static str)] = if lang.is_en() {
+                &[
+                    (0, "None"),
+                    (1, "Sharp"),
+                    (2, "Crisp"),
+                    (3, "Strong"),
+                    (4, "Smooth"),
+                    (5, "Windows LCD"),
+                    (6, "Windows"),
+                ]
+            } else {
+                &[
+                    (0, "无"),
+                    (1, "锐利"),
+                    (2, "犀利"),
+                    (3, "浑厚"),
+                    (4, "平滑"),
+                    (5, "Windows LCD"),
+                    (6, "Windows"),
+                ]
+            };
             self.choice_row(
-                "tray-number-weight",
-                lang.pick("数字字重", "Number weight"),
-                lang.pick("托盘上的数字用多粗的笔画", "How heavy the tray digits are"),
-                weight_options,
-                config.tray_number_weight,
+                "tray-number-antialias",
+                lang.pick("数字抗锯齿", "Digit antialiasing"),
+                lang.pick(
+                    "和 Photoshop 字符面板那七档一致；「无」是硬边，小尺寸下最清楚",
+                    "The same seven levels as the Photoshop character panel; None is hard-edged",
+                ),
+                options,
+                config.tray_number_antialias.index(),
                 move |value, window, cx| {
+                    let style = crate::config::TrayAntialias::from_index(value);
                     let _ = store
                         .borrow_mut()
-                        .update(|config| FontTarget::TrayNumber.set_weight(config, value));
+                        .update(|config| config.tray_number_antialias = style);
                     crate::gui::refresh_tray_icon(cx);
                     refresh_ui(window, cx);
                 },
             )
         };
 
-        let number_size = self.number_row(
-            "tray-number-size",
-            lang.pick("数字大小", "Digit size"),
-            lang.pick(
-                "占图标高度的比例，100% = 撑满；0 = 自动；点数字可直接填",
-                "Share of the icon height, 100% = full; 0 = auto; click the number to type",
-            ),
-            NumberField::NumberSize,
+        // 三档位数各一套字号 / 宽度 / 高度 / 字距：一位数只有「5」的时候可以放大，
+        // 三位数「100」需要更小的字号才不会挤成一团 —— 分开存正是为这个。
+        let digit_one = self.digit_metrics_group(
+            1,
+            lang.pick("一位数（0–9）", "One digit (0–9)"),
+            config,
+            lang,
+            cx,
+        );
+        let digit_two = self.digit_metrics_group(
+            2,
+            lang.pick("两位数（10–99）", "Two digits (10–99)"),
+            config,
+            lang,
+            cx,
+        );
+        let digit_three = self.digit_metrics_group(
+            3,
+            lang.pick("三位数（100）", "Three digits (100)"),
             config,
             lang,
             cx,
@@ -10069,7 +10376,10 @@ impl Settings {
             self.toggle_row(
                 "popup-animation",
                 lang.pick("弹出动画", "Popup animation"),
-                lang.pick("从任务栏上沿展开", "Unfold from the taskbar"),
+                lang.pick(
+                    "从任务栏后面滑出来，或原地淡入淡出",
+                    "Slide out from behind the taskbar, or cross-fade in place",
+                ),
                 config.popup_animation,
                 move |window, cx| {
                     let _ = store
@@ -10129,13 +10439,58 @@ impl Settings {
             )
         };
 
-        // 弹出速度：同样是数字框，毫秒随便填（原来只有 200/300/400/500）。
+        // 弹出方式：照系统音量面板整块滑进来，还是原地淡入淡出。
+        let animation_style = {
+            let store = self.config.clone();
+            self.choice_row_owned(
+                "popup-anim-style",
+                lang.pick("弹出方式", "Popup style"),
+                lang.pick(
+                    "「跟随系统」和 Windows 自己的音量面板一样整块从任务栏后面滑进来；「淡入淡出」是原地淡出淡入",
+                    "\"Follow system\" slides the whole panel in from behind the taskbar, \"Fade\" just cross-fades in place",
+                ),
+                vec![
+                    (0, lang.pick("跟随系统", "Follow system").to_string()),
+                    (1, lang.pick("淡入淡出", "Fade").to_string()),
+                ],
+                config.popup_anim_style.index(),
+                move |value, window, cx| {
+                    let _ = store.borrow_mut().update(|config| {
+                        config.popup_anim_style = PopupAnimStyle::from_index(value)
+                    });
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        // 收起动画：关掉就瞬间消失（默认开）。
+        let close_animation = {
+            let store = self.config.clone();
+            self.toggle_row(
+                "panel-close-animation",
+                lang.pick("收起动画", "Close animation"),
+                lang.pick(
+                    "关掉的话面板一眨眼就没了",
+                    "Turn off to make the panel disappear instantly",
+                ),
+                config.panel_close_animation,
+                move |window, cx| {
+                    let _ = store.borrow_mut().update(|config| {
+                        config.panel_close_animation = !config.panel_close_animation
+                    });
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        // 弹出速度：三档通用的数字框，毫秒随便填。
+        // 「跟随系统」也吃这一项 —— 缩放的是系统那条曲线的时间常数，形状不变。
         let animation_speed = self.number_row(
             "popup-animation-ms",
             lang.pick("弹出速度（毫秒）", "Popup speed (ms)"),
             lang.pick(
-                "从按下到完全展开的时长，数值越小越快",
-                "Time from the hotkey to fully open; smaller is faster",
+                "从按下到完全展开的时长，数值越小越快；「跟随系统」按同一比例缩放系统节奏",
+                "Time from the hotkey to fully open; smaller is faster. With \"Follow system\" it scales the system timing",
             ),
             NumberField::PopupAnimation,
             config,
@@ -10264,7 +10619,12 @@ impl Settings {
             rows.push(app_icon);
             rows.push(app_name_capitalize);
             rows.push(animation);
-            rows.push(animation_speed);
+            if config.popup_animation {
+                rows.push(animation_style);
+                rows.push(close_animation);
+                // 三档都能调速度：「跟随系统」缩放的是系统曲线的时间常数。
+                rows.push(animation_speed);
+            }
             rows
         });
 
@@ -10290,13 +10650,19 @@ impl Settings {
             "speaker",
             vec![icon_style, tray_menu_devices],
         )];
-        // 字体 / 字重 / 高度只对「数字」图标有意义：选喇叭时整段收起来，
+        // 字体 / 抗锯齿 / 三档字号宽高只对「数字」图标有意义：选喇叭时整段收起来，
         // 免得摆一堆改了也看不出变化的选项。
         if matches!(config.tray_icon_style, TrayIconStyle::Number) {
             sections.push(self.section(
                 lang.pick("托盘数字", "Tray digits"),
                 "speaker",
-                vec![number_fonts, number_weight, number_size],
+                vec![
+                    number_fonts,
+                    antialias,
+                    digit_one,
+                    digit_two,
+                    digit_three,
+                ],
             ));
         }
         // 律动效果 / 灵敏度只对「动态」图标有意义。
@@ -11468,8 +11834,23 @@ impl Settings {
                 .child(text)
         };
 
-        // 两个「添加到名单」下拉和「选设备」共用一套弹出层：选项来源不同而已。
+        // 「添加到名单」、选设备、选显示器共用一套弹出层：选项来源不同而已。
         match which {
+            DevicePicker::OsdMonitor => {
+                let options = crate::windows::osd::display_options();
+                if options.is_empty() {
+                    list = list.child(hint(lang.pick("没有检测到显示器", "No displays found")));
+                } else {
+                    for (value, name) in options {
+                        list = list.child(self.monitor_menu_row(
+                            value,
+                            &name,
+                            value == config.osd.monitor,
+                            cx,
+                        ));
+                    }
+                }
+            }
             DevicePicker::StartupDefault | DevicePicker::BoundDevice => {
                 let current_id = match which {
                     DevicePicker::StartupDefault => config.startup.default_device_id.clone(),
@@ -11635,6 +12016,56 @@ impl Settings {
     }
 
     /// 设备列表里的一行：图标 + 名字 +（选中的那个打勾）。
+    /// 显示器下拉里的一行：名字 + 勾选，点一下定下 `osd.monitor`。
+    fn monitor_menu_row(
+        &self,
+        value: u32,
+        name: &str,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let store = self.config.clone();
+        let name = SharedString::from(name.to_string());
+        div()
+            .id(SharedString::from(format!("osd-monitor-{value}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .px(px(6.))
+            .py(px(5.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .cursor_pointer()
+            .when(selected, |style| style.bg(theme::accent_soft()))
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                let _ = store.borrow_mut().update(|config| {
+                    config.osd.monitor_mode = crate::config::OsdMonitorMode::Single;
+                    config.osd.monitor = value;
+                });
+                // 选完就收起来，不用再点一下。
+                this.picker = None;
+                refresh_ui(window, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(theme::fs(11.5))
+                    .text_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::text_primary()
+                    })
+                    .child(name),
+            )
+            .when(selected, |style| {
+                style.child(icon("check", 13.0, theme::accent()))
+            })
+            .into_any_element()
+    }
+
     fn device_menu_row(
         &self,
         id: &str,
@@ -11673,8 +12104,10 @@ impl Settings {
                         config.volume_cap.device_id = id.clone();
                         config.volume_cap.device_name = name.clone();
                     }
-                    // 另外两种「添加」各有自己的行（`add_*_menu_row`），走不到这里。
-                    DevicePicker::AddDeviceState | DevicePicker::AddAppVolume => {}
+                    // 「添加」两种各有一行，显示器那行也各有一份，都走不到这里。
+                    DevicePicker::AddDeviceState
+                    | DevicePicker::AddAppVolume
+                    | DevicePicker::OsdMonitor => {}
                 });
                 if which == DevicePicker::BoundDevice {
                     crate::gui::refresh_volume_cap(cx);
@@ -12477,6 +12910,11 @@ impl Render for Settings {
                 }
                 DevicePicker::AddDeviceState => config.startup.device_state_mode.uses_list(),
                 DevicePicker::AddAppVolume => config.startup.set_app_volumes,
+                // 选了「手动选择」那一档这一行才存在。
+                DevicePicker::OsdMonitor => {
+                    config.osd.monitor_mode == crate::config::OsdMonitorMode::Single
+                        && config.osd.monitor != 0
+                }
             };
             if !alive {
                 self.picker = None;

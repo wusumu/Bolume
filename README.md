@@ -4,7 +4,7 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写 · 单文件 exe · 绿色免安装 · 配置就在 exe 旁边 · 中英双语界面**
 
-目前版本 **0.77** · [下载](../../releases) · [English](#english)
+目前版本 **0.79** · [下载](../../releases) · [English](#english)
 
 ---
 
@@ -62,6 +62,9 @@ Bolume 把这些收进一个右下角弹出的面板里：一台默认设备 + �
 - 强调色可以跟随 Windows 强调色（读 `DWM\AccentColor`），也可以自己挑
 - 界面字体、字号缩放、字重、对比度、不透明度都能调
 - 面板里音量条（含亮度条）的粗细、圆角可调，圆角按条高百分比算，100% 是全圆头
+- 弹出动画二选一：`跟随系统`（照系统的指数曲线，从屏幕最底边、任务栏背后滑进来，速度按同一比例缩放）/ `淡入淡出`（原地淡入）；都按屏幕刷新率逐帧推进，**怎么出就怎么回**，收起也能选带不带动画
+- 动画可以**打断**：没出完再按一次就从当前位置掉头收回，收回一半再按也能接着弹回来
+- 屏幕提示的动画二选一：`淡入淡出` / `跟随系统`（滑上来 + 淡入，消失时滑回去）
 - 托盘图标：喇叭弧线跟随音量、或直接显示数字；波形动画可调增益
 
 ## 截图
@@ -189,6 +192,7 @@ vendor/
 - Its own on-screen display for volume, mute, track changes and brightness, with a layout editor
 - Global hotkeys for everything, including media keys taken over through a low-level keyboard hook, hold-to-repeat, and an app blocklist that gets out of the way in fullscreen games
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
+- Popup animations can follow the system: the panel and the OSD both rise from the bottom edge of the screen from *behind* the taskbar, animated frame-by-frame in sync with the display refresh rate, matching how Windows 11 (and 10) animate their own volume surfaces
 
 Download the latest `Bolume_vX.XX.zip` from [Releases](../../releases), extract anywhere and run `Bolume.exe`. Windows 10/11 x64, no installer, no .NET.
 

@@ -34,6 +34,11 @@ pub struct MonitorInfo {
     pub is_primary: bool,
     /// 工作区（逻辑像素）：x、y、宽、高。已经排除任务栏。
     pub work: (f32, f32, f32, f32),
+    /// 整块屏幕（逻辑像素）：x、y、宽、高。含任务栏占的那一条。
+    ///
+    /// 「从任务栏后面滑出来」的动画要拿它算起点：窗口顶边贴到屏幕底，才真的是
+    /// 整块卡片都在屏幕外，而不是卡在工作区底边上凭空冒出来。
+    pub bounds: (f32, f32, f32, f32),
     /// 系统的 `HMONITOR`（拿来和 `MonitorFromPoint` 的结果比对）。
     pub handle: isize,
 }
@@ -118,6 +123,7 @@ unsafe extern "system" fn collect(
 
     let device = wide_to_string(&info.szDevice);
     let work = info.monitorInfo.rcWork;
+    let screen = info.monitorInfo.rcMonitor;
     list.push(MonitorInfo {
         name: friendly_name(&device).unwrap_or(device),
         is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
@@ -126,6 +132,12 @@ unsafe extern "system" fn collect(
             work.top as f32 / scale,
             (work.right - work.left) as f32 / scale,
             (work.bottom - work.top) as f32 / scale,
+        ),
+        bounds: (
+            screen.left as f32 / scale,
+            screen.top as f32 / scale,
+            (screen.right - screen.left) as f32 / scale,
+            (screen.bottom - screen.top) as f32 / scale,
         ),
         handle: monitor.0 as isize,
     });
