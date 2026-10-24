@@ -1060,7 +1060,9 @@ impl StartupProfile {
 /// rev 67：托盘数字重做 —— 去掉「字重 / 数字大小」，改成照 PS 字符面板那套
 /// （`tray_number_antialias` + 三位数的 `tray_digit_one/two/three`：
 /// 字号 / 宽度 / 高度 / 字距）。老配置的「数字大小」百分比换算成一个字号搬过去。
-const CONFIG_REV: u32 = 67;
+/// rev 68：应用可以自定义名字（`app_names`，面板右键「重命名」）。
+/// 纯新增字段，默认空表 = 全部显示进程名，不需要迁移老配置。
+const CONFIG_REV: u32 = 68;
 
 /// 面板弹出动画的风格。
 ///
@@ -3281,6 +3283,17 @@ pub struct DeviceIconAlias {
     pub icon: String,
 }
 
+/// 应用的自定义名字（面板右键「重命名」）。
+///
+/// 按会话 key 存，和 `hidden_apps` 同一套：普通应用就是 `exe:<全路径小写>`，
+/// 进程重启、换会话都不会丢；拿不到进程路径的少数应用退化成 `pid:<pid>`，
+/// 那一条只在同一个进程活着时有意义。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppAlias {
+    pub key: String,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -3644,6 +3657,11 @@ pub struct Config {
     /// 进程重启后依然稳定，不会因为重新打开而重新出现。
     pub hidden_apps: Vec<String>,
 
+    /// 应用的自定义名字：填了之后面板里只显示它，系统名只在悬停提示里兜底。
+    ///
+    /// 和 `hidden_apps` 一样按会话 key（`exe:<路径>`）存，重启不丢。
+    pub app_names: Vec<AppAlias>,
+
     /// 配置格式版本：用来判断要不要把老配置的默认值升级到新默认。
     ///
     /// 必须单独标 `#[serde(default)]`：容器级的 default 会拿 `Config::default()`
@@ -3765,6 +3783,7 @@ impl Default for Config {
             panel_font_weight: DEFAULT_UI_FONT_WEIGHT,
             device_name_size: 13,
             hidden_apps: Vec::new(),
+            app_names: Vec::new(),
             config_rev: CONFIG_REV,
         }
     }
@@ -3855,9 +3874,49 @@ impl Config {
         true
     }
 
+    /// 这个应用有没有自定义名字（空字符串不算）。
+    pub fn app_alias(&self, key: &str) -> Option<&str> {
+        self.app_names
+            .iter()
+            .find(|alias| alias.key == key)
+            .map(|alias| alias.name.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// 应用在面板里该显示的名字：有自定义就用自定义，否则用进程名。
+    pub fn app_label(&self, key: &str, name: &str) -> String {
+        self.app_alias(key).unwrap_or(name).to_string()
+    }
+
+    /// 设应用的自定义名字；传空（或全空格）= 恢复进程名。返回有没有改动。
+    pub fn set_app_alias(&mut self, key: &str, name: &str) -> bool {
+        let name = name.trim();
+        let existing = self.app_names.iter().position(|alias| alias.key == key);
+        if name.is_empty() {
+            if let Some(index) = existing {
+                self.app_names.remove(index);
+                return true;
+            }
+            return false;
+        }
+        match existing {
+            Some(index) => {
+                if self.app_names[index].name == name {
+                    return false;
+                }
+                self.app_names[index].name = name.to_string();
+            }
+            None => self.app_names.push(AppAlias {
+                key: key.to_string(),
+                name: name.to_string(),
+            }),
+        }
+        true
+    }
+
     /// 这台设备用的自定义图标名（没有就是 `None`，交给设备类型去猜）。
-    pub fn device_icon(&self, id: &str) -> Option<&str> {
-        self.device_icons
+    pub fn device_icon(&self, id: &str) -> Option<&str> {        self.device_icons
             .iter()
             .find(|alias| alias.id == id)
             .map(|alias| alias.icon.as_str())
@@ -5223,6 +5282,34 @@ mod tests {
 
         // 清一个本来就没有的条目，不算改动。
         assert!(!config.set_device_alias(id, ""));
+    }
+
+    /// 应用改名：按会话 key 存、幂等、传空 = 恢复进程名。
+    ///
+    /// key 就是 `exe:<全路径小写>`（见 `audio::engine` 里的分组键），和
+    /// `hidden_apps` 共用同一套 key —— 折叠过的应用改完名还得能认出来。
+    #[test]
+    fn app_alias_overrides_and_clears() {
+        let mut config = Config::default();
+        let key = "exe:c:\\program files\\music\\player.exe";
+        assert_eq!(config.app_label(key, "Player"), "Player");
+
+        assert!(config.set_app_alias(key, "  网易云  "));
+        assert_eq!(config.app_label(key, "Player"), "网易云");
+
+        assert!(config.set_app_alias(key, "网易云音乐"));
+        assert_eq!(config.app_names.len(), 1);
+        assert!(!config.set_app_alias(key, "网易云音乐"));
+
+        // 别的应用各存各的。
+        assert!(config.set_app_alias("exe:d:\\game.exe", "游戏"));
+        assert_eq!(config.app_label("exe:d:\\game.exe", "Game"), "游戏");
+        assert_eq!(config.app_names.len(), 2);
+
+        // 空名字 = 恢复进程名（不是存一个空别名）。
+        assert!(config.set_app_alias(key, "  "));
+        assert_eq!(config.app_label(key, "Player"), "Player");
+        assert!(!config.set_app_alias(key, ""));
     }
 
     /// 设备图标：按 id 存、幂等、传空 = 回到跟随设备类型。

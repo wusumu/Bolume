@@ -4493,6 +4493,11 @@ impl Settings {
     }
 
     fn general_page(&self, config: &Config, lang: Lang) -> Vec<AnyElement> {
+        // 开机自启显示的是注册表里的**实际**状态，不是配置里那个布尔值：
+        // 任务管理器「启动」页里改过之后，配置并不知道 —— 用户关掉再打开，
+        // 这里显示的还是老样子就成了谎话。开关的翻转方向也按实际状态算，
+        // 免得配置落后一格时点一下「反着来」。
+        let autostart_on = crate::platform::autostart::is_enabled();
         let autostart = self.toggle_row(
             "toggle-autostart",
             lang.pick("开机自动启动", "Launch at login"),
@@ -4500,10 +4505,10 @@ impl Settings {
                 "登录 Windows 后自动在托盘运行",
                 "Start in the tray after you sign in",
             ),
-            config.launch_at_login,
-            self.bind(|config| {
-                config.launch_at_login = !config.launch_at_login;
-                let enable = config.launch_at_login;
+            autostart_on,
+            self.bind(move |config| {
+                let enable = !autostart_on;
+                config.launch_at_login = enable;
                 crate::platform::autostart::set_enabled(enable);
             }),
         );
@@ -6196,18 +6201,19 @@ impl Settings {
         .detach();
     }
 
-    /// 关窗时把「保持显示」钉住的提示条一起收走。
+    /// 关窗时把「边看边调」的东西一起收走：钉住的提示条 + 弹出来预览的面板。
     ///
-    /// 钉住是为了「边看预览边调外观」，它属于这一扇设置窗；窗口一关就没法再取消，
-    /// 留一张卡片常驻在屏幕上只能挡住别的窗口。所以这里挂一个窗口关闭回调，
-    /// 解除钉住并立刻淡出 —— 和用户关窗这个动作同步。
+    /// 这些都属于这一扇设置窗：钉住是为了对着调外观，预览面板是改外观时自动弹的。
+    /// 窗口一关就没法再取消 / 再关掉，留它们在屏幕上只能挡住别的窗口。所以这里挂
+    /// 一个窗口关闭回调，和用户关窗这个动作同步 —— 提示条解除钉住并淡出，面板收起。
     ///
     /// 订阅要存在自己身上：`Subscription` 一被 drop 回调就失效了。
-    pub fn watch_osd_pin_release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn watch_preview_release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let window_id = window.window_handle().window_id();
         let sub = cx.on_window_closed(move |cx, closed| {
             if closed == window_id {
                 crate::gui::release_osd_pins(cx);
+                crate::gui::release_flyout(cx);
             }
         });
         self.window_closed = Some(sub);

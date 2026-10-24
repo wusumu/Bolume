@@ -180,11 +180,24 @@ pub fn run(
         display_engine.send(crate::display::DisplayCommand::Refresh);
     }
 
-    // 自启动状态与注册表对账：便携版移动目录后这里会自动修正。
+    // 自启动状态与注册表对账：**注册表才是事实**，配置只跟着记一笔。
+    //
+    // 三件事都在这里做：
+    //  * 用户在任务管理器「启动」页里关掉 / 打开过 → 配置跟着改，设置页才不会一直显示错；
+    //  * 便携版移动了目录 → 把 `Run` 里那条路径改到当前 exe；
+    //  * 两边都没有 → 配置也置为关闭。
+    //
+    // 反过来的方向（配置开着、注册表里没有）不再自动补写：那多半是用户在任务管理器里
+    // 关掉的，替他重开等于跟用户对着干。
     {
-        let cfg = config.borrow().get().clone();
-        if cfg.launch_at_login && !crate::platform::autostart::is_enabled() {
-            crate::platform::autostart::set_enabled(true);
+        let actual = crate::platform::autostart::is_enabled();
+        if actual {
+            crate::platform::autostart::ensure_path();
+        }
+        if config.borrow().get().launch_at_login != actual {
+            let _ = config
+                .borrow_mut()
+                .update(|config| config.launch_at_login = actual);
         }
     }
 
@@ -416,6 +429,7 @@ pub fn run(
                             config.clone(),
                             engine.clone(),
                             mute_override,
+                            cx.focus_handle(),
                         );
                         flyout.on_open_settings =
                             Some(Rc::new(|_window: &mut gpui::Window, cx: &mut App| {
@@ -1138,12 +1152,32 @@ pub fn repaint_windows(cx: &mut App) {
 }
 
 /// 音量面板宽度改了：整块重排，跟着它走的亮度面板也重新贴一次。
+///
+/// 面板没开着的时候会被「预览」出来（和手动打开一模一样，只是不抢焦点）——
+/// 改外观本来就得看着效果调，这一下是用户预期里的。
 pub fn refresh_flyout_size(cx: &mut App) {
     let handle = cx.global::<AppState>().flyout.borrow().clone();
     if let Some(handle) = handle {
-        let _ = handle.update(cx, |flyout, window, cx| flyout.update_frame(window, cx));
+        let _ = handle.update(cx, |flyout, window, cx| flyout.refresh_layout(window, cx));
     }
     refresh_brightness_window(cx);
+}
+
+/// 设置窗关掉时把它弹出来的面板一起收走。
+///
+/// 钉住的留着：那是用户自己按的置顶，意思是「别自己消失」。
+pub fn release_flyout(cx: &mut App) {
+    let handle = cx.global::<AppState>().flyout.borrow().clone();
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |flyout, window, cx| {
+            if flyout.is_visible() && !flyout.is_pinned() {
+                flyout.hide(window, cx);
+            }
+        });
+    }
+    // 亮度面板是跟着音量面板来的（挨着摆、一起出现 / 一起收），收完得同步一次，
+    // 否则音量面板走了它自己还留在屏幕上。
+    sync_brightness(cx);
 }
 
 /// 重新枚举一遍显示器（设置页「显示器」那一页打开时调一次）。
@@ -2548,8 +2582,8 @@ fn open_settings(cx: &mut App) {
         // 改名失焦落盘：窗口切走（Alt+Tab / 点别的程序）也要存上。
         let _ = handle.update(cx, |this, window, cx| {
             this.watch_rename_blur(window, cx);
-            // 「保持显示」只是给设置页看的预览：窗口关掉就一起收走。
-            this.watch_osd_pin_release(window, cx);
+            // 「保持显示」/ 预览面板都只是给设置页看的：窗口关掉就一起收走。
+            this.watch_preview_release(window, cx);
         });
         // 窗口刚显示时 gpui 的首帧可能赶在 DirectX 设备就绪之前，画了也不会被合成，
         // 于是窗口看上去全透明（只剩 DWM 的阴影）。这里补一次重画：

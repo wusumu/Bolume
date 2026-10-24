@@ -368,6 +368,15 @@ pub struct Flyout {
     /// 一旦进来就不出去：声音小的应用电平常在门槛上下抖，跟着它来回挪会让条目
     /// 在列表里一直窜。这里只增不减，面板每次弹出时清空。
     promoted: RefCell<Vec<String>>,
+
+    /// 面板的键盘焦点：只有「重命名」在用时才真的收键盘，平时面板照旧不参与输入。
+    focus: gpui::FocusHandle,
+    /// 正在就地改名的应用；`None` = 没有在改名。
+    rename: Option<RenameState>,
+    /// 输入法还没提交的候选字范围（UTF-16 下标），没在拼字就是 `None`。
+    text_marked: Option<std::ops::Range<usize>>,
+    /// 改名输入框画在哪：输入法要把候选窗摆到它旁边。
+    rename_bounds: Rc<Cell<Option<gpui::Bounds<Pixels>>>>,
 }
 
 /// 应用条目的右键菜单。
@@ -392,6 +401,25 @@ struct AppMenu {
 /// 设备名点开的「更换播放设备」菜单（浮层，不占布局）。
 #[derive(Clone)]
 struct DeviceMenu {
+    x: f32,
+    y: f32,
+}
+
+/// 面板里就地改名的状态（应用右键 →「重命名」）。
+///
+/// 名字是照着 `hidden_apps` 那套 key（`exe:<全路径小写>` / `pid:<pid>`）存的，
+/// 所以这里也拿 key 当身份：进程重启、换会话之后改的名字照样认得出是哪个应用。
+#[derive(Clone)]
+struct RenameState {
+    key: String,
+    /// 正在输入的字。空串 = 还没改过名（输入框里显示占位提示）。
+    text: String,
+    /// 光标位置（UTF-16 偏移，和平台层 / 输入法用的是同一套计数）。
+    cursor: usize,
+    /// 输入框为空时显示的灰字（进程原名）：删干净了也知道原来叫什么。
+    placeholder: String,
+    /// 右键菜单弹出来的位置（窗口坐标）：竖向排版那一列只有 46 宽，输入框摆不进去，
+    /// 只能按这个位置浮一张卡片出来。
     x: f32,
     y: f32,
 }
@@ -424,12 +452,99 @@ struct HoverTip {
     height: f32,
 }
 
+/// 应用自定义名最多几个字（和设置页改名一个量级，面板那一格放得下）。
+const MAX_APP_NAME_CHARS: usize = 24;
+
+/// 按 UTF-16 计的长度（输入法 / 平台层用的都是这个单位）。
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// 按 UTF-16 下标切一段字符串（越界自动夹紧）。
+fn utf16_slice(text: &str, range: std::ops::Range<usize>) -> String {
+    let mut out = String::new();
+    let mut index = 0usize;
+    for ch in text.chars() {
+        let len = ch.len_utf16();
+        if index >= range.start && index + len <= range.end {
+            out.push(ch);
+        }
+        index += len;
+    }
+    out
+}
+
+/// UTF-16 偏移 → 字符下标（越界夹到最后）。
+fn char_index(text: &str, at: usize) -> usize {
+    let mut offset = 0usize;
+    for (index, ch) in text.chars().enumerate() {
+        if offset >= at {
+            return index;
+        }
+        offset += ch.len_utf16();
+    }
+    text.chars().count()
+}
+
+/// 在 UTF-16 偏移处插一段文字，返回新内容与新光标（超过字数上限就截掉尾巴）。
+fn insert_at(text: &str, at: usize, insert: &str, max_chars: usize) -> (String, usize) {
+    let mut chars: Vec<char> = text.chars().collect();
+    let index = char_index(text, at);
+    let room = max_chars.saturating_sub(chars.len());
+    let add: Vec<char> = insert
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(room)
+        .collect();
+    let added: usize = add.iter().map(|ch| ch.len_utf16()).sum();
+    chars.splice(index..index, add);
+    (chars.into_iter().collect(), at + added)
+}
+
+/// 删光标前（退格）或后（Delete）的一个字，返回新内容与新光标。
+fn delete_at(text: &str, at: usize, forward: bool) -> Option<(String, usize)> {
+    let mut chars: Vec<char> = text.chars().collect();
+    let index = char_index(text, at);
+    let target = if forward {
+        index
+    } else {
+        index.checked_sub(1)?
+    };
+    if target >= chars.len() {
+        return None;
+    }
+    let removed = chars.remove(target);
+    let cursor = if forward {
+        at
+    } else {
+        at - removed.len_utf16()
+    };
+    Some((chars.into_iter().collect(), cursor))
+}
+
+/// 光标左右挪一个字（emoji 这类占两个 UTF-16 单位的算一个字）。
+fn step_cursor(text: &str, at: usize, forward: bool) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let index = char_index(text, at);
+    if forward {
+        match chars.get(index) {
+            Some(ch) => at + ch.len_utf16(),
+            None => at,
+        }
+    } else if index == 0 {
+        at
+    } else {
+        at - chars[index - 1].len_utf16()
+    }
+}
+
 impl Flyout {
     pub(crate) fn new(
         snapshot: Snapshot,
         config: Rc<RefCell<ConfigStore>>,
         engine: Rc<crate::audio::AudioEngine>,
         muted_override: Rc<RefCell<HashMap<String, MuteNote>>>,
+        focus: gpui::FocusHandle,
     ) -> Self {
         Self {
             snapshot,
@@ -462,6 +577,10 @@ impl Flyout {
             apps_scroll: gpui::ScrollHandle::new(),
             wheel_last_at: None,
             promoted: RefCell::new(Vec::new()),
+            focus,
+            rename: None,
+            text_marked: None,
+            rename_bounds: Rc::new(Cell::new(None)),
         }
     }
 
@@ -578,13 +697,13 @@ impl Flyout {
         !app.is_system && self.snapshot.app_routing
     }
 
-    /// 右键菜单的高度：折叠项 +（可改时）分隔线 / 小标题 / 设备列表。
+    /// 右键菜单的高度：重命名 + 折叠 +（可改时）分隔线 / 小标题 / 设备列表。
     ///
     /// 用来把菜单夹在面板里 —— 设备多的机器上它会比面板还高，
     /// 只能保证菜单顶边不越界（gpui 的浮层不做滚动）。
     fn app_menu_height(&self, movable: bool) -> f32 {
         // 菜单行高是固定值（不跟面板字号缩放），这里照着常量算就行。
-        let base = MENU_PAD * 2.0 + MENU_ITEM;
+        let base = MENU_PAD * 2.0 + MENU_ITEM * 2.0;
         if !movable {
             return base;
         }
@@ -605,6 +724,261 @@ impl Flyout {
                 config.hidden_apps.push(key.clone());
             }
         });
+    }
+
+    // ---------- 就地改名（右键 →「重命名」） ----------
+    //
+    // 面板平时不吃键盘，只有这一段会临时接管：输入框画在名字那一格，
+    // 宽的全给输入用（滑条 / 读数 / 静音按钮这一行先不画，免得一边打字一边被点）。
+    // 中文靠 `impl EntityInputHandler for Flyout` 接（和设置窗同一套做法）。
+
+    /// 这一行现在是不是正在改名。
+    fn renaming(&self, key: &str) -> bool {
+        self.rename.as_ref().is_some_and(|state| state.key == key)
+    }
+
+    /// 进入改名：把**自定义名**装进输入框（没改过就是空 + 占位提示），光标放末尾。
+    ///
+    /// 装自定义名而不是面板上显示的那个名字：改过名再点一次「重命名」，用户要改的是
+    /// 自己起的那个；删干净回车就又回到进程原名，和设备改名是同一套规则。
+    fn start_rename(
+        &mut self,
+        key: &str,
+        placeholder: String,
+        x: f32,
+        y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.cfg().app_alias(key).unwrap_or_default().to_string();
+        let cursor = utf16_len(&text);
+        self.text_marked = None;
+        self.rename = Some(RenameState {
+            key: key.to_string(),
+            text,
+            cursor,
+            placeholder,
+            x,
+            y,
+        });
+        // 打开菜单即视为不再悬停，免得名字继续滚动。
+        *self.hovered_name.borrow_mut() = None;
+        *self.hover_tip.borrow_mut() = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// 落盘：回车、点别处、面板收起都算提交（空内容 = 恢复进程名）。
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.text_marked = None;
+        let Some(state) = self.rename.take() else {
+            return;
+        };
+        let _ = self.config.borrow_mut().update(|config| {
+            config.set_app_alias(&state.key, &state.text);
+        });
+        // 光 `cx.notify()` 在 Windows 上只是置脏，不补一次刷新的话输入框会一直挂在
+        // 屏幕上（打字能变是因为输入法那条路自己会刷新）。
+        window.refresh();
+        cx.notify();
+    }
+
+    /// Esc：什么都不写，直接退出编辑态。
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.text_marked = None;
+        if self.rename.take().is_some() {
+            window.refresh();
+            cx.notify();
+        }
+    }
+
+    /// 把一段文字插到光标处（输入法提交的字也走这里）。
+    fn insert_rename(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(state) = self.rename.as_mut() else {
+            return;
+        };
+        let (next, cursor) = insert_at(&state.text, state.cursor, text, MAX_APP_NAME_CHARS);
+        state.text = next;
+        state.cursor = cursor;
+        cx.notify();
+    }
+
+    /// 按光标删一个字：`forward` 真 = Delete，假 = 退格。
+    fn delete_rename(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.rename.as_mut() else {
+            return;
+        };
+        if let Some((next, cursor)) = delete_at(&state.text, state.cursor, forward) {
+            state.text = next;
+            state.cursor = cursor;
+            cx.notify();
+        }
+    }
+
+    /// 左右 / Home / End 挪光标。
+    fn move_rename_cursor(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(state) = self.rename.as_mut() else {
+            return;
+        };
+        let len = utf16_len(&state.text);
+        let at = state.cursor.min(len);
+        state.cursor = match key {
+            "home" => 0,
+            "end" => len,
+            "left" => step_cursor(&state.text, at, false),
+            "right" => step_cursor(&state.text, at, true),
+            _ => at,
+        };
+        cx.notify();
+    }
+
+    /// 改名期间的按键。文字本身不在这里插 —— 输入法 / `WM_CHAR` 走
+    /// `EntityInputHandler`，这里只管确认、取消、光标和删除。
+    fn on_rename_key(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.is_none() {
+            return;
+        }
+        // 输入法正在拼字：回车 / Esc / 退格都该先给输入法（确认候选、取消、删候选字）。
+        if self.text_marked.is_some() {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        match key {
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_rename(window, cx);
+            }
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_rename(window, cx);
+            }
+            "backspace" => {
+                cx.stop_propagation();
+                self.delete_rename(false, cx);
+                window.refresh();
+            }
+            "delete" => {
+                cx.stop_propagation();
+                self.delete_rename(true, cx);
+                window.refresh();
+            }
+            "left" | "right" | "home" | "end" => {
+                cx.stop_propagation();
+                self.move_rename_cursor(key, cx);
+                window.refresh();
+            }
+            "v" if event.keystroke.modifiers.control => {
+                cx.stop_propagation();
+                let text = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text().map(|text| text.to_string()));
+                if let Some(text) = text {
+                    self.insert_rename(&text, cx);
+                    window.refresh();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 改名输入框：已输入的字 + 光标 +（空的时候）进程原名当占位提示。
+    ///
+    /// 尾上挂一块 `canvas` 记下真实位置 —— 输入法要把候选窗摆到这里，
+    /// 平台层也是靠它算「这一格现在在收字」。
+    fn rename_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(state) = self.rename.as_ref() else {
+            return div().into_any_element();
+        };
+        let empty = state.text.is_empty();
+        let len = utf16_len(&state.text);
+        let cursor = state.cursor.min(len);
+        let before = utf16_slice(&state.text, 0..cursor);
+        let after = utf16_slice(&state.text, cursor..len);
+        let placeholder = state.placeholder.clone();
+
+        let caret = || {
+            div()
+                .w(px(1.5))
+                .h(px(12.))
+                .flex_none()
+                .bg(theme::text_primary())
+        };
+        let focus = self.focus.clone();
+        let entity = cx.entity();
+        let bounds_cell = self.rename_bounds.clone();
+
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .gap(px(1.))
+            .overflow_hidden()
+            .text_size(self.fs(12.5))
+            .text_color(theme::text_primary())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(1.))
+                    .whitespace_nowrap()
+                    .when(empty, |row| {
+                        row.child(caret()).child(
+                            div()
+                                .text_color(theme::text_tertiary())
+                                .child(placeholder),
+                        )
+                    })
+                    .when(!empty, |row| row.child(before).child(caret()).child(after)),
+            )
+            .child(
+                gpui::canvas(
+                    |_bounds, _window, _cx| {},
+                    move |bounds, _, window, cx| {
+                        bounds_cell.set(Some(bounds));
+                        window.handle_input(
+                            &focus,
+                            gpui::ElementInputHandler::new(bounds, entity.clone()),
+                            cx,
+                        );
+                    },
+                )
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    /// 竖向排版用的改名卡片：那一列只有 46 宽，输入框塞不进行里，只能浮出来。
+    ///
+    /// 位置照右键菜单弹出来的地方摆（已经夹在窗口内），宽度按面板宽度来 ——
+    /// 竖排面板本身就很窄，卡片贴着两边留 6px。
+    fn rename_overlay(&self, state: &RenameState, cx: &mut Context<Self>) -> AnyElement {
+        let width = (self.panel_width() - 12.0).clamp(120.0, 260.0);
+        let top = state.y.clamp(4.0, (self.panel_size().1 - 34.0).max(4.0));
+        div()
+            .absolute()
+            .left(px(6.))
+            .top(px(top))
+            .w(px(width))
+            .p(px(6.))
+            .rounded(px(theme::RADIUS_SMALL + 2.0))
+            .bg(theme::surface_elevated())
+            .border_1()
+            .border_color(theme::border_strong())
+            .child(
+                div()
+                    .h(px(18.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .child(self.rename_field(cx)),
+            )
+            .into_any_element()
     }
 
     fn icon_for(&self, app: &AppInfo) -> Option<Arc<RenderImage>> {
@@ -1343,13 +1717,19 @@ impl Flyout {
         } else {
             app.name.clone()
         };
+        // 右键「重命名」改过的名字：面板里只显示它（进程原名留在改名框的占位提示里）。
+        let name = self.cfg().app_label(&key, &name);
         let hidden = self.is_hidden(&key);
         let name_color = if hidden || muted || !playing {
             theme::text_secondary()
         } else {
             theme::text_primary()
         };
-        let name_element = self.app_name(&key, name.clone(), name_color, window, cx);
+        let name_element = if self.renaming(&key) {
+            self.rename_field(cx)
+        } else {
+            self.app_name(&key, name.clone(), name_color, window, cx)
+        };
         // 名字栏放不下就只剩省略号，图标这边再给一个入口：停 400ms 出全名。
         let icon_element = self.icon_with_tip(
             format!("app-icon-tip-{key}"),
@@ -1425,6 +1805,11 @@ impl Flyout {
         if hidden {
             // 被折叠的应用在展开后用弱化样式区分。
             row = row.opacity(0.55);
+        }
+        // 正在改名：这一行只留图标 + 输入框。滑条 / 读数 / 静音按钮先不画 ——
+        // 一边打字一边被点到不算好事，输入框也能占满整行宽度。
+        if self.renaming(&key) {
+            return row.child(icon_element).child(name_element).into_any_element();
         }
         row.child(icon_element)
             .child(name_element)
@@ -2034,6 +2419,9 @@ impl Flyout {
         } else {
             app.name.clone()
         };
+        // 竖排默认不写名字，全名只看悬停提示 —— 右键改过的名字也得跟着走，
+        // 不然「改完名面板上还是老名字」看着像没生效。
+        let tip_name = self.cfg().app_label(&key, &tip_name);
         let icon_button = self.channel_icon(
             format!("app-icon-{key}"),
             icon_element,
@@ -2051,9 +2439,10 @@ impl Flyout {
 
         let name = if self.cfg().vertical_app_names {
             Some(if app.is_system {
-                lang.pick("系统声音", "System sounds").to_string()
+                self.cfg()
+                    .app_label(&key, lang.pick("系统声音", "System sounds"))
             } else {
-                app.name.clone()
+                self.cfg().app_label(&key, &app.name)
             })
         } else {
             None
@@ -2230,13 +2619,13 @@ impl Flyout {
 
     /// 应用条目的右键菜单：一层可点掉的遮罩 + 浮在上面的小卡片。
     ///
-    /// 上半是折叠 / 展开，下半（能改路由时）是这台应用用哪个播放设备 ——
+    /// 上半是「重命名 / 折叠」，下半（能改路由时）是这台应用用哪个播放设备 ——
     /// 和 EarTrumpet 的「移动」按钮同一套语义：`默认设备` + 分隔线 + 每台设备，
     /// 当前生效的那一项打勾。
     fn context_menu(&self, menu: AppMenu, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.cfg().language;
         let (label, next_hidden) = if menu.hidden {
-            (lang.pick("展开此应用", "Expand this app"), false)
+            (lang.pick("取消折叠此应用", "Uncollapse this app"), false)
         } else {
             (lang.pick("折叠此应用", "Collapse this app"), true)
         };
@@ -2254,13 +2643,31 @@ impl Flyout {
             cx.notify();
         });
 
-        let mut items = div().flex().flex_col().child(self.menu_row(
-            "app-menu-hide",
-            label,
-            None,
-            false,
-            activate,
-        ));
+        // 「重命名」：收掉菜单，把这一行的名字换成输入框（回车落盘、Esc 取消）。
+        let rename_key = menu.key.clone();
+        let rename_placeholder = menu.name.clone();
+        let (menu_x, menu_y) = (menu.x, menu.y);
+        let start_rename = cx.listener(move |this: &mut Self, _, window: &mut Window, cx| {
+            *this.menu.borrow_mut() = None;
+            this.start_rename(
+                &rename_key,
+                rename_placeholder.clone(),
+                menu_x,
+                menu_y,
+                window,
+                cx,
+            );
+        });
+
+        let mut items = div().flex().flex_col()
+            .child(self.menu_row(
+                "app-menu-rename",
+                lang.pick("重命名", "Rename"),
+                None,
+                false,
+                start_rename,
+            ))
+            .child(self.menu_row("app-menu-hide", label, None, false, activate));
 
         if menu.movable {
             items = items
@@ -2277,9 +2684,11 @@ impl Flyout {
                         .px(px(10.))
                         .flex()
                         .items_center()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_size(self.fs(10.))
                         .text_color(theme::text_tertiary())
-                        .child(lang.pick("播放设备", "Playback device")),
+                        .child(lang.pick("指定此应用播放设备", "Playback device for this app")),
                 );
 
             // 第一项永远是「跟随默认设备」—— 和 EarTrumpet 一样，
@@ -2889,6 +3298,24 @@ impl Flyout {
     }
 
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_inner(true, window, cx);
+    }
+
+    /// 设置页改外观时把面板弹出来看一眼：**和手动打开完全一样**，只有一点不同 ——
+    /// 不抢焦点（设置窗还得接着用，鼠标还得接着点设置页里的控件）。
+    ///
+    /// 以前这一步是被 `refresh_layout` 里的 `set_frame` 顺手挪上来的：窗口在预热时
+    /// 就停在屏幕外、而且是「可见」的，一 `SetWindowPos` 就露头了，但 `visible`
+    /// 还是 false —— 于是 60Hz 补帧不跑（电平看着一卡一卡）、失焦不自动收、
+    /// 再按快捷键又是从屏幕外重新滑一遍（看着像「先关掉再重开」）。
+    pub fn show_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible {
+            return;
+        }
+        self.show_inner(false, window, cx);
+    }
+
+    fn show_inner(&mut self, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         self.activity.reset();
         // 每次弹出都从列表顶部开始，别接着上次的滚动位置。
@@ -2904,7 +3331,7 @@ impl Flyout {
         // 窗口几何变更必须放到本帧绘制结束之后：鼠标事件是在绘制期间派发的，
         // 此时直接 SetWindowPos 会撞上 gpui 内部正在借用的渲染器。
         cx.defer_in(window, move |this, window, cx| {
-            this.enter(window, cx, animate, config_ms, motion);
+            this.enter(window, cx, animate, config_ms, motion, activate);
             cx.notify();
         });
         // `defer_in` 要等「下一帧绘制完」才执行；空闲时 gpui 不给帧，
@@ -2920,6 +3347,7 @@ impl Flyout {
         animate: bool,
         config_ms: u32,
         motion: EntranceMotion,
+        activate: bool,
     ) {
         use crate::windows::platform::SlideMode;
         // 上一段还在跑（正在收起 / 正在滑入）：从它停下的位置接力，
@@ -2956,7 +3384,11 @@ impl Flyout {
             crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
         }
         crate::windows::platform::set_visible(window, true);
-        crate::windows::platform::activate(window);
+        // 预览（设置页弹出来的那一份）不抢焦点：键盘和鼠标都还该留给设置窗。
+        // 其余一切照旧 —— Z 序、滑动、补帧都按「手动打开」那一套走。
+        if activate {
+            crate::windows::platform::activate(window);
+        }
         // 一直排在任务栏之后：滑过任务栏的那一段和底部那圈阴影都被任务栏挡住。
         crate::windows::platform::present_behind_taskbar(window);
         if animate {
@@ -2986,6 +3418,9 @@ impl Flyout {
         // 压着一条旧读数不放。
         self.release_hold.borrow_mut().clear();
         self.drag_values.borrow_mut().clear();
+        // 正在改名时面板被收起（点了托盘 / 快捷键 / 点了别处）：名字照样要落盘，
+        // 不然用户刚打的字跟着面板一起消失，还以为是没生效。
+        self.commit_rename(window, cx);
         *self.menu.borrow_mut() = None;
         *self.device_menu.borrow_mut() = None;
         self.engine.send(AudioCommand::SetVisible(false));
@@ -3117,6 +3552,29 @@ impl Flyout {
     /// 面板贴右下角（任务栏上沿）定位，高度随内容精确变化。
     pub fn update_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.update_frame_parked(window, cx, false);
+    }
+
+    /// 设置页改了面板外观之后调（宽度 / 高度 / 字号 / 行距 / 排版 …）。
+    ///
+    /// 面板没开着就**按手动打开那套弹出来**（预览）；已经开着就跟着新尺寸重排。
+    pub fn refresh_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.show_preview(window, cx);
+            return;
+        }
+        // 滑入动画还在跑：滑动线程按它自己记的终点挪窗口，这时候再 `set_frame`
+        // 两边会抢位置（看着就是抖一下）。把这一段收掉，直接一次落到位。
+        if let Some(handle) = self.slide.take() {
+            handle.cancel();
+            self.anim.finish();
+            self.rest_offset = 0.0;
+            // 半路收掉的要是「淡入」那一档，窗口可能停在半透明上 —— 补回满不透明。
+            // （滑入那两档不能碰整窗 alpha，一碰 DWM 就补一段出现淡入。）
+            if self.anim.motion() == EntranceMotion::Fade {
+                crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
+            }
+        }
+        self.update_frame(window, cx);
     }
 
     /// 同上，`parked` = 这次落位直接落到**屏幕外**（系统风格的起点）。
@@ -3324,6 +3782,15 @@ impl Render for Flyout {
             .clone()
             .map(|tip| self.hover_tip_view(tip));
 
+        // 竖向排版没有一整个「名字栏」可以就地换成输入框，改名时浮一张小卡片。
+        let rename_overlay = if vertical {
+            self.rename
+                .as_ref()
+                .map(|state| self.rename_overlay(state, cx))
+        } else {
+            None
+        };
+
         // 尺寸永远是「完整那一份」：三档动画都是整扇窗在屏幕上滑（或者原地淡），
         // 内容一帧都不裁不缩 —— 裁切会多一层容器、还要每帧重绘整块面板。
         let full_height = self.desired_height();
@@ -3371,6 +3838,7 @@ impl Render for Flyout {
                 .children(overlay)
                 .children(device_overlay)
                 .children(tip_overlay)
+                .children(rename_overlay)
         } else {
             content
                 .child(device_row)
@@ -3412,7 +3880,31 @@ impl Render for Flyout {
                 .child(content),
         };
 
-        div().size_full().relative().child(panel)
+        div()
+            .size_full()
+            .relative()
+            // 面板平时不吃键盘：焦点只挂在根节点上，改名那一段才真的用得上
+            // （`start_rename` 里 `window.focus`，输入法的字走 `EntityInputHandler`，
+            // 回车 / Esc / 光标走 `on_rename_key`）。
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_rename_key))
+            // 「点别处就落盘」必须挂在捕获相位：子控件（滑条、菜单项、名字区）
+            // 都会 `stop_propagation`，冒泡根本轮不到根节点。点在输入框自己身上
+            // 不算「点别处」—— 那一格要留着继续改。
+            .capture_any_mouse_down(cx.listener(
+                |this: &mut Self, event: &MouseDownEvent, window: &mut Window, cx| {
+                    if this.rename.is_none() {
+                        return;
+                    }
+                    if let Some(bounds) = this.rename_bounds.get() {
+                        if bounds.contains(&event.position) {
+                            return;
+                        }
+                    }
+                    this.commit_rename(window, cx);
+                },
+            ))
+            .child(panel)
     }
 }
 
@@ -3514,6 +4006,156 @@ fn slider_unmute(
 ) -> bool {
     let from = previous.unwrap_or(current);
     from != value && cfg.unmute.allows(gesture, value > from)
+}
+
+/// 面板的改名输入：中文靠输入法提交的字也走这里落进缓冲。
+///
+/// 面板平时完全不碰键盘（没有焦点、没有按键监听），只有「重命名」那一段会
+/// `window.focus` 自己并挂上 `ElementInputHandler` —— 所以这几个回调里
+/// 一律以「没在改名就返回空」兜底，别的状态下不该有任何副作用。
+impl gpui::EntityInputHandler for Flyout {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let state = self.rename.as_ref()?;
+        let len = utf16_len(&state.text);
+        let start = range.start.min(len);
+        let end = range.end.min(len).max(start);
+        *adjusted_range = Some(start..end);
+        Some(utf16_slice(&state.text, start..end))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        let state = self.rename.as_ref()?;
+        let len = utf16_len(&state.text);
+        let pos = state.cursor.min(len);
+        // 没有选区，就一条竖线：输入法按这个位置摆候选窗、落提交的字。
+        Some(gpui::UTF16Selection {
+            range: pos..pos,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.text_marked.clone()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_marked.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_rename_range(range, text, false, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_rename_range(range, new_text, true, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: gpui::Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        // 面板这一格不做「点哪跳哪」：点输入框本身不算落盘（见根节点的捕获相位），
+        // 光标只跟着键盘走。
+        None
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        self.rename.as_ref().map(|state| utf16_len(&state.text))
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        // 只有真的在改名时接管文字输入，其余时候让系统关掉输入法。
+        self.rename.is_some()
+    }
+}
+
+impl Flyout {
+    /// 把一段文字换进改名缓冲：`mark` 为真表示这是输入法还没提交的候选字。
+    ///
+    /// 有 `marked` 时整段替换上一次的候选（拼音字母才不会一个个堆进去）；
+    /// 没有就用平台给的范围，再退到光标处插入。
+    fn replace_rename_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        mark: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.rename.as_ref() else {
+            return;
+        };
+        let current = state.text.clone();
+        let len = utf16_len(&current);
+        // 输入法提交时给的是它自己记的候选范围，以它为准；否则插在光标处。
+        let range = range.or(self.text_marked.clone()).unwrap_or_else(|| {
+            let at = state.cursor.min(len);
+            at..at
+        });
+        let start = range.start.min(len);
+        let end = range.end.min(len).max(start);
+        let prefix = utf16_slice(&current, 0..start);
+        let suffix = utf16_slice(&current, end..len);
+        let inserted: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        // 限长按整串算：先拼完再截，免得前缀 + 后缀把上限吃光还算成「插进去了」。
+        let next: String = format!("{prefix}{inserted}{suffix}")
+            .chars()
+            .take(MAX_APP_NAME_CHARS)
+            .collect();
+        // 光标跟在刚插进来那段字的后面（被截断时落在末尾）。
+        let cursor = (start + utf16_len(&inserted)).min(utf16_len(&next));
+        if let Some(state) = self.rename.as_mut() {
+            state.text = next;
+            state.cursor = cursor;
+        }
+        self.text_marked = mark.then_some(start..cursor);
+        cx.notify();
+    }
 }
 
 #[cfg(test)]
