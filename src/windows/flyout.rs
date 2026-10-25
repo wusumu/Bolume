@@ -124,6 +124,21 @@ fn vertical_fader_height(cfg: &Config) -> f32 {
     (vertical_panel_height(cfg) - vertical_fixed_height(cfg)).max(V_FADER_MIN)
 }
 
+/// 竖排一共几列：设备一列 + 每路应用一列 + 折叠入口一列（展开后折叠的也各占一列）。
+///
+/// 抽成纯函数是为了能测。列数算少一列，窗口就比内容窄，最后一列会被裁掉 ——
+/// 而最后一列正好是「已折叠」入口，裁掉就等于折叠之后再也点不回来。
+fn vertical_columns(visible: usize, hidden: usize, show_hidden: bool) -> usize {
+    let visible = visible.clamp(1, theme::MAX_VISIBLE_APPS);
+    let folded = if hidden > 0 {
+        // 入口本身一列；展开时被折叠的应用各占一列。
+        1 + if show_hidden { hidden } else { 0 }
+    } else {
+        0
+    };
+    visible + folded + 1
+}
+
 // 弹出动画的曲线与状态机在 `ui::anim`：显示器窗口用的是同一套，
 // 两扇窗一起弹出来，曲线差一点都会看出「一个先落、一个后落」。
 
@@ -1121,8 +1136,15 @@ impl Flyout {
     }
 
     /// 竖向排版一共几列：设备占一列，其余每路应用一列。
+    ///
+    /// 有被折叠的应用时还要多算一列「已折叠」的入口（展开后它们各占一列）。
+    /// 少算这一列的话窗口会比内容窄，最右边那列直接被裁掉 —— 而那正好是入口。
     pub fn channel_count(&self) -> usize {
-        self.visible_apps().len().clamp(1, theme::MAX_VISIBLE_APPS) + 1
+        vertical_columns(
+            self.visible_apps().len(),
+            self.hidden_apps().len(),
+            self.show_hidden,
+        )
     }
 
     /// 面板宽度：横排听用户配的（`flyout_width`），竖排由列数算出来。
@@ -2587,6 +2609,52 @@ impl Flyout {
             .into_any_element()
     }
 
+    /// 竖排版的「已折叠 n」入口：占一列，整列都能点。
+    ///
+    /// 折叠一列就换成一列入口，面板宽度因此不变（横排那边折叠会让窗口变矮，
+    /// 竖排没有「变矮」这回事，只能靠入口列把宽度补回来）。
+    fn hidden_column(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let expanded = self.show_hidden;
+        let onclick = cx.listener(|this: &mut Self, _, window: &mut Window, cx| {
+            this.show_hidden = !this.show_hidden;
+            this.update_frame(window, cx);
+            cx.notify();
+        });
+
+        div()
+            .id("hidden-apps-column")
+            .w(px(self.column_width()))
+            .h(px(
+                (self.column_height() - theme::FOOTER_HEIGHT - 1.0 - V_PAD * 2.0).max(48.),
+            ))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(3.))
+            .rounded(px(theme::RADIUS_ROW))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(onclick)
+            .child(icon(
+                if expanded {
+                    "chevron-up"
+                } else {
+                    "chevron-down"
+                },
+                10.0,
+                theme::text_tertiary(),
+            ))
+            .child(
+                div()
+                    .text_size(self.fs(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(count.to_string()),
+            )
+            .into_any_element()
+    }
+
     /// 列表底部的「已折叠 n」标题：点一下展开/收起被折叠的应用。
     fn hidden_toggle_row(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.cfg().language;
@@ -3866,6 +3934,16 @@ impl Render for Flyout {
                 None => columns.push(self.empty_device_row(lang)),
             }
             columns.extend(apps.iter().map(|app| self.app_channel(app, window, cx)));
+            // 竖排也得有「已折叠」的入口：横排能挂在列表底部，竖排没有列表底部，
+            // 折叠之后那一列直接消失、面板跟着变窄，被折叠的应用再也点不到。
+            // 现在折叠掉一列就换成这个入口列 —— 宽度不变，点它展开（展开的列走弱化样式，
+            // 右键还是「取消折叠此应用」）。
+            if !hidden.is_empty() {
+                columns.push(self.hidden_column(hidden.len(), cx));
+                if self.show_hidden {
+                    columns.extend(hidden.iter().map(|app| self.app_channel(app, window, cx)));
+                }
+            }
             columns
         } else {
             Vec::new()
@@ -4306,8 +4384,8 @@ mod tests {
     use super::{
         HOLD_SETTLE, MUTE_OVERRIDE_FOR, MuteNote, ReleaseNote, V_FADER_HEIGHT, V_FADER_MIN,
         VOLUME_HOLD_FOR, note_muted, resolve_held_volume, resolve_muted, shown_muted,
-        slider_unmute, split_device_name, vertical_fader_height, vertical_panel_height,
-        volume_readout,
+        slider_unmute, split_device_name, vertical_columns, vertical_fader_height,
+        vertical_panel_height, volume_readout,
     };
     use crate::config::{Config, VolumeGesture};
 
@@ -4392,6 +4470,23 @@ mod tests {
         config.vertical_height = 1;
         assert!(vertical_fader_height(&config) >= V_FADER_MIN);
         assert!(vertical_panel_height(&config) >= 140.0);
+    }
+
+    /// 竖排折叠掉一列之后，宽度不能跟着掉 —— 掉下去就等于把「已折叠」入口裁掉。
+    ///
+    /// 折叠一个应用：可见列 -1、新增入口列 +1，总列数不变；展开时入口列还在，
+    /// 折叠的那些各占一列。少算入口列就是这一条在保的东西。
+    #[test]
+    fn vertical_fold_keeps_a_column_for_the_toggle() {
+        // 3 路应用、没有折叠：设备 + 3 列。
+        assert_eq!(vertical_columns(3, 0, false), 4);
+        // 折叠掉一路：设备 + 2 列 + 入口列，宽度和折叠前一样。
+        assert_eq!(vertical_columns(2, 1, false), 4);
+        // 展开：入口列 + 被折叠的那一路都回来。
+        assert_eq!(vertical_columns(2, 1, true), 5);
+        assert_eq!(vertical_columns(0, 2, false), 3);
+        // 全部折叠掉也还剩设备列和入口列，不会退化成 0 列。
+        assert_eq!(vertical_columns(0, 0, false), 2);
     }
 
     #[test]
