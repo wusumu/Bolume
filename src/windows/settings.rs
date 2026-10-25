@@ -77,6 +77,11 @@ enum Page {
     Devices,
     Display,
     Volume,
+    /// 响度均衡：全局开关 + 两个参数 + 已单独设置的应用。
+    ///
+    /// 单独一页是因为它下面能挂一长串应用（每个单独设置过的应用一行），
+    /// 塞在「音量」页尾部会把那页本来就多的内容顶得没底。
+    Loudness,
     Startup,
     Shortcuts,
     Osd,
@@ -86,7 +91,7 @@ enum Page {
     About,
 }
 
-const PAGE_COUNT: usize = 10;
+const PAGE_COUNT: usize = 11;
 
 /// 解除静音矩阵里的一格：开关 id、当前值、点一下怎么改。
 type UnmuteCell = (&'static str, bool, fn(&mut Config));
@@ -97,6 +102,7 @@ impl Page {
         Page::Devices,
         Page::Display,
         Page::Volume,
+        Page::Loudness,
         Page::Startup,
         Page::Shortcuts,
         Page::Osd,
@@ -115,6 +121,7 @@ impl Page {
             Self::Devices => "devices",
             Self::Display => "display",
             Self::Volume => "volume",
+            Self::Loudness => "loudness",
             Self::Startup => "startup",
             Self::Shortcuts => "shortcuts",
             Self::Osd => "osd",
@@ -130,6 +137,7 @@ impl Page {
             Self::Devices => "headphones",
             Self::Display => "sun",
             Self::Volume => "volume-high",
+            Self::Loudness => "levels",
             Self::Startup => "power",
             Self::Shortcuts => "keyboard",
             Self::Osd => "monitor",
@@ -145,6 +153,7 @@ impl Page {
             Self::Devices => lang.pick("设备", "Devices"),
             Self::Display => lang.pick("显示器", "Display"),
             Self::Volume => lang.pick("音量", "Volume"),
+            Self::Loudness => lang.pick("响度均衡", "Loudness"),
             Self::Startup => lang.pick("启动", "Startup"),
             Self::Shortcuts => lang.pick("快捷键", "Shortcuts"),
             Self::Osd => lang.pick("屏幕提示", "On-screen"),
@@ -910,6 +919,10 @@ enum NumberField {
     BrightnessHotkeyMonitor,
     /// 亮度快捷键自己的步进（百分点，0 = 跟面板的「亮度步进」）。
     BrightnessHotkeyStep,
+    /// 响度均衡：最大放大级别（百分比，1–100）。
+    LoudnessLevel,
+    /// 响度均衡：音量变化级别（1–10）。
+    LoudnessSmooth,
 }
 
 impl NumberField {
@@ -981,6 +994,9 @@ impl NumberField {
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval,
             Self::BrightnessHotkeyMonitor => config.brightness.hotkey_monitor,
             Self::BrightnessHotkeyStep => config.brightness.hotkey_step,
+            // 两个都是整数百分比 / 级别，直接就是显示值。
+            Self::LoudnessLevel => config.loudness.level.clamp(1, 100),
+            Self::LoudnessSmooth => config.loudness.smoothness.clamp(1, 10),
         }
     }
 
@@ -1069,6 +1085,16 @@ impl NumberField {
             // 台数上限按 8 给：再多的场面亮度面板本来也放不下。
             Self::BrightnessHotkeyMonitor => (1, 8),
             Self::BrightnessHotkeyStep => crate::config::BRIGHTNESS_HOTKEY_STEP_RANGE,
+            // 目标电平 / 上限都是线性幅度，1% 就已经很小了，不给 0（0 等于全程静音）。
+            Self::LoudnessLevel => (1, 100),
+            // 参考实现的 `CompRate` 没有硬上限；给到 10.0（= 20 dB 斜率）足够，
+            // 再大就是「所有内容一样响」的死压，听感会喘。
+            // 1 = 一块走 50%，10 = 一块走千分之一。
+            Self::LoudnessSmooth => (1, 10),
+            // 参考实现默认 3000ms；少于 100ms 窗口里连一块都攒不满。
+
+            // 0 dB = 不提升（参考实现的行为）；+18 dB（8 倍）再往上就没意义了。
+
         }
     }
 
@@ -1134,6 +1160,8 @@ impl NumberField {
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval = value,
             Self::BrightnessHotkeyMonitor => config.brightness.hotkey_monitor = value,
             Self::BrightnessHotkeyStep => config.brightness.hotkey_step = value,
+            Self::LoudnessLevel => config.loudness.level = value.clamp(1, 100),
+            Self::LoudnessSmooth => config.loudness.smoothness = value.clamp(1, 10),
         }
     }
 
@@ -1236,6 +1264,8 @@ impl NumberField {
                     format!("{value}%")
                 }
             }
+            Self::LoudnessLevel => format!("{value}%"),
+            Self::LoudnessSmooth => format!("{value}"),
         }
     }
 
@@ -1260,7 +1290,7 @@ impl NumberField {
         } else if self.allows_decimal() {
             5
         } else if matches!(self, Self::OsdHold) {
-            // 最长 10000ms，五位。
+            // 最长 20000ms，五位。
             5
         } else if matches!(
             self,
@@ -1347,6 +1377,8 @@ impl NumberField {
             Self::TrayDigit(_, TrayDigitMetric::SizePt) => 1,
             Self::TrayDigit(_, TrayDigitMetric::Width | TrayDigitMetric::Height) => 5,
             Self::TrayDigit(_, TrayDigitMetric::Tracking) => 10,
+            // 响度那两个都是小整数，一档一格。
+            Self::LoudnessLevel | Self::LoudnessSmooth => 1,
             _ => 1,
         }
     }
@@ -1833,6 +1865,19 @@ impl Settings {
         let store = self.config.clone();
         move |window, cx| {
             let _ = store.borrow_mut().update(|config| apply(config));
+            refresh_ui(window, cx);
+        }
+    }
+
+    /// 跟 `bind` 一样，但改完还要把新值推给音频线程（响度均衡是引擎里跑的）。
+    fn bind_loudness(
+        &self,
+        apply: impl Fn(&mut Config) + 'static,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let store = self.config.clone();
+        move |window, cx| {
+            let _ = store.borrow_mut().update(|config| apply(config));
+            crate::gui::refresh_loudness(cx);
             refresh_ui(window, cx);
         }
     }
@@ -2454,8 +2499,12 @@ impl Settings {
 
         let input = div()
             .id(SharedString::from(format!("{id}-value")))
-            // 「20.0 dB」比「100%」宽，带小数的字段给宽一点，别被截成省略号。
-            .w(px(if field.allows_decimal() { 80. } else { 68. }))
+            // 「20.0 dB」比「100%」宽，带小数的字段给宽一点，别被截成省略号；
+            // 「20000 ms」比两者都长，再单给一档。
+            .w(px(match field {
+                other if other.allows_decimal() => 80.,
+                _ => 68.,
+            }))
             .flex_none()
             .py(px(2.))
             .rounded(px(4.))
@@ -2637,6 +2686,13 @@ impl Settings {
         if field == NumberField::VolumeCap {
             // 上限变了要立刻压一遍，别等到下一次 tick。
             crate::gui::refresh_volume_cap(cx);
+        }
+        if matches!(
+            field,
+            NumberField::LoudnessLevel | NumberField::LoudnessSmooth
+        ) {
+            // 响度参数只活在音频线程里，得推一份新的过去；累积的平均值会被清空重攒。
+            crate::gui::refresh_loudness(cx);
         }
         if field == NumberField::BrightnessWidth {
             // 宽度变了：亮度窗要重排（滑条长度、预设折行都跟着变）；
@@ -4343,6 +4399,18 @@ fn modifiers_bits(modifiers: &Modifiers) -> u32 {
 fn refresh_ui(window: &mut Window, cx: &mut App) {
     cx.refresh_windows();
     crate::windows::platform::post_repaint(window);
+}
+
+/// 会话 key → 能看的短名字。
+///
+/// 响度均衡的设置页要列出「单独设置过」的应用，应用没在跑时快照里就查不到名字，
+/// 只能从 key 里抠：`exe:c:\a\b\player.exe` → `player.exe`。
+fn app_key_file_name(key: &str) -> String {
+    key.strip_prefix("exe:")
+        .and_then(|path| path.rsplit(['\\', '/']).next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(key)
+        .to_string()
 }
 
 /// 换配色之后重画**所有**窗口：设置窗、音量面板、亮度窗、托盘菜单、OSD。
@@ -7394,6 +7462,194 @@ impl Settings {
                 ],
             ),
         ]
+    }
+
+    /// 响度均衡这一页：全局开关 + 两个参数 + 已单独设置的应用。
+    ///
+    /// 算法和这两个参数的语义照 TomSteady（`dsp_tom.dll` v1.4，Winamp 的 AGC 插件）。
+    /// 它面板上就两个滑块：`Desired Real Volume`（= 这里说「最大放大级别」）
+    /// 与 `Volume Slide Smoothness`（INI 里叫 `stepping`，= 「音量变化级别」，默认 8）。
+    /// 插件自己的说明文件原话是「这个插件音量控制得很细，它会自动调，没有需要设置的东西」。
+    fn loudness_page(
+        &self,
+        config: &Config,
+        lang: Lang,
+        snapshot: &Snapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let loud = config.loudness;
+        let global_on = loud.enabled;
+
+        let enabled = self.toggle_row(
+            "toggle-loudness",
+            lang.pick("全局响度均衡", "Global loudness equalization"),
+            lang.pick(
+                "所有应用都按这一套来；单个应用可以在面板里右键单独开或关",
+                "Applies to every app; override any single app from its right-click menu",
+            ),
+            global_on,
+            self.bind_loudness(|config| config.loudness.enabled = !config.loudness.enabled),
+        );
+
+        // 两个参数对应 TomSteady 面板上那两个滑块，别的都没有 —— 它自己的
+        // 说明文件还写着「你不用调，它会自己调」。
+        let level = self.number_row(
+            "loudness-level",
+            lang.pick("最大放大级别", "Max amplification"),
+            lang.pick(
+                "最多把声音推到满刻度的多少；100% 会落在九成左右，再高就削顶了",
+                "How loud the app may get, as a share of full scale; 100% lands around 90% so nothing clips",
+            ),
+            NumberField::LoudnessLevel,
+            config,
+            lang,
+            cx,
+        );
+
+        let smoothness = self.number_row(
+            "loudness-smoothness",
+            lang.pick("音量变化级别", "Volume change level"),
+            lang.pick(
+                "越大越稳、越小越跟手；10 大约三四十秒走完一圈，1 是一下就到",
+                "Higher is steadier, lower follows faster; 10 takes tens of seconds to sweep",
+            ),
+            NumberField::LoudnessSmooth,
+            config,
+            lang,
+            cx,
+        );
+
+        // 单独设置过的应用：行上点一下就是切换，切回和全局一致时这一行会自己消失
+        // （`set_app_loudness` 会把「跟全局一样」的条目删掉）。
+        let mut app_rows: Vec<AnyElement> = Vec::new();
+        if config.app_loudness.is_empty() {
+            app_rows.push(
+                div()
+                    .px(px(9.))
+                    .py(px(5.))
+                    .text_size(theme::fs(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick(
+                        "还没有单独设置的应用。在面板里右键任一应用 →「响度均衡」就能单独开关它。",
+                        "Nothing set per app yet. Right-click an app in the panel and toggle “Loudness equalization”.",
+                    ))
+                    .into_any_element(),
+            );
+        } else {
+            for entry in &config.app_loudness {
+                let name = snapshot
+                    .apps
+                    .iter()
+                    .find(|app| app.key == entry.key)
+                    .map(|app| config.app_label(&entry.key, &app.name))
+                    .unwrap_or_else(|| app_key_file_name(&entry.key));
+                let hint = match (entry.enabled, global_on) {
+                    (true, false) => lang.pick("单独开启（全局是关的）", "On for this app only"),
+                    (false, true) => lang.pick("单独关闭（全局是开的）", "Off for this app only"),
+                    // 和全局一样：条目只是「记住这个应用的选择」，等全局翻面才起作用。
+                    (true, true) => lang.pick("开着（和全局一致）", "On, same as global"),
+                    (false, false) => lang.pick("关着（和全局一致）", "Off, same as global"),
+                };
+                app_rows.push(self.loudness_app_row(&entry.key, name, hint, entry.enabled));
+            }
+        }
+
+        // 参数一直摆着，开关关着也照样能调：这一页本身就是「响度均衡」，
+        // 一进来只看到一个空开关、看不到均衡到底在调什么，反而像是没做完。
+        //
+        // 以前只在「全局开 || 有应用单独开」时才展开，于是「全局关、只给某个
+        // 应用单独开」的人根本找不到这两个参数 —— 明明那一路正在用它们。
+        let mut params: Vec<AnyElement> = Vec::new();
+        if !global_on {
+            params.push(
+                div()
+                    .px(px(9.))
+                    .py(px(2.))
+                    .text_size(theme::fs(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick(
+                        "全局是关的：下面这几个参数只对已单独开启的应用生效。",
+                        "Global is off; these values apply only to the apps enabled individually below.",
+                    ))
+                    .into_any_element(),
+            );
+        }
+        params.extend([level, smoothness]);
+
+        let takeover_note = self.sub_group(vec![
+            div()
+                .px(px(9.))
+                .py(px(2.))
+                .text_size(theme::fs(10.5))
+                .text_color(theme::text_tertiary())
+                .child(lang.pick(
+                    "需要的放大倍数超过系统音量上限（100% 还不够响）时，会单独接管这个应用的声音补上差额，大约晚 40 毫秒；受保护的内容（DRM）和独占模式的应用接管不了。",
+                    "When the app needs more than the system's 100% ceiling, its audio is taken over to supply the rest — about 40 ms later. DRM-protected and exclusive-mode apps cannot be taken over.",
+                ))
+                .into_any_element(),
+        ]);
+
+        vec![
+            self.section(
+                lang.pick("响度均衡", "Loudness equalization"),
+                "levels",
+                vec![enabled, self.sub_group(params), takeover_note],
+            ),
+            self.section(
+                lang.pick("单独设置的应用", "Per-app overrides"),
+                "apps",
+                vec![self.sub_group(app_rows)],
+            ),
+        ]
+    }
+
+    /// 单应用那一行：点一下切换开关，切回和全局一致时条目会被删掉。
+    fn loudness_app_row(
+        &self,
+        key: &str,
+        title: String,
+        hint: &'static str,
+        value: bool,
+    ) -> AnyElement {
+        let store = self.config.clone();
+        let key_owned = key.to_string();
+        div()
+            .id(SharedString::from(format!("loudness-app-{key_owned}")))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(7.))
+            .py(px(3.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(move |_, window, cx| {
+                let target = !value;
+                let key = key_owned.clone();
+                let _ = store.borrow_mut().update(|config| {
+                    config.set_app_loudness(&key, Some(target));
+                });
+                crate::gui::refresh_loudness(cx);
+                refresh_ui(window, cx);
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(theme::fs(12.))
+                    .text_color(theme::text_primary())
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(theme::fs(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(hint),
+            )
+            .child(self.mini_switch(value))
+            .into_any_element()
     }
 
     fn shortcuts_page(
@@ -12820,6 +13076,7 @@ impl Settings {
             Page::Devices => self.devices_page(lang, snapshot, cx),
             Page::Display => self.display_page(config, lang, cx),
             Page::Volume => self.volume_page(config, lang, snapshot, cx),
+            Page::Loudness => self.loudness_page(config, lang, snapshot, cx),
             Page::Startup => self.startup_page(config, lang, snapshot, cx),
             Page::Shortcuts => self.shortcuts_page(config, lang, cx),
             Page::Osd => self.osd_page(config, lang, cx),

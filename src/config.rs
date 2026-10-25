@@ -1062,7 +1062,16 @@ impl StartupProfile {
 /// 字号 / 宽度 / 高度 / 字距）。老配置的「数字大小」百分比换算成一个字号搬过去。
 /// rev 68：应用可以自定义名字（`app_names`，面板右键「重命名」）。
 /// 纯新增字段，默认空表 = 全部显示进程名，不需要迁移老配置。
-const CONFIG_REV: u32 = 68;
+/// rev 69：响度均衡（`loudness` + `app_loudness`）。默认关闭，纯新增字段，
+/// 不需要迁移：老配置读进来就是「没开」，音量行为跟以前一模一样。
+/// rev 70：响度均衡加「最大增益」（`loudness.max_gain`，默认 1.0 = 不提升）。
+/// 超过 1.0 的部分要接管该应用的音频流才输出得出来，默认不开，
+/// 所以老配置的行为同样不变。
+/// rev 71：响度均衡换成 TomSteady 的算法，参数从五个（目标电平 / 上限 /
+/// 压缩比 / 平均窗口 / 最大增益）收成两个（`loudness.level` 最大放大级别、
+/// `loudness.smoothness` 音量变化级别）。老配置里那五个字段反序列化时被忽略，
+/// 落到新默认值 —— 默认仍然是「关」，所以老配置读进来音量行为照旧。
+const CONFIG_REV: u32 = 71;
 
 /// 面板弹出动画的风格。
 ///
@@ -3294,6 +3303,123 @@ pub struct AppAlias {
     pub name: String,
 }
 
+/// 单个应用的响度均衡覆盖。
+///
+/// 全局开关在 `Config::loudness`；这里只记「这个应用跟全局不一样」的那部分。
+/// 按会话 key 存，和 `hidden_apps` / `app_names` 同一套，重启不丢。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLoudness {
+    pub key: String,
+    pub enabled: bool,
+}
+
+/// 响度均衡。
+///
+/// 算法照 TomSteady（Winamp 的 AGC 插件，Tom St Denis 写的 `dsp_tom.dll` v1.4）：
+/// 每 26ms 一块（Winamp 的 1152 采样块），量出这一块**乘完当前增益之后**的峰值，
+/// 跟目标峰值比 —— 超了就往下走一格，不到就往上走一格，一格 = 满量程的 `1/2^级别`。
+/// 连续往上走 128 块之后步长再乘上级别（安静素材不用等半分钟才抬起来）。
+///
+/// 两个参数直接对应插件面板上的两个滑块（反汇编 `dsp_tom.dll` 得到的原值）：
+///
+/// | 这里 | 插件里的名字 | 范围 | 默认 |
+/// |------|--------------|------|------|
+/// | `level` | Desired Real Volume | 0–100 | 75 |
+/// | `smoothness` | Volume Slide Smoothness（INI 里叫 `stepping`）| 5–10 | 8 |
+///
+/// 插件把 `stepping` 同时当定点小数位数用（`1<<stepping` = 100%），所以它的滑块
+/// 最低只给到 5；我们内部用 f32、步长按 `1/2^级别` 算，1–10 都能用
+/// （1 = 一块变 50%，10 = 一千块才走完一圈）。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoudnessConfig {
+    pub enabled: bool,
+    /// 最大放大级别（1–100，%）：目标峰值占满量程的百分比。
+    ///
+    /// 也就是「最多能放大到多响」—— 100% 就是把声音推到满刻度附近
+    /// （插件里的硬保护是 30000/32768 ≈ 91.6%，到那儿之前就开始压），
+    /// 1% 等于几乎不放大。插件默认 75，这里默认满档 100：均衡的意义就是
+    /// 「该多响就多响」，压着上限反而听不出它干活。
+    pub level: u32,
+    /// 音量变化级别（1–10）：一格走多远。
+    ///
+    /// 数值越大越稳（从静音走到满增益要 `2^级别` 块 ≈ 26ms × 2^级别），
+    /// 越小越跟手。插件默认 8（约 6.7 秒走完，实测就是它）。
+    pub smoothness: u32,
+}
+
+impl Default for LoudnessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: 100,
+            smoothness: 8,
+        }
+    }
+}
+
+impl LoudnessConfig {
+    /// 引擎采样节拍（毫秒）。跟以前一样每 15ms 采一次会话峰值。
+    pub const TICK_MS: u32 = 15;
+    /// 插件的一个处理块（毫秒）：Winamp 一块 1152 采样，44.1kHz 下 26.1ms。
+    /// 所有「一格」「一张票」都是按块算的，所以引擎要按块攒够时间才决策。
+    pub const BLOCK_MS: u32 = 26;
+    /// 插件里的「防止削顶」线：`30000/32768`，块内峰值超过它就直接压一格。
+    pub const CLIP_LEVEL: f32 = 30000.0 / 32768.0;
+    /// 连续抬升多少块之后步长乘上级别（`[0x100723cc] >= 0x80`）。
+    pub const FAST_AFTER: u32 = 128;
+    /// 预测器投票的饱和值和判决线（插件里那张 0x07 起的表，8 上 7 下）。
+    pub const VOTE_MAX: i32 = 15;
+    pub const VOTE_UP: i32 = 8;
+    pub const VOTE_DOWN: i32 = 7;
+    /// 输出（峰值 × 增益）超过目标的这个倍数，就按比例往回走，不再只投票。
+    ///
+    /// 1.5 倍 = +3.5dB：到这个程度已经「明显过响」，再用插件的 8 票投票去降
+    /// 就太慢（视频里的瞬态只有一两块）。见 `Steady::step` 的说明。
+    pub const OVER_FIT: f32 = 1.5;
+
+    /// 增益越过 1.0 多少才值得开接管流。
+    ///
+    /// 和 1.0 之间留 2% 死区（0.17dB，听不出来）：正好压在 1.0 上时，
+    /// 接管流会建了又拆 —— 每拆一次原声都要掉一下再回来，听着一顿一顿。
+    pub const BOOST_ENGAGE: f32 = 1.02;
+    /// 低于这个峰值就当「这一块没有内容」，增益一动都不动。
+    ///
+    /// 0.001 ≈ -60dB，人耳在这个电平上已经听不出内容了。不加这条的话，
+    /// 对话间隙、曲间空白、视频缓冲的静音块全都在「不到目标」那一支里投票，
+    /// 把增益一路堆到上限 —— 下一句一开口就是几倍的爆音（用户听到的
+    /// 「一开始播放突然很大声、音质很差地响几百毫秒」就是它）。
+    pub const MIN_PEAK: f32 = 0.001;
+    /// 增益上限（8 倍 = +18dB）。
+    ///
+    /// 插件里 `vol` 也有上限（否则安静素材会把底噪一起抬成巨响）。8 倍能覆盖
+    /// 峰值在 0.1 以上（-20dB）的素材 —— 正常音乐/视频的音轨余量都在这个范围；
+    /// 再高的增益会把房间噪声、解码抖动一起抬起来，得不偿失。
+    pub const MAX_GAIN: f32 = 8.0;
+
+    /// 目标峰值（线性幅度）。`level` 是百分比。
+    ///
+    /// 内部钳到防削顶线以下（`CLIP_LEVEL × 0.99 ≈ 90.6%`）：目标高过削顶线的话，
+    /// 「到了目标」和「削顶了要压」两支会互相打架，增益在 0.86–0.97 之间来回跳，
+    /// 听感是持续发抖。插件里同样有这个矛盾（`level` 拉到 100 时目标就是 100%，
+    /// 而削顶线在 91.6%），只是它跑在 Winamp 的 DSP 链里、抖动被播放器自己的
+    /// 音量盖住了；接在系统混音上必须收掉。
+    pub fn target(&self) -> f32 {
+        let want = self.level.clamp(1, 100) as f32 / 100.0;
+        want.min(Self::CLIP_LEVEL * 0.99)
+    }
+
+    /// 一格走多远（增益单位）。`smoothness` 就是定点小数位数。
+    pub fn step(&self) -> f32 {
+        1.0 / (1u32 << self.smoothness.clamp(1, 10)) as f32
+    }
+
+    /// 一拍（15ms）合多少块（26ms）。引擎按块攒够才走一步。
+    pub fn blocks_per_tick(&self) -> f32 {
+        Self::TICK_MS as f32 / Self::BLOCK_MS as f32
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -3662,6 +3788,14 @@ pub struct Config {
     /// 和 `hidden_apps` 一样按会话 key（`exe:<路径>`）存，重启不丢。
     pub app_names: Vec<AppAlias>,
 
+    /// 响度均衡的全局参数。
+    pub loudness: LoudnessConfig,
+
+    /// 单个应用的响度均衡开关（覆盖全局）。
+    ///
+    /// 只有「跟全局不一样」的应用才会在这里留一条；没有条目 = 跟随全局。
+    pub app_loudness: Vec<AppLoudness>,
+
     /// 配置格式版本：用来判断要不要把老配置的默认值升级到新默认。
     ///
     /// 必须单独标 `#[serde(default)]`：容器级的 default 会拿 `Config::default()`
@@ -3784,6 +3918,8 @@ impl Default for Config {
             device_name_size: 13,
             hidden_apps: Vec::new(),
             app_names: Vec::new(),
+            loudness: LoudnessConfig::default(),
+            app_loudness: Vec::new(),
             config_rev: CONFIG_REV,
         }
     }
@@ -3913,6 +4049,68 @@ impl Config {
             }),
         }
         true
+    }
+
+    /// 这个应用要不要做响度均衡：单应用覆盖优先，没有覆盖就跟全局开关。
+    pub fn loudness_for(&self, key: &str) -> bool {
+        self.app_loudness
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.enabled)
+            .unwrap_or(self.loudness.enabled)
+    }
+
+    /// 这个应用的响度均衡**单独设置**成了什么（`None` = 跟着全局，没留条目）。
+    ///
+    /// 面板上的角标问的是「它是不是被单独开了」—— 全局开着时每个应用都在均衡，
+    /// 那种情况不该在每一个图标上打标；只有覆盖成「开」的才值得标一下。
+    pub fn app_loudness_override(&self, key: &str) -> Option<bool> {
+        self.app_loudness
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.enabled)
+    }
+
+    /// 设单个应用的响度均衡开关。传 `None` = 删掉覆盖、回到跟随全局。
+    ///
+    /// 返回有没有改动（跟 `set_app_alias` 一样的约定，方便调用方决定要不要落盘）。
+    pub fn set_app_loudness(&mut self, key: &str, enabled: Option<bool>) -> bool {
+        let existing = self.app_loudness.iter().position(|entry| entry.key == key);
+        match enabled {
+            None => match existing {
+                Some(index) => {
+                    self.app_loudness.remove(index);
+                    true
+                }
+                None => false,
+            },
+            Some(enabled) => {
+                // 和全局一致就别留条目了：留着的话以后改全局开关它不跟着走，
+                // 用户会觉得「怎么这个应用不听话」。
+                if enabled == self.loudness.enabled {
+                    return match existing {
+                        Some(index) => {
+                            self.app_loudness.remove(index);
+                            true
+                        }
+                        None => false,
+                    };
+                }
+                match existing {
+                    Some(index) => {
+                        if self.app_loudness[index].enabled == enabled {
+                            return false;
+                        }
+                        self.app_loudness[index].enabled = enabled;
+                    }
+                    None => self.app_loudness.push(AppLoudness {
+                        key: key.to_string(),
+                        enabled,
+                    }),
+                }
+                true
+            }
+        }
     }
 
     /// 这台设备用的自定义图标名（没有就是 `None`，交给设备类型去猜）。
@@ -5310,6 +5508,97 @@ mod tests {
         assert!(config.set_app_alias(key, "  "));
         assert_eq!(config.app_label(key, "Player"), "Player");
         assert!(!config.set_app_alias(key, ""));
+    }
+
+    /// 响度均衡：单应用覆盖优先于全局；和全局一致时不留条目；
+    /// 传 `None` 删覆盖、回到跟随全局。
+    #[test]
+    fn loudness_override_follows_global_until_set() {
+        let mut config = Config::default();
+        let music = "exe:c:\\music\\player.exe";
+        let game = "exe:d:\\game.exe";
+
+        // 默认全局关，谁都跟随。
+        assert!(!config.loudness.enabled);
+        assert!(!config.loudness_for(music));
+
+        // 打得跟全局一致 = 不留条目，否则以后改全局它就不跟着走了。
+        assert!(!config.set_app_loudness(music, Some(false)));
+        assert!(config.app_loudness.is_empty());
+
+        // 单独给一个应用开。
+        assert!(config.set_app_loudness(music, Some(true)));
+        assert!(config.loudness_for(music));
+        assert!(!config.loudness_for(game));
+        assert!(!config.set_app_loudness(music, Some(true)));
+
+        // 全局打开：game 没有条目，直接跟着全局生效；
+        // music 的条目和全局一致了，再设一次就会被整理掉。
+        config.loudness.enabled = true;
+        assert!(config.loudness_for(game));
+        assert!(config.loudness_for(music));
+        assert!(config.set_app_loudness(music, Some(true)));
+        assert!(config.app_loudness.is_empty());
+        assert!(config.loudness_for(game));
+
+        // 全局开着时单独关一个应用。
+        assert!(config.set_app_loudness(game, Some(false)));
+        assert!(!config.loudness_for(game));
+        assert!(config.loudness_for(music));
+
+        // 删覆盖 = 回到跟随全局。
+        assert!(config.set_app_loudness(game, None));
+        assert!(config.loudness_for(game));
+        assert!(!config.set_app_loudness(game, None));
+    }
+
+    /// `smoothness` 照 TomSteady 的默认值 8（INI 里的 `stepping`）；
+    /// `level` 反过来取满档 100（插件默认 75，但压着上限听不出均衡在干活）。
+    #[test]
+    fn loudness_defaults_match_tomsteady() {
+        let loudness = LoudnessConfig::default();
+        assert!(!loudness.enabled);
+        assert_eq!(loudness.level, 100);
+        assert_eq!(loudness.smoothness, 8);
+
+        // 100% 目标被削顶线钳到 90.6%；一格 = 1/2^8 = 1/256（插件把 stepping
+        // 当定点小数位数用）。
+        assert!((loudness.target() - LoudnessConfig::CLIP_LEVEL * 0.99).abs() < 1e-6);
+        assert!((loudness.step() - 1.0 / 256.0).abs() < 1e-9);
+
+        // 一拍 15ms 合不到一块（一块 26ms），引擎得攒两拍才决策一次。
+        assert!((loudness.blocks_per_tick() - 15.0 / 26.0).abs() < 1e-6);
+        assert!(loudness.blocks_per_tick() < 1.0);
+
+        // 防削顶线是插件里的 30000/32768，不是 1.0。
+        assert!((LoudnessConfig::CLIP_LEVEL - 0.91552734).abs() < 1e-6);
+        assert!(LoudnessConfig::CLIP_LEVEL < 1.0);
+    }
+
+    /// 两个参数都要夹到有效范围：填 0 或填 300 不能算出离谱的增益 / 步长。
+    #[test]
+    fn loudness_params_clamp() {
+        let zero = LoudnessConfig {
+            level: 0,
+            smoothness: 0,
+            ..LoudnessConfig::default()
+        };
+        // level 0 也留 1%，否则等于「不放大」；步长最粗到 50%（一块走半程）。
+        assert!((zero.target() - 0.01).abs() < 1e-6);
+        assert!((zero.step() - 0.5).abs() < 1e-6);
+
+        let huge = LoudnessConfig {
+            level: 300,
+            smoothness: 99,
+            ..LoudnessConfig::default()
+        };
+        // 目标高不过防削顶线：level 100 实际落在 90.6%（见 `target()` 的说明）。
+        assert!((huge.target() - LoudnessConfig::CLIP_LEVEL * 0.99).abs() < 1e-6);
+        assert!((huge.step() - 1.0 / 1024.0).abs() < 1e-9);
+
+        // 步长必须是正的，不然 `gain.max(step)` 之后增益会卡在 0。
+        assert!(zero.step() > 0.0);
+        assert!(huge.step() > 0.0);
     }
 
     /// 设备图标：按 id 存、幂等、传空 = 回到跟随设备类型。

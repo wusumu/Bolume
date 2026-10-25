@@ -1,7 +1,7 @@
 //! 音频引擎：独立工作线程持有全部 COM 对象，UI 线程只收发纯数据。
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     time::{Duration, Instant},
@@ -14,8 +14,8 @@ use windows::Win32::Media::Audio::Endpoints::{
 };
 use windows::Win32::Media::Audio::{
     AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED,
-    EDataFlow, ERole, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2,
-    IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
+    EDataFlow, ERole, IAudioSessionControl2, IAudioSessionManager2,
+    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
     ISimpleAudioVolume, eMultimedia, eRender,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
@@ -24,6 +24,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{GUID, Interface, PCWSTR};
 
+use super::boost::{BoostEvent, BoostTarget};
 use super::model::{AppInfo, DeviceInfo, DeviceKind, Snapshot};
 use super::{
     appdevice::AppDevicePolicy,
@@ -61,6 +62,184 @@ const MUTE_APPLY_TIMEOUT: Duration = Duration::from_millis(1100);
 
 /// 对不上账时最多陪它折腾这么久（之后交还真实值，免得跟别的混音器死磕）。
 const MUTE_GIVE_UP: Duration = Duration::from_millis(3000);
+
+/// trace 里只留文件名，路径太长看不清。
+fn short_key(key: &str) -> &str {
+    key.rsplit(['\\', '/']).next().unwrap_or(key)
+}
+
+/// 响度均衡开着时的采样间隔。
+///
+/// 15ms 一拍，一拍最多走一块（插件一块 26ms）。不能跟着面板的可视状态走：
+/// AGC 的步进是按块算的，拍子一变慢，音量就变成一格一格跳 ——
+/// 而且面板关着的时候声音一样要均衡。
+const LOUDNESS_TICK: Duration = Duration::from_millis(crate::config::LoudnessConfig::TICK_MS as u64);
+
+/// 等接管线程「已退出接管」回报的最长时间。
+///
+/// 正常只要几十毫秒（`boost` 里 `PENDING_MS 24` + `TICK 8ms`）。超过这个时间
+/// 就是回报丢了，硬放行 —— 卡在表里的 pid 会让那个应用再也调不动。
+const RELEASE_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// 一个会话的 AGC 状态（TomSteady 那套）。
+///
+/// 照 `dsp_tom.dll` v1.4 的 NQ 主循环（`0x10001DD0` 起）：
+///
+/// 1. 把这一块乘上当前增益，量出乘完之后的峰值；
+/// 2. 超过目标峰值 → 投一票「往下」，降到 7 票时减一格；
+/// 3. 不到目标峰值 → 投一票「往上」，到 8 票时加一格；连续加 128 块之后
+///    一次加「级别」格（安静素材不用等半分钟才抬起来）。
+///
+/// 插件里那张「预测器」表（`0x100052f8`，初值 0x07，每块 ±1，8 上 7 下）
+/// 稳态下等价于一个 0..15 的滞回计数器，这里就用计数器表示。
+///
+/// 有两处**故意偏离插件**（都是因为它跑在系统混音上，不是在 Winamp 的 DSP 链里）：
+///
+/// - 静音块不参与投票（插件会照样加，于是间隙里把增益堆满，下一句就是爆音）；
+/// - 超过防削顶线时直接按比例压到目标，而不是「减一格」——
+///   一格只有 3%，从 8 倍降下来要好几秒，那几秒全是削顶失真。
+#[derive(Default)]
+struct Steady {
+    /// 当前增益（插件里的「filter volume」）。1.0 = 原样。
+    gain: f32,
+    /// 投票（0..15）。插件的表初值是 7，判决线 8 上 7 下。
+    votes: i32,
+    /// 连续抬升的块数，满 [`LoudnessConfig::FAST_AFTER`] 之后步长乘级别。
+    rising: u32,
+    /// 攒着还没凑够一块的毫秒。
+    accum: f32,
+    /// 这一块里采到过的**最大**峰值。
+    ///
+    /// 插件在 DSP 里看的是块内每一个样本，它量的天然就是块峰值。我们只能
+    /// 15ms 读一次 `GetPeakValue`，一块 26ms 里只看得到两个瞬时值 ——
+    /// 视频里的枪声、鼓点、音效比 15ms 还短，采样点全落在缝隙里就漏掉了。
+    /// 实测（DOpus 播视频，level 20 / target 0.2）：meter 报 0.15，实际输出
+    /// 峰值到 0.76，隔几秒就顶一次削顶 —— 用户听到的「隔几秒炸一下」。
+    /// 所以一块之内要取最大值，而不是拿最后一拍的瞬时值代表整块。
+    block_peak: f32,
+    /// 是否已经初始化过（`Default` 里的 0 增益不是合法的起点）。
+    started: bool,
+}
+
+impl Steady {
+    fn reset(&mut self) {
+        *self = Self {
+            gain: 1.0,
+            votes: crate::config::LoudnessConfig::VOTE_DOWN,
+            rising: 0,
+            accum: 0.0,
+            block_peak: 0.0,
+            started: true,
+        };
+    }
+
+    /// 接管流中途断了：把增益夹回 1.0 以内再接着算。
+    ///
+    /// 不能直接 [`Self::reset`] 到 1.0 —— 那等于把刚压下去的增益又抬满
+    /// （大动态那一下会二次爆）。夹到 1.0 之后 AGC 立刻按「超目标」往下压，
+    /// 走的是写会话音量那条路，几十毫秒就能回到目标。
+    fn hold(&mut self, config: &crate::config::LoudnessConfig) {
+        if !self.started {
+            self.reset();
+        }
+        self.gain = self.gain.clamp(config.step(), 1.0);
+        self.votes = crate::config::LoudnessConfig::VOTE_DOWN;
+        self.rising = 0;
+    }
+
+    /// 喂一拍（15ms）的峰值，返回这一拍的增益。
+    ///
+    /// `peak` 是会话电平表读到的**音量之前**的峰值（实测见 `boost` 模块），
+    /// 所以「乘完增益之后」就是 `peak * gain` —— 跟插件量的是同一个位置。
+    fn push(&mut self, peak: f32, config: &crate::config::LoudnessConfig, elapsed_ms: f32) -> f32 {
+        if !self.started {
+            self.reset();
+        }
+        // 一块之内的峰值取最大（见 `block_peak` 的说明）。
+        self.block_peak = self.block_peak.max(peak);
+        self.accum += elapsed_ms;
+        let block = crate::config::LoudnessConfig::BLOCK_MS as f32;
+        // 一拍最多走一块（TICK_MS < BLOCK_MS）；卡顿之后补算，但别一次补几百块。
+        let mut budget = 8;
+        while self.accum >= block && budget > 0 {
+            self.accum -= block;
+            let block_peak = std::mem::take(&mut self.block_peak);
+            self.step(block_peak, config);
+            budget -= 1;
+        }
+        if budget == 0 {
+            self.accum = 0.0;
+        }
+        self.gain
+    }
+
+    fn step(&mut self, peak: f32, config: &crate::config::LoudnessConfig) {
+        use crate::config::LoudnessConfig as C;
+        let target = config.target();
+        let level = config.smoothness.clamp(1, 10) as f32;
+        let step = config.step();
+
+        // 静音块：既不涨也不降，直接跳过这一块。
+        //
+        // 插件里没有这条（它假设素材是连续的），但用在系统混音上必须有：
+        // 视频暂停、对话间隙、曲间空白都是「峰值 0 的块」，全都落进「不到目标」
+        // 那一支的话，增益会一路爬到上限；等真有声音时就是几倍的爆音，
+        // 而且要好几秒才压回来 —— 这正是「一开始播放突然很大声、音质很差」。
+        if peak < C::MIN_PEAK {
+            self.rising = 0;
+            return;
+        }
+
+        let out = peak * self.gain;
+        if out > C::CLIP_LEVEL {
+            // 防削顶。
+            //
+            // 插件这里是 `vol -= stepping`（一步顶「级别」格 ≈ 3%），慢得离谱：
+            // 从安静段堆起来的 8 倍降到目标要上百块（好几秒），那几秒全是
+            // 削顶失真 —— 用户说的「一开始播放突然很大声、音质很差响几百毫秒」
+            // 就是这一段。这里直接按比例压到「这一块的峰值正好等于目标」，
+            // 一块（26ms）之内收敛。尖峰过去后抬回来仍然走下面的慢路径
+            // （release 慢、attack 快，这是 AGC 该有的手感）。
+            let want = target / peak;
+            self.gain = want.min(self.gain - step * level).max(step);
+            self.votes = 0;
+            self.rising = 0;
+        } else if out > target * C::OVER_FIT {
+            // 明显超目标（`OVER_FIT` = 1.5 倍，+3.5dB）。
+            //
+            // 插件这里只投一票，8 票才降一格 —— 那是给连续的音乐写的，超目标
+            // 会连着出现几十块，投票攒得起来。视频不一样：一段对白后面接一个
+            // 26ms 的音效，超目标只出现一两块，投票还没攒够音效就过去了。
+            // 实测（DOpus 播视频、level 20）：AGC 一路把增益抬到 8 倍，音效来的
+            // 时候输出是目标的 4 倍，全靠输出端限幅器硬压 12dB —— 听感就是
+            // 「隔几秒被按一下」。所以这里补一条按比例回退：一块之内往目标走
+            // 一半（`powf(0.5)`），既不猛抽，也不会让限幅器独自扛。
+            let ratio = (target / out).clamp(0.01, 1.0);
+            self.gain = (self.gain * ratio.sqrt()).max(step);
+            self.votes = C::VOTE_DOWN;
+            self.rising = 0;
+        } else if out > target {
+            self.rising = 0;
+            self.votes = (self.votes - 1).max(0);
+            if self.votes <= C::VOTE_DOWN {
+                self.gain -= step;
+            }
+        } else {
+            self.votes = (self.votes + 1).min(C::VOTE_MAX);
+            if self.votes >= C::VOTE_UP {
+                self.rising = self.rising.saturating_add(1);
+                if self.rising >= C::FAST_AFTER {
+                    self.gain += step * level;
+                } else {
+                    self.gain += step;
+                }
+            }
+        }
+        // 插件里最小是一格，不能让增益归零（归零就再也起不来了，
+        // 而且会话音量写 0 会让 process loopback 的捕获变哑）；上限见 MAX_GAIN。
+        self.gain = self.gain.clamp(step, C::MAX_GAIN);
+    }
+}
 
 #[derive(Debug)]
 pub enum AudioCommand {
@@ -121,6 +300,13 @@ pub enum AudioCommand {
         device_id: String,
         limit: Option<f32>,
     },
+    /// 响度均衡（全局参数 + 单应用的开关覆盖）。
+    ///
+    /// `overrides` 里只放「跟全局不一样」的应用，和配置里 `app_loudness` 一致。
+    SetLoudness {
+        config: crate::config::LoudnessConfig,
+        overrides: Vec<(String, bool)>,
+    },
     Refresh,
     Shutdown,
 }
@@ -129,6 +315,12 @@ pub enum AudioCommand {
 pub enum AudioEvent {
     Snapshot(Snapshot),
     Error(String),
+    /// 用户手动改了这个应用的音量，它已经从响度均衡里退出来。
+    ///
+    /// 均衡每 15ms 就会写一次音量，手动拖滑条如果不退出，下一个 15ms 就被顶回去 ——
+    /// 滑条根本拖不动。参考实现对应的是 `AutoExcludeOnManualSet`，只是它默认关、
+    /// 而且只影响本次运行；这里直接落配置，重启后依然记得「这个应用我不想均衡」。
+    LoudnessReleased(String),
 }
 
 pub struct AudioEngine {
@@ -298,10 +490,36 @@ struct AppEntry {
     /// 会话是挂在设备上的：应用被指到别的设备后，它的会话只存在于那台设备。
     /// 面板不用这个，但排查「调到不了某个应用」时要靠它看清会话到底在哪。
     session_devices: Vec<String>,
+    /// 接管流该接哪台端点。
+    ///
+    /// 记的是「最后看到它**在出声**的那台设备」：应用被指到别的设备之后，旧设备上
+    /// 往往还留着一条 `Expired` 会话，`session_devices.first()` 会认错 —— 那样放大的
+    /// 那份会从旧设备出来，而原声在新设备上一点没被压住。
+    ///
+    /// 只在 `state == 1`（真的在播放）时更新，没在播放时保持不变：否则应用一暂停，
+    /// 这个值会退回某台可能的旧设备，接管流跟着重开一次（声音会跳台）。
+    boost_device: Option<String>,
     level: f32,
     muted: bool,
     peak: f32,
+    /// 未钳位的峰值，只给 AGC 用。
+    ///
+    /// `peak` 要钳到 0..1 给面板画律动；但 AGC 算「乘完增益之后有多响」必须用
+    /// 真实幅度 —— 素材本身超过满量程（播放器上混、某些 DSD/OGG 解码路径）时，
+    /// 钳过的值会让防削顶永远以为 `out == gain`，压不下来。
+    raw_peak: f32,
     state: u32,
+    /// 响度均衡的 AGC 状态。会话重建时跟着 `AppEntry` 一起搬过去。
+    steady: Steady,
+    /// 这条应用的声音现在由接管流出（流建好之后一直是 true，直到均衡关掉 /
+    /// 静音 / 用户手动拖了这个应用的滑条 / 流失败）。
+    ///
+    /// 和「增益有没有超过 1」分开记：接管期间增益可能是小于 1 的衰减，
+    /// 那也需要由流来做（会话已经被压到 2%），不能靠这个数去判断要不要流。
+    boost_on: bool,
+    /// 接管通路要输出的增益（`boost_on` 为 true 时有效）。会话被压到
+    /// [`boost::ATTEN`]，露出部分只能靠这条流补。
+    boost_gain: f32,
 }
 
 struct Worker {
@@ -340,6 +558,42 @@ struct Worker {
     /// 重新造，挂在条目上的守门会跟着丢 —— 而那次重建恰好也可能是因为静音变了
     /// 触发的，丢了就没人把它按回去。
     mute_guard: std::collections::HashMap<String, MuteGuard>,
+    /// 响度均衡的全局参数。
+    loudness: crate::config::LoudnessConfig,
+    /// 单应用的开关覆盖（key → 开/关）。没有条目 = 跟随全局。
+    loudness_overrides: HashMap<String, bool>,
+    /// 本次运行里被用户手动改过音量、从而退出均衡的应用。
+    ///
+    /// 只是「界面把配置同步回来」之前的短路；配置一更新（`SetLoudness`）就清空。
+    loudness_manual: HashSet<String>,
+    /// 正在被均衡接管的某个应用，接管那一刻的音量。
+    ///
+    /// 用户取消勾选「响度均衡」时要还原成这个样子。不还原的话，均衡把 100% 压到
+    /// 25%，取消后音量就永远停在 25% —— 看着像「勾一下掉一截」，勾几次就听不见了。
+    loudness_saved: HashMap<String, f32>,
+    /// 接管通路：每应用超过 100% 的那部分增益由它输出。
+    ///
+    /// 只有算出来的增益真的越过 1.02 时才有流。
+    boost: crate::audio::boost::BoostHub,
+    /// 这些应用抓不了（独占模式 / DRM / 声音不在默认设备上），本次运行里不再试。
+    boost_blocked: HashSet<String>,
+    /// 调试用：上一拍打进 trace 的状态快照（key → 一行摘要）。
+    ///
+    /// 只在变化时写，否则 15ms 一拍会把文件刷爆。
+    trace_state: HashMap<String, String>,
+    /// 正在退出接管的 pid → 开始的时刻。
+    ///
+    /// 从「接管中」退回「会话自己出声」时，接管线程还要把会话音量还回去
+    /// （几十毫秒）。这期间引擎不能写音量，否则原声和接管流会同时出声。
+    /// 等接管线程回报 [`BoostEvent::Released`] 再放开。
+    ///
+    /// 带时刻是为了兜底：只要有一条 `Released` 丢了（`sync_boost` 那次恰好
+    /// 判定「目标没变」没往接管线程推），这个 pid 就会永久留在表里，那个应用
+    /// 从此再也调不动 —— 用户看到的就是「调着调着就不行了」。超过
+    /// [`RELEASE_TIMEOUT`] 一律放行。
+    boost_releasing: HashMap<u32, Instant>,
+    /// 上一次推给接管线程的目标集合（没变就不重复推）。
+    boost_targets: Vec<BoostTarget>,
 }
 
 /// 一次静音写入的守门记录。
@@ -392,6 +646,15 @@ fn run_worker(
         events: events.clone(),
         cap: None,
         mute_guard: std::collections::HashMap::new(),
+        loudness: crate::config::LoudnessConfig::default(),
+        loudness_overrides: HashMap::new(),
+        loudness_manual: HashSet::new(),
+        loudness_saved: HashMap::new(),
+        boost: crate::audio::boost::BoostHub::new(),
+        boost_blocked: HashSet::new(),
+        boost_releasing: HashMap::new(),
+        boost_targets: Vec::new(),
+        trace_state: HashMap::new(),
     };
 
     // 设备集合变化（启用/禁用、插拔、切默认）由系统主动通知，不再等下一次轮询。
@@ -416,7 +679,11 @@ fn run_worker(
     let _ = events.send_blocking(AudioEvent::Snapshot(worker.snapshot()));
 
     loop {
-        let timeout = if worker.visible || worker.animating {
+        // 响度均衡要按 15ms 采、按 15ms 写，节奏不能跟着面板的可视状态走
+        // （面板关着的时候声音一样要均衡）。
+        let timeout = if worker.loudness_wanted() {
+            LOUDNESS_TICK
+        } else if worker.visible || worker.animating {
             TICK_VISIBLE
         } else {
             TICK_HIDDEN
@@ -608,6 +875,31 @@ impl Worker {
                 volume,
                 unmute,
             } => {
+                // 用户自己动手了：这个应用退出响度均衡（否则下面这笔写入
+                // 会在 15ms 后被均衡覆盖回去，滑条像被黏住一样拖不动）。
+                let mut releasing: Vec<u32> = Vec::new();
+                if !self.loudness_manual.contains(&key) && self.loudness_for(&key) {
+                    // 先短路，别等界面把配置同步回来。
+                    self.loudness_manual.insert(key.clone());
+                    // 用户自己拖到的位置就是最终值：把接管前那份账销掉，
+                    // 否则界面随后发来的 `SetLoudness`（关掉均衡）会拿旧值盖回去。
+                    self.loudness_saved.remove(&key);
+                    if let Some(app) = self.apps.iter_mut().find(|a| a.key == key) {
+                        app.steady.reset();
+                        // 用户自己定的音量说了算：接管流收掉，声音回到会话那条路。
+                        if app.boost_on {
+                            app.boost_on = false;
+                            app.boost_gain = 1.0;
+                            releasing.push(app.pid);
+                        }
+                    }
+                    // 通道是无界的，`try_send` 不会失败；这里不能用 `send` ——
+                    // 它是 async 方法，丢掉返回的 Future 等于什么都没发。
+                    let _ = self.events.try_send(AudioEvent::LoudnessReleased(key.clone()));
+                }
+                for pid in releasing {
+                    self.boost_releasing.insert(pid, Instant::now());
+                }
                 if let Some(app) = self.apps.iter_mut().find(|a| a.key == key) {
                     let level = volume.clamp(0.0, 1.0);
                     let context = GUID::zeroed();
@@ -702,6 +994,61 @@ impl Worker {
                 // 立刻压一次：不用等下一帧，界面上的读数和滑条马上就是上限值。
                 self.enforce_cap();
             }
+            AudioCommand::SetLoudness { config, overrides } => {
+                // 换配置之前先把旧状态记下来：下面要算「哪些应用从均衡中变成不均衡」。
+                let was_global = self.loudness.enabled;
+                let was_overrides = self.loudness_overrides.clone();
+                self.loudness = config;
+                self.loudness_overrides.clear();
+                for (key, enabled) in overrides {
+                    self.loudness_overrides.insert(key, enabled);
+                }
+                // 配置变了就意味着「这是用户刚在界面上按的」，手动退出的短路全部作废
+                // （界面上那个勾就是最终意思）。
+                self.loudness_manual.clear();
+                // 只有**开关**真的拨动了才给抓不了的应用再一次机会。
+                //
+                // 这里以前是「每次配置变化都清空」，而设置页每动一下数值都会
+                // 重推一份配置 —— 拖一次滑条就把所有被拉黑的应用重新开一遍流，
+                // 每条流都要压音量、settle、失败、回滚，听感是一连串的闪和抖。
+                let toggled =
+                    was_global != self.loudness.enabled || was_overrides != self.loudness_overrides;
+                if toggled {
+                    self.boost_blocked.clear();
+                }
+
+                // 关掉均衡的应用要把音量还原成接管前的值 —— 用户按的是「取消勾选」，
+                // 期望听到他自己设的那个音量，而不是停在均衡压下去的位置。
+                let released: Vec<String> = self
+                    .apps
+                    .iter()
+                    .filter(|app| !app.is_system)
+                    .filter(|app| {
+                        let was = was_overrides
+                            .get(&app.key)
+                            .copied()
+                            .unwrap_or(was_global);
+                        let now = self
+                            .loudness_overrides
+                            .get(&app.key)
+                            .copied()
+                            .unwrap_or(self.loudness.enabled);
+                        was && !now
+                    })
+                    .map(|app| app.key.clone())
+                    .collect();
+                for key in released {
+                    // 手动拖过滑条的应用这里没有账（那条路已经销账了）。
+                    self.restore_loudness_volume(&key);
+                }
+
+                // 参数变化（最大放大级别 / 音量变化级别）**不重置增益**。
+                //
+                // 以前这里对所有应用 `steady.reset()`：拖一下滑条，正在接管的
+                // 应用就掉回 1.0 → 触发退出接管（关流、还音量）→ 重新从 1.0 爬。
+                // 连拖几下就一路 reset 一路重开，听感就是「调着调着就不行了」。
+                // 而且新参数每块都是从 config 现算的，增益本身没有陈旧值。
+            }
             AudioCommand::Shutdown => {}
             AudioCommand::Refresh => {
                 self.refresh_devices();
@@ -755,6 +1102,309 @@ impl Worker {
         }
 
         self.refresh_levels();
+        // 放在读数之后：本拍刚采到的峰值就是这一拍要处理的输入。
+        self.apply_loudness();
+        // 接管通路：先收失败，再把新的目标压过去。
+        self.drain_boost_events();
+        self.sync_boost();
+    }
+
+    /// 收接管线程回报的失败。
+    ///
+    /// 抓不到（独占模式 / DRM / 会话不在默认设备上）就把增益归位：不归位的话
+    /// 会话音量已经被按到 1.0、接管流又没有，用户会觉得「开了均衡反而乱了」。
+    fn drain_boost_events(&mut self) {
+        for event in self.boost.drain_events() {
+            match event {
+                BoostEvent::Failed {
+                    pid,
+                    reason,
+                    retry,
+                } => {
+                    log::warn!(
+                        "接管失败（pid {pid}{}）：{reason}",
+                        if retry { "，冷却后再试" } else { "，本次运行不再试" }
+                    );
+                    self.boost_releasing.remove(&pid);
+                    let config = self.loudness;
+                    let mut blocked = None;
+                    for app in &mut self.apps {
+                        if app.pid == pid {
+                            // 重要：`boost_on` 必须一起清掉。留着 true 的话
+                            // `apply_loudness` 会一直走「接管中」那一支、一个字都不写，
+                            // 这个应用从此再也调不动（用户说的「调着调着就不行了」）。
+                            app.boost_on = false;
+                            app.boost_gain = 1.0;
+                            if retry {
+                                app.steady.hold(&config);
+                            } else {
+                                app.steady.reset();
+                            }
+                            blocked = Some(app.key.clone());
+                        }
+                    }
+                    if let Some(key) = blocked {
+                        // 只有「抓不了」才拉黑；流断了留给接管线程冷却后重开。
+                        if !retry {
+                            self.boost_blocked.insert(key);
+                        }
+                    }
+                }
+                BoostEvent::Released { pid } => {
+                    // 接管线程已经把会话音量还回去了，从这里开始引擎可以重新写音量。
+                    // `app.level` 不用在这里改：下一拍 `refresh_levels` 会把真实值读回来。
+                    self.boost_releasing.remove(&pid);
+                }
+            }
+        }
+    }
+
+    /// 把「增益越过 1.0 的应用」推给接管线程。
+    ///
+    /// 一个 pid 只挑一条：同进程的多条会话本来就一起出声，抓一次就够了
+    /// （process loopback 按进程抓，抓两次会得到两份一样的音频）。
+    fn sync_boost(&mut self) {
+        let mut targets: Vec<BoostTarget> = Vec::new();
+        for app in &self.apps {
+            // 只在真的越过 1.02 时才开流：1.0 附近那点增益不值得为它
+            // 「压原声 + 多 40ms 延迟」，听感上是白亏的。
+            if app.is_system || !app.boost_on {
+                continue;
+            }
+            if self.boost_blocked.contains(&app.key) || self.loudness_manual.contains(&app.key) {
+                continue;
+            }
+            if targets.iter().any(|target| target.pid == app.pid) {
+                continue;
+            }
+            targets.push(BoostTarget {
+                pid: app.pid,
+                gain: app.boost_gain,
+                // 会话实际挂在哪台端点，接管流就接哪台。应用被面板指到别的设备
+                // 之后必须跟着走，否则放大后的那份会留在默认设备上。
+                // 认「最后在出声的那台」（`boost_device`），别被旧设备上的 Expired 会话骗了。
+                device: app
+                    .boost_device
+                    .clone()
+                    .or_else(|| app.session_devices.first().cloned()),
+            });
+        }
+        targets.sort_by_key(|target| target.pid);
+        if targets == self.boost_targets {
+            return;
+        }
+        if std::env::var_os("BOLUME_TRACE").is_some() {
+            let list: Vec<String> = targets
+                .iter()
+                .map(|t| format!("pid {} @ {:.3} dev={:?}", t.pid, t.gain, t.device))
+                .collect();
+            crate::platform::hotkey::trace(&format!("targets [{}]", list.join(", ")));
+        }
+        self.boost_targets = targets.clone();
+        self.boost.set_targets(targets);
+    }
+
+    /// 有没有任何一个应用需要响度均衡。
+    ///
+    /// 全局开着，或全局关着但有人单开 —— 两种都要按 15ms 跑。
+    fn loudness_wanted(&self) -> bool {
+        self.loudness.enabled || self.loudness_overrides.values().any(|enabled| *enabled)
+    }
+
+    /// 这个应用要不要均衡（单应用覆盖优先）。
+    fn loudness_for(&self, key: &str) -> bool {
+        self.loudness_overrides
+            .get(key)
+            .copied()
+            .unwrap_or(self.loudness.enabled)
+    }
+
+    /// 把某个应用从均衡里放出来，音量还原成接管前的值。
+    ///
+    /// 没有账（从没接管过，或者用户手动拖过滑条）就什么都不做 —— 后者是故意的：
+    /// 用户拖到哪儿就是哪儿，别再拿旧值盖回去。
+    fn restore_loudness_volume(&mut self, key: &str) {
+        if let Some(app) = self.apps.iter_mut().find(|app| app.key == key) {
+            app.steady.reset();
+        }
+        let Some(saved) = self.loudness_saved.remove(key) else {
+            return;
+        };
+        let Some(app) = self.apps.iter_mut().find(|app| app.key == key) else {
+            return;
+        };
+        let saved = saved.clamp(0.0, 1.0);
+        let context = GUID::zeroed();
+        let mut applied = false;
+        for volume in &app.volumes {
+            if unsafe { volume.SetMasterVolume(saved, &context) }.is_ok() {
+                applied = true;
+            }
+        }
+        if applied {
+            app.level = saved;
+        }
+    }
+
+    /// 响度均衡：把每个应用的音量拉向「听起来一样响」的位置。
+    ///
+    /// 算法是 TomSteady 的 AGC（见 [`Steady`]）。
+    ///
+    /// 通路有两条：增益 ≤ 1.0 时直接写会话音量；增益越过 1.02 就交给接管流
+    /// （WASAPI 的会话音量到不了 1.0 以上）。**接管一旦建立就一直由流承担**
+    /// ——包括增益后来掉回 1 以下的衰减段——直到均衡被关、静音、用户手动拖了
+    /// 这个应用的滑条、或者流失败。中途「掉到 1.02 以下就退出」会让流建了拆、
+    /// 拆了建，每次都要压音量/还音量/settle，听感是一连串的跳和空洞。
+    ///
+    /// **接管期间会话音量归接管线程管，这里一个字都不许写。** 写下去就是
+    /// 「原声 + 放大后的接管流」两份：听起来是回声，音量还会顶到削顶（炸）。
+    fn apply_loudness(&mut self) {
+        if !self.loudness_wanted() {
+            // 全关了：接管流也要收掉，否则它会一直替这个应用出声。
+            let mut drops: Vec<u32> = Vec::new();
+            for app in &mut self.apps {
+                if app.boost_on {
+                    app.boost_on = false;
+                    app.boost_gain = 1.0;
+                    drops.push(app.pid);
+                }
+            }
+            for pid in drops {
+                self.boost_releasing.insert(pid, Instant::now());
+            }
+            return;
+        }
+        let global = self.loudness;
+        // 覆盖表很小（只有「跟全局不一样」的应用），拷一份免得到处借 self。
+        let overrides = self.loudness_overrides.clone();
+        let manual = self.loudness_manual.clone();
+        let context = GUID::zeroed();
+        let tick = crate::config::LoudnessConfig::TICK_MS as f32;
+        // 循环里要收掉接管流的 pid：`self.apps` 已经可变借出去了，没法直接写
+        // `boost_releasing`，先攒着，循环之后统一插。
+        let mut drops: Vec<u32> = Vec::new();
+
+        // 没开调试就不再为 trace 构造字符串：这段在 15ms 的主循环里，
+        // 每拍给每个应用 `format!` 一次是白花的。
+        let tracing = std::env::var_os("BOLUME_TRACE").is_some();
+        let mut trace_now: HashMap<String, String> = HashMap::new();
+        for app in &mut self.apps {
+            // 系统声音不参与：那是提示音，不是用户在听的内容。
+            if app.is_system {
+                continue;
+            }
+            let on = overrides.get(&app.key).copied().unwrap_or(global.enabled);
+            // 用户刚手动拖过这个应用：这一轮别碰它（等界面把配置同步回来）。
+            if manual.contains(&app.key) {
+                if tracing {
+                    trace_now.insert(app.key.clone(), "manual-skip".into());
+                }
+                continue;
+            }
+            if !on {
+                // 关掉的那一路把 AGC 清干净：下次再开是从头开始，
+                // 而不是拿几分钟前的增益一上来就猛调。
+                app.steady.reset();
+                if app.boost_on {
+                    app.boost_on = false;
+                    app.boost_gain = 1.0;
+                    drops.push(app.pid);
+                }
+                continue;
+            }
+
+            // 第一次接管这个应用：记下它此刻的音量，取消勾选时还原到这里。
+            if !self.loudness_saved.contains_key(&app.key) {
+                self.loudness_saved.insert(app.key.clone(), app.level);
+            }
+
+            // 用户自己按的静音：把接管收掉（不然接管流会把静音绕过去），
+            // 音量也不动 —— 静音着还去改音量，用户会以为均衡把静音弄没了。
+            if app.muted {
+                if app.boost_on {
+                    app.boost_on = false;
+                    app.boost_gain = 1.0;
+                    drops.push(app.pid);
+                }
+                continue;
+            }
+
+            let gain = app.steady.push(app.raw_peak, &global, tick);
+            if tracing {
+                trace_now.insert(
+                app.key.clone(),
+                format!(
+                    "pk={:.4} gain={:.3} on={} level={:.3} out={:.3}",
+                    app.raw_peak,
+                    gain,
+                    app.boost_on,
+                    app.level,
+                    app.raw_peak * gain
+                    ),
+                );
+            }
+            if let Some(at) = self.boost_releasing.get(&app.pid).copied() {
+                if at.elapsed() < RELEASE_TIMEOUT {
+                    continue;
+                }
+                // 接管线程的回报丢了。放行比永久卡住强：再晚也就多一次的
+                // 音量写，比「这个应用永远调不动」好。
+                log::warn!("接管退出没收尾（pid {}），超时强制放行", app.pid);
+                self.boost_releasing.remove(&app.pid);
+            }
+
+            // 接管一旦建立就一直跑到「均衡被关 / 静音 / 手动拖滑条 / 流失败」为止。
+            //
+            // 以前是「增益掉回 1.02 以下就退出」，结果素材刚好在目标附近时，
+            // 增益在 1.0~1.04 之间来回摆，流就建了拆、拆了建：每一轮都要压音量、
+            // 还音量、settle，听感是一连串的音量跳和几十毫秒的空洞 ——
+            // 用户说的「调着调着就不行了」有一半是这个。
+            // 而且衰减（增益 < 1）也能由流做，会话保持 2% 就行，没必要退出来。
+            if app.boost_on {
+                app.level = 1.0;
+                app.boost_gain = gain.max(0.02);
+                continue;
+            }
+
+            // 越过 1.02：会话满格，多出来的交给接管流。
+            // 界面上的音量照旧按 1.0 显示：用户设的是「满」，多出来的是增益。
+            if gain >= crate::config::LoudnessConfig::BOOST_ENGAGE {
+                app.level = 1.0;
+                app.boost_on = true;
+                app.boost_gain = gain;
+                continue;
+            }
+
+            // 1.0 上下这点（1.0–1.02，0.17dB）不值得开接管流，直接按 1.0 走。
+            app.boost_gain = 1.0;
+            let target = gain.min(1.0);
+            // 差得太小就别写了：每 15ms 一次 COM 写入，几百个会话会白白烧 CPU，
+            // USB / 蓝牙端点上还会让设备一直有事做。
+            if (target - app.level).abs() < 0.0005 {
+                continue;
+            }
+            let mut applied = false;
+            for volume in &app.volumes {
+                if unsafe { volume.SetMasterVolume(target, &context) }.is_ok() {
+                    applied = true;
+                }
+            }
+            if applied {
+                app.level = target;
+            }
+        }
+        for pid in drops {
+            self.boost_releasing.insert(pid, Instant::now());
+        }
+        // 只在状态变化时落盘（15ms 一拍全程写会把文件刷爆）。
+        if tracing {
+            for (key, line) in &trace_now {
+                if self.trace_state.get(key) != Some(line) {
+                    crate::platform::hotkey::trace(&format!("agc {} {}", short_key(key), line));
+                    self.trace_state.insert(key.clone(), line.clone());
+                }
+            }
+        }
     }
 
     fn current_flow(&self) -> EDataFlow {
@@ -934,6 +1584,31 @@ impl Worker {
 
         // 一台启用的设备都没有：没有会话可扫。
         let mut apps: Vec<AppEntry> = Vec::with_capacity(ids.len() * 4);
+        // 响应均衡的累积器要跨扫描活着。
+        //
+        // 这个函数每次都会把 `AppEntry` 全部重造（面板开着时 400ms 一次），
+        // 而平均窗口是 3 秒 —— 跟着条目一起重造的话永远攒不满一块，均衡等于不生效。
+        // 所以先按 key 把上一轮的累积器搬出来，造新条目时再塞回去；
+        // 应用真的退出了，那一份没人认领，随 `carried` 一起丢掉。
+        let mut carried: HashMap<String, Steady> = self
+            .apps
+            .iter_mut()
+            .map(|app| (app.key.clone(), std::mem::take(&mut app.steady)))
+            .collect();
+        // 接管增益同样要跨扫描搬过去：否则 400ms 重造一次会把增益打回 1.0，
+        // 接管流跟着停掉再建一次，面板开着时听感会一顿一顿的。
+        let mut carried_boost: HashMap<String, (bool, f32)> = self
+            .apps
+            .iter()
+            .map(|app| (app.key.clone(), (app.boost_on, app.boost_gain)))
+            .collect();
+        // 接管端点也是：没在播放的那几轮扫描读不到「活会话」，不搬过去的话
+        // 会退回一台瞎猜的设备，接管流白重开一次（声音跳台）。
+        let mut carried_device: HashMap<String, Option<String>> = self
+            .apps
+            .iter()
+            .map(|app| (app.key.clone(), app.boost_device.clone()))
+            .collect();
         // 分组键 → 在 apps 里的下标。同一 exe 的多条会话合并成一行。
         let mut groups: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         // pid → 进程还在不在。同一个进程常常有好几条会话（Chromium 系），
@@ -1026,6 +1701,9 @@ impl Worker {
                     if !entry.session_devices.iter().any(|id| id == device_id) {
                         entry.session_devices.push(device_id.to_string());
                     }
+                    if state == 1 {
+                        entry.boost_device = Some(device_id.to_string());
+                    }
                     // 组内只要有一条会话在发声，整行就算作播放中。
                     if state == 1 {
                         entry.state = 1;
@@ -1038,6 +1716,20 @@ impl Worker {
                     .map(|value| value.as_bool())
                     .unwrap_or(false);
 
+                // 上一轮的 AGC 状态（应用没变就接着用，别从零开始）。
+                let steady = carried.remove(&group_key).unwrap_or_default();
+                // 取在 `key` 被移走之前：同一条会话的接管增益也要接着用。
+                let (boost_on, boost_gain) = carried_boost.remove(&group_key).unwrap_or((false, 1.0));
+                // 接管流接哪台端点：正在这条设备上出声就认它，静着的应用沿用上一轮记下的。
+                let boost_device = if state == 1 {
+                    Some(device_id.to_string())
+                } else {
+                    carried_device.remove(&group_key).flatten()
+                };
+                // 接管期间这条会话被我们按在 2%：那个 2% 不是用户的音量，
+                // 读回来会把 `app.level` 带成 0.02（接管一结束应用就哑了）。
+                let level = if boost_on { 1.0 } else { level };
+
                 groups.insert(group_key.clone(), apps.len());
                 apps.push(AppEntry {
                     key: group_key,
@@ -1049,10 +1741,15 @@ impl Worker {
                     volumes: vec![volume],
                     meters: meter.into_iter().collect(),
                     session_devices: vec![device_id.to_string()],
+                    boost_device,
                     level,
                     muted,
                     peak: 0.0,
+                    raw_peak: 0.0,
                     state,
+                    steady,
+                    boost_on,
+                    boost_gain,
                 });
             }
         }
@@ -1072,6 +1769,19 @@ impl Worker {
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
 
+        if std::env::var_os("BOLUME_TRACE").is_some() {
+            let held: Vec<String> = self
+                .apps
+                .iter()
+                .filter(|app| app.boost_on)
+                .map(|app| format!("{}(pid {})", short_key(&app.key), app.pid))
+                .collect();
+            crate::platform::hotkey::trace(&format!(
+                "rescan n={} boost_on=[{}]",
+                self.apps.len(),
+                held.join(", ")
+            ));
+        }
         self.apps = apps;
         // 已经不在场的 pid 从解析缓存里删掉：一是缓存会一直长，二是 pid 会被系统
         // 复用给新进程 —— 留着旧的，新进程一上来就顶着上一个应用的名字和图标。
@@ -1187,9 +1897,13 @@ impl Worker {
         self.mute_guard = guards;
 
         for app in &mut self.apps {
-            if let Some(volume) = app.volumes.first() {
-                if let Ok(level) = unsafe { volume.GetMasterVolume() } {
-                    app.level = level;
+            // 接管期间会话被接管线程按在 [`boost::ATTEN`]：那不是用户的音量，
+            // 读回来会让面板显示 2%，接管结束时还会把用户音量带跑。
+            if !app.boost_on {
+                if let Some(volume) = app.volumes.first() {
+                    if let Ok(level) = unsafe { volume.GetMasterVolume() } {
+                        app.level = level;
+                    }
                 }
             }
             // 组内任一静音就算静音；音量取第一条会话的值（写入时是整组一起写）。
@@ -1198,12 +1912,13 @@ impl Worker {
                     .map(|v| v.as_bool())
                     .unwrap_or(false)
             });
-            app.peak = app
+            let peak = app
                 .meters
                 .iter()
                 .filter_map(|meter| unsafe { meter.GetPeakValue() }.ok())
-                .fold(0.0f32, f32::max)
-                .clamp(0.0, 1.0);
+                .fold(0.0f32, f32::max);
+            app.raw_peak = peak;
+            app.peak = peak.clamp(0.0, 1.0);
         }
     }
 
@@ -1265,8 +1980,10 @@ impl Worker {
                 name: app.name.clone(),
                 process_path: app.process_path.clone(),
                 icon_path: app.icon_path.clone(),
-                volume: app.level,
-                muted: app.muted,
+                // 接管期间会话音量被按在 1.0、而且是被**我们**静音的：
+                // 对用户来说它就是满音量在响，别显示成静音。
+                volume: if app.boost_on { 1.0 } else { app.level },
+                muted: !app.boost_on && app.muted,
                 peak: app.peak,
                 is_system: app.is_system,
                 state: app.state,
@@ -1389,5 +2106,89 @@ mod tests {
         );
 
         let _ = unsafe { enumerator.UnregisterEndpointNotificationCallback(&notify) };
+    }
+
+    /// 喂一块（26ms）的峰值。
+    fn feed(steady: &mut Steady, peak: f32, config: &crate::config::LoudnessConfig, blocks: u32) {
+        let block = crate::config::LoudnessConfig::BLOCK_MS as f32;
+        for _ in 0..blocks {
+            steady.push(peak, config, block);
+        }
+    }
+
+    /// 一段很轻的素材把增益抬高，然后进入完全静音：增益必须停住。
+    ///
+    /// 以前静音块也走「不到目标 → 投票加一」，增益会一路爬到上限；
+    /// 下一句一开口就是几倍爆音 —— 用户报的「一开始播放突然很大声、
+    /// 音质很差地响几百毫秒」。
+    #[test]
+    fn steady_holds_gain_through_silence() {
+        let config = crate::config::LoudnessConfig::default();
+        let mut steady = Steady::default();
+        feed(&mut steady, 0.02, &config, 1000);
+        let lifted = steady.gain;
+        assert!(lifted > 1.5, "很轻的素材应该把增益抬起来，实际 {lifted}");
+
+        feed(&mut steady, 0.0, &config, 1000);
+        assert!(
+            (steady.gain - lifted).abs() < 1e-6,
+            "静音块不该动增益：{lifted} -> {}",
+            steady.gain
+        );
+    }
+
+    /// 增益很高时突然来了强信号：**一块之内**就要压到防削顶线以下。
+    ///
+    /// 只按「减级别格」走的话要好几秒（smoothness 8 时从 4 倍降到 1 倍
+    /// 要 96 块 ≈ 2.5 秒），这 2.5 秒全是削顶失真。
+    #[test]
+    fn steady_kills_clipping_within_one_block() {
+        use crate::config::LoudnessConfig as C;
+        let config = crate::config::LoudnessConfig::default();
+        let mut steady = Steady::default();
+        feed(&mut steady, 0.02, &config, 1000);
+        assert!(steady.gain > 2.0, "先要把增益抬到 2 倍以上");
+
+        let gain = steady.push(0.9, &config, C::BLOCK_MS as f32);
+        assert!(
+            gain * 0.9 <= C::CLIP_LEVEL + 1e-4,
+            "一块之后仍超削顶线：gain {gain} × 0.9 = {}",
+            gain * 0.9
+        );
+    }
+
+    /// 削顶之后要落到**目标**上，而不是停在削顶线下面那一档。
+    ///
+    /// 只压到「不削顶」的话，输出会一直贴着 0.91（比目标 0.75 响 1.7dB），
+    /// 而靠投票一格一格降要一分多钟 —— 听感就是「突然变大声之后一直很大声」。
+    #[test]
+    fn steady_settles_on_target_after_clipping() {
+        use crate::config::LoudnessConfig as C;
+        let config = crate::config::LoudnessConfig::default();
+        let mut steady = Steady::default();
+        feed(&mut steady, 0.02, &config, 1000);
+        assert!(steady.gain > 2.0);
+
+        let gain = steady.push(0.9, &config, C::BLOCK_MS as f32);
+        assert!(
+            (gain * 0.9 - config.target()).abs() < 0.01,
+            "一块之后应该落在目标 {}，实际 {}",
+            config.target(),
+            gain * 0.9
+        );
+    }
+
+    /// 一直很轻的素材也不能把增益堆到上限之外（否则底噪会被一起抬成巨响）。
+    #[test]
+    fn steady_respects_max_gain() {
+        use crate::config::LoudnessConfig as C;
+        let config = crate::config::LoudnessConfig::default();
+        let mut steady = Steady::default();
+        feed(&mut steady, 0.001, &config, 4000);
+        assert!(
+            steady.gain <= C::MAX_GAIN + 1e-6,
+            "增益超过上限：{}",
+            steady.gain
+        );
     }
 }

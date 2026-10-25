@@ -386,6 +386,10 @@ struct AppMenu {
     name: String,
     /// 当前是否已被折叠（决定菜单显示「折叠」还是「展开」）。
     hidden: bool,
+    /// 这个应用当前是否在做响度均衡（决定菜单项前的勾）。
+    loudness: bool,
+    /// 系统声音：不给开响度均衡（音频线程那边也会跳过它）。
+    is_system: bool,
     /// 这个应用被单独指定到的设备；`None` = 跟随系统默认设备。
     device_id: Option<String>,
     /// 应用进程 id（改路由按 pid 下发）。
@@ -701,9 +705,11 @@ impl Flyout {
     ///
     /// 用来把菜单夹在面板里 —— 设备多的机器上它会比面板还高，
     /// 只能保证菜单顶边不越界（gpui 的浮层不做滚动）。
-    fn app_menu_height(&self, movable: bool) -> f32 {
+    fn app_menu_height(&self, movable: bool, loudness: bool) -> f32 {
         // 菜单行高是固定值（不跟面板字号缩放），这里照着常量算就行。
-        let base = MENU_PAD * 2.0 + MENU_ITEM * 2.0;
+        // 普通应用三行（重命名 / 折叠此应用 / 响度均衡），系统声音只有前两行。
+        let rows = if loudness { 3.0 } else { 2.0 };
+        let base = MENU_PAD * 2.0 + MENU_ITEM * rows;
         if !movable {
             return base;
         }
@@ -724,6 +730,35 @@ impl Flyout {
                 config.hidden_apps.push(key.clone());
             }
         });
+    }
+
+    /// 打开 / 关掉这个应用的响度均衡。
+    ///
+    /// 设成和全局一样时配置里不会留条目（`set_app_loudness` 自己会清），
+    /// 这样以后改全局开关，没单独设过的应用都会跟着走。
+    fn set_app_loudness(&mut self, key: &str, enabled: bool) {
+        let key = key.to_string();
+        // 先落配置，再把结果推给音频线程 —— 推的时候要读配置，两段别套在一起。
+        let _ = self
+            .config
+            .borrow_mut()
+            .update(|config| {
+                config.set_app_loudness(&key, Some(enabled));
+            });
+        let config = self.config.borrow();
+        crate::gui::sync_loudness(&self.engine, config.get());
+    }
+
+    /// 面板页脚那个按钮：一把开关全局响度均衡。
+    ///
+    /// 和设置页「全局响度均衡」写的是同一个字段（`config.loudness.enabled`），
+    /// 两边永远同一份状态；落盘之后再把新的开关推给音频线程。
+    fn toggle_global_loudness(&mut self, cx: &mut Context<Self>) {
+        let _ = self.config.borrow_mut().update(|config| {
+            config.loudness.enabled = !config.loudness.enabled;
+        });
+        crate::gui::refresh_loudness(cx);
+        cx.notify();
     }
 
     // ---------- 就地改名（右键 →「重命名」） ----------
@@ -1642,8 +1677,11 @@ impl Flyout {
                 .child(icon("music", icon_side * 0.85, theme::text_tertiary()))
                 .into_any_element(),
         };
-        // 被单独指定过播放设备的应用，图标右上角打一个小点。
-        let icon_element = with_route_badge(icon_element, app.is_routed());
+        // 被单独指定过播放设备的应用打右上角的点；被**单独开了**响度均衡的，
+        // 右下角再打一个电平柱角标（全局开着不算，那样每个图标都会有）。
+        let loud_badge = !app.is_system
+            && self.config.borrow().get().app_loudness_override(&app.key) == Some(true);
+        let icon_element = with_app_badges(icon_element, app.is_routed(), loud_badge);
 
         let mute = self.mute_button(format!("app-mute-{key}"), muted, 26.0, move |_, _| {
             let want = toggle_muted(&mute_slot, &mute_key, muted);
@@ -1742,10 +1780,12 @@ impl Flyout {
         let menu_slot = self.menu.clone();
         let key_for_menu = key.clone();
         let hidden_for_menu = hidden;
+        let loudness_for_menu = self.cfg().loudness_for(&key);
+        let system_for_menu = app.is_system;
         let device_for_menu = app.device_id.clone();
         let pid_for_menu = app.pid;
         let movable_for_menu = self.is_movable(app);
-        let menu_height = self.app_menu_height(movable_for_menu);
+        let menu_height = self.app_menu_height(movable_for_menu, !app.is_system);
         let open_menu = cx.listener(
             move |this: &mut Self, event: &MouseDownEvent, window: &mut Window, cx| {
                 // 用真实窗口尺寸而不是 viewport_size：面板淡出时 viewport 报得比窗口高，
@@ -1771,6 +1811,8 @@ impl Flyout {
                     key: key_for_menu.clone(),
                     name: name.clone(),
                     hidden: hidden_for_menu,
+                    loudness: loudness_for_menu,
+                    is_system: system_for_menu,
                     device_id: device_for_menu.clone(),
                     pid: pid_for_menu,
                     movable: movable_for_menu,
@@ -2412,7 +2454,9 @@ impl Flyout {
                 .into_any_element(),
             None => icon("music", icon_side, theme::text_tertiary()).into_any_element(),
         };
-        let icon_element = with_route_badge(icon_element, app.is_routed());
+        let loud_badge = !app.is_system
+            && self.config.borrow().get().app_loudness_override(&app.key) == Some(true);
+        let icon_element = with_app_badges(icon_element, app.is_routed(), loud_badge);
         // 竖排默认不写名字，全名只能靠悬停提示看 —— 所以这里一定要给。
         let tip_name = if app.is_system {
             lang.pick("系统声音", "System sounds").to_string()
@@ -2452,11 +2496,13 @@ impl Flyout {
         let menu_slot = self.menu.clone();
         let key_for_menu = key.clone();
         let hidden = self.is_hidden(&key);
+        let loudness_for_menu = self.cfg().loudness_for(&key);
+        let system_for_menu = app.is_system;
         let name_for_menu = name.clone().unwrap_or_else(|| app.name.clone());
         let device_for_menu = app.device_id.clone();
         let pid_for_menu = app.pid;
         let movable_for_menu = self.is_movable(app);
-        let menu_height = self.app_menu_height(movable_for_menu);
+        let menu_height = self.app_menu_height(movable_for_menu, !app.is_system);
         let open_menu = cx.listener(
             move |this: &mut Self, event: &MouseDownEvent, window: &mut Window, cx| {
                 cx.stop_propagation();
@@ -2483,6 +2529,8 @@ impl Flyout {
                     key: key_for_menu.clone(),
                     name: name_for_menu.clone(),
                     hidden,
+                    loudness: loudness_for_menu,
+                    is_system: system_for_menu,
                     device_id: device_for_menu.clone(),
                     pid: pid_for_menu,
                     movable: movable_for_menu,
@@ -2668,6 +2716,27 @@ impl Flyout {
                 start_rename,
             ))
             .child(self.menu_row("app-menu-hide", label, None, false, activate));
+
+        // 「响度均衡」：勾上就把这个应用的音量自动拉齐，不勾就按用户自己拖的来。
+        // 系统声音没有这一项（音频线程那边也会跳过它）。
+        if !menu.is_system {
+            let loudness_key = menu.key.clone();
+            let loudness_on = menu.loudness;
+            let toggle_loudness = cx.listener(move |this: &mut Self, _, _, cx| {
+                this.set_app_loudness(&loudness_key, !loudness_on);
+                // 点完就收：勾掉的时候音量会当场还原，菜单留着会挡住滑条
+                // 和读数，看不见它回到了哪儿。
+                *this.menu.borrow_mut() = None;
+                cx.notify();
+            });
+            items = items.child(self.menu_row(
+                "app-menu-loudness",
+                lang.pick("响度均衡", "Loudness equalization"),
+                None,
+                menu.loudness,
+                toggle_loudness,
+            ));
+        }
 
         if menu.movable {
             items = items
@@ -2985,32 +3054,69 @@ impl Flyout {
         button.into_any_element()
     }
 
+    /// 底部带文字的按钮（图标 + 文字）：混音器和响度均衡共用一套尺寸。
+    ///
+    /// `active` 时图标与文字都走强调色、垫一层淡底 —— 和置顶那个纯图标按钮
+    /// 是同一套「亮着」的表示法。
+    fn footer_label_button(
+        &self,
+        id: &'static str,
+        name: &'static str,
+        label: &'static str,
+        active: bool,
+        onclick: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let color = if active {
+            theme::accent()
+        } else {
+            theme::text_tertiary()
+        };
+        let mut button = div()
+            .id(id)
+            .h(px(22.))
+            .px(px(8.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(onclick)
+            .child(icon(name, 13.0, color))
+            .child(div().text_size(self.fs(11.)).text_color(color).child(label));
+        if active {
+            button = button.bg(theme::accent_soft());
+        }
+        button.into_any_element()
+    }
+
     fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.cfg().language;
-        // 从左到右：混音器 · 设置 · 置顶。
+        let loud_on = self.config.borrow().get().loudness.enabled;
+        // 从左到右：响度均衡 · 混音器 · 设置 · 置顶。
+        //
+        // 响度均衡这个按钮和设置页的「全局响度均衡」是同一个字段，改哪边都一样；
+        // 开着的时候图标和文字走强调色 + 淡底（和置顶按钮同一套「亮着」的表示）。
         let mut actions = div().flex().items_center().gap(px(2.));
-        actions = actions.child(
-            div()
-                .id("open-mixer")
-                .h(px(22.))
-                .px(px(8.))
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .rounded(px(theme::RADIUS_SMALL))
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::surface_hover()))
-                .on_click(|_, _, _| {
-                    let _ = std::process::Command::new("sndvol.exe").spawn();
-                })
-                .child(icon("apps", 13.0, theme::text_tertiary()))
-                .child(
-                    div()
-                        .text_size(self.fs(11.))
-                        .text_color(theme::text_tertiary())
-                        .child(lang.pick("混音器", "Mixer")),
-                ),
-        );
+        actions = actions.child(self.footer_label_button(
+            "toggle-loudness",
+            "levels",
+            lang.pick("响度均衡", "Loudness"),
+            loud_on,
+            cx.listener(|this: &mut Self, _, _window, cx| {
+                this.toggle_global_loudness(cx);
+            }),
+        ));
+        actions = actions.child(self.footer_label_button(
+            "open-mixer",
+            "adjustments",
+            lang.pick("混音器", "Mixer"),
+            false,
+            |_, _, _| {
+                let _ = std::process::Command::new("sndvol.exe").spawn();
+            },
+        ));
         if let Some(callback) = self.on_open_settings.clone() {
             actions = actions.child(Self::footer_icon_button(
                 "open-settings",
@@ -3933,20 +4039,22 @@ fn volume_readout(display: f32, logarithmic: bool, min_db: f32) -> String {
 ///
 /// 从**第一个**左括号切：型号描述总是从那个括号开始的，里面再套括号（Realtek(R)）
 /// 都属于第二行。全角括号一并认。
-/// 给应用图标右上角加一个小圆点：这个应用被单独指定了播放设备。
+/// 给应用图标加角标：右上角 = 单独指定了播放设备，右下角 = 单独开了响度均衡。
 ///
-/// EarTrumpet 没有这个标记（它只在右键菜单里打勾），这里补一个 ——
-/// 面板上一眼就能看出「哪几个应用没走默认设备」。gpui 的父盒子不裁子元素，
-/// 圆点正好跨在图标边线上，看着像个角标。
-fn with_route_badge(element: AnyElement, routed: bool) -> AnyElement {
-    if !routed {
+/// EarTrumpet 没有这两个标记（它只在右键菜单里打勾），这里补上 ——
+/// 面板上一眼就能看出「哪几个应用没走默认设备」「哪几个被单独接管了响度」。
+/// gpui 的父盒子不裁子元素，角标正好跨在图标边线上。
+///
+/// 两个角标刻意在三个维度上都错开：位置（右上 / 右下）、形状（实心圆点 /
+/// 三根电平柱）、颜色（强调色 / 主文字色）。同一个应用两样都开时，
+/// 两个角标各站一边，不会叠在一起变成一坨。
+fn with_app_badges(element: AnyElement, routed: bool, loudness: bool) -> AnyElement {
+    if !routed && !loudness {
         return element;
     }
-    div()
-        .relative()
-        .flex_none()
-        .child(element)
-        .child(
+    let mut wrapper = div().relative().flex_none().child(element);
+    if routed {
+        wrapper = wrapper.child(
             div()
                 .absolute()
                 .right(px(-1.))
@@ -3956,7 +4064,39 @@ fn with_route_badge(element: AnyElement, routed: bool) -> AnyElement {
                 .bg(theme::accent())
                 .border_1()
                 .border_color(theme::surface_elevated()),
-        )
+        );
+    }
+    if loudness {
+        wrapper = wrapper.child(
+            div()
+                .absolute()
+                .right(px(-2.))
+                .bottom(px(-2.))
+                .flex()
+                .items_end()
+                .gap(px(1.))
+                .px(px(1.))
+                .py(px(1.))
+                .rounded(px(2.))
+                .bg(theme::surface_elevated())
+                .border_1()
+                .border_color(theme::border())
+                .child(loudness_bar(3.0))
+                .child(loudness_bar(5.0))
+                .child(loudness_bar(2.0)),
+        );
+    }
+    wrapper.into_any_element()
+}
+
+/// 响度均衡角标里的一根柱子：用主文字色，深色 / 浅色主题下都看得见，
+/// 也不会跟强调色的「设备」圆点撞色。
+fn loudness_bar(height: f32) -> AnyElement {
+    div()
+        .w(px(1.5))
+        .h(px(height))
+        .rounded_full()
+        .bg(theme::text_primary())
         .into_any_element()
 }
 

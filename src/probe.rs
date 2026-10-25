@@ -437,7 +437,7 @@ fn render(snapshot: &Snapshot) -> String {
             .collect::<Vec<_>>()
             .join(" + ");
         out.push_str(&format!(
-            "  {:<28} pid={:<6} {}{} peak={:.3} state={} on={} icon={}\n",
+            "  {:<28} pid={:<6} {}{} peak={:.3} state={} on={} key={} icon={}\n",
             truncate(&app.name, 28),
             app.pid,
             format!(
@@ -449,6 +449,7 @@ fn render(snapshot: &Snapshot) -> String {
             app.peak,
             app.state,
             if on.is_empty() { "-" } else { &on },
+            app.key,
             app.icon_path
                 .as_ref()
                 .map(|path| path.display().to_string())

@@ -62,6 +62,8 @@ icon_assets!(
     "prev",
     "stop",
     "search",
+    "adjustments",
+    "levels",
 );
 
 pub struct Assets;

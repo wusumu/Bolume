@@ -206,6 +206,8 @@ pub fn run(
     // 最大音量限制交给音频线程去做「最后一道闸」：滑条、滚轮、快捷键、
     // 硬件音量键改上去的音量都会在这里被按回上限。
     sync_volume_cap(&engine, &cfg0.volume_cap);
+    // 响度均衡：参数和单应用开关都在音频线程里生效。
+    sync_loudness(&engine, &cfg0);
 
     // 主题：全部内置，配置里存的是主题名。
     // 名字对不上（改过名的老配置）就退回默认主题，并把配置改回真实生效的那个。
@@ -526,8 +528,25 @@ pub fn run(
             cx.spawn(async move |cx| {
                 let mut last_device_key = String::new();
                 while let Ok(event) = events.recv().await {
-                    let AudioEvent::Snapshot(snapshot) = event else {
-                        continue;
+                    let snapshot = match event {
+                        AudioEvent::Snapshot(snapshot) => snapshot,
+                        AudioEvent::LoudnessReleased(key) => {
+                            // 用户自己拖了音量：把这个应用的响度均衡关掉并落配置。
+                            // 关掉之后音频线程那边会收到新的 SetLoudness，滑条就能自由拖了。
+                            let (engine, config, _, _) =
+                                cx.update(|cx| cx.global::<AppState>().clone_handles());
+                            let mut changed = false;
+                            let _ = config.borrow_mut().update(|config| {
+                                changed = config.set_app_loudness(&key, Some(false));
+                            });
+                            if changed {
+                                let config = config.borrow();
+                                sync_loudness(&engine, config.get());
+                            }
+                            let _ = cx.update(|cx| cx.refresh_windows());
+                            continue;
+                        }
+                        AudioEvent::Error(_) => continue,
                     };
                     let (engine, config, tray, shared) =
                         cx.update(|cx| cx.global::<AppState>().clone_handles());
@@ -1996,6 +2015,9 @@ fn quit_now(cx: &mut App) -> ! {
     if let Some(state) = cx.try_global::<AppState>() {
         state.tray.remove();
     }
+    // 接管期间被我们压到 2% 的应用，要在这里还回去：`process::exit` 不跑析构，
+    // 接管线程的 `close()` 根本没机会执行。
+    crate::audio::boost::release_all();
     std::process::exit(0)
 }
 
@@ -2462,6 +2484,25 @@ pub fn refresh_volume_cap(cx: &mut App) {
     let state = cx.global::<AppState>();
     let cap = state.config.borrow().get().volume_cap.clone();
     sync_volume_cap(&state.engine, &cap);
+}
+
+/// 把响度均衡的参数和单应用开关推给音频线程。
+pub fn sync_loudness(engine: &AudioEngine, config: &crate::config::Config) {
+    engine.send(AudioCommand::SetLoudness {
+        config: config.loudness,
+        overrides: config
+            .app_loudness
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.enabled))
+            .collect(),
+    });
+}
+
+/// 响度均衡改了之后调用（设置页的参数 / 面板右键的单应用开关都走这里）。
+pub fn refresh_loudness(cx: &mut App) {
+    let state = cx.global::<AppState>();
+    let config = state.config.borrow();
+    sync_loudness(&state.engine, config.get());
 }
 
 /// 某台设备的音量上限在滑条刻度上的位置（0..1，对数模式下是显示位置）。
