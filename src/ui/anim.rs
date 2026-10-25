@@ -70,9 +70,13 @@ pub enum EntranceMotion {
 /// - 音量 OSD：起始位移 = 卡片高度 + 10，位移时间常数 ≈70ms，
 ///   同时淡入（延迟 20ms 起、250ms 线性到 1）；消失是「滑回去 + 约 140ms 淡出」。
 ///
-/// **Windows 10**：那一代 shell 的弹出面板用的是 XAML 的 `PopupThemeTransition`
-/// （默认 `FromVerticalOffset = 0`），也就是**纯淡入、不位移**，时长取 XAML 的
-/// 167ms 标准档。本机是 Win11，这一档没有逐帧实测，只在注释里留依据。
+/// **Windows 10**：这一档以前是照 XAML 的 `PopupThemeTransition`（`FromVerticalOffset
+/// = 0`）推断成「纯淡入、不位移」的，注释里也写明了没实测过。实测反馈证明这条推断
+/// 会出事：收起只靠位移，`slide = 0` 时整段动画什么都不做 —— 面板弹出来就再也收不
+/// 回去（失焦、再点一次都无效）。所以**面板**不再分世代，两代都按「从任务栏背后滑上
+/// 来」走：面板是自绘的，那颗 `Shell_TrayWnd` 两代都在，z 序技巧一样成立。
+/// 屏幕提示（`osd`）还留着 Win10 的纯淡入分支 —— 它自己的退场按 `exit()` 算 alpha，
+/// 不靠 `slide`，不会卡在那儿。
 pub struct SystemMotion {
     /// 起始位移（逻辑像素）。0 = 不位移，只有淡入。
     pub slide: f32,
@@ -93,23 +97,16 @@ const PANEL_BASE_MS: f32 = 250.0;
 
 impl SystemMotion {
     /// 面板（音量面板 / 显示器窗口）那一套。
+    ///
+    /// 不分系统世代：Win10 那套「纯淡入」既没实测依据，又会让收起变成空操作
+    /// （见 `SystemMotion` 的说明）。
     pub fn panel(slide: f32) -> Self {
-        if crate::platform::winver::is_windows_11() {
-            Self {
-                slide,
-                tau_ms: 48.0,
-                fade_delay_ms: 0.0,
-                fade_ms: 0.0,
-                exit_ms: 145.0,
-            }
-        } else {
-            Self {
-                slide: 0.0,
-                tau_ms: 48.0,
-                fade_delay_ms: 0.0,
-                fade_ms: WIN10_FADE_MS,
-                exit_ms: WIN10_FADE_MS,
-            }
+        Self {
+            slide,
+            tau_ms: 48.0,
+            fade_delay_ms: 0.0,
+            fade_ms: 0.0,
+            exit_ms: 145.0,
         }
     }
 
@@ -312,6 +309,22 @@ mod tests {
         let a = 1.0 - base.enter(10.0).0 / 370.0;
         let b = 1.0 - fast.enter(5.0).0 / 370.0;
         assert!((a - b).abs() < 0.02, "曲线形状不该被速度改变（{a} vs {b}）");
+    }
+
+    #[test]
+    fn panel_always_slides_out_on_exit() {
+        // 面板的收起**只靠位移**（这一档的 `fade_ms` 是 0）。以前 Win10 走的是
+        // 「纯淡入、slide = 0」那一档，于是收起整段动画什么也不做 —— 面板弹出来
+        // 就再也收不回去（失焦、再按一次都没反应）。这条测试守着这个前提。
+        let m = SystemMotion::panel(370.0);
+        assert!(
+            m.slide > 0.5,
+            "面板这一档必须有位移，否则收起会变成空操作"
+        );
+        assert!(m.exit_ms > 0.0, "收起时长不能是 0");
+        let (offset, alpha) = m.exit(m.exit_ms);
+        assert!(offset > 300.0, "走完应该滑到屏幕外（{offset}）");
+        assert!(alpha <= 0.01, "自己算的淡出也得收干净（{alpha}）");
     }
 
     #[test]

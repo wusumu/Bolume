@@ -3238,7 +3238,10 @@ impl Flyout {
                     end: if slides { end } else { 0.0 },
                     tau_ms: m.tau_ms,
                     fade_delay_ms: m.fade_delay_ms,
-                    fade_ms: if entering { m.fade_ms } else { 0.0 },
+                    // 出场也带上这一档的淡出：面板这一档的 `fade_ms` 是 0（纯靠滑出去），
+                    // 但「纯淡出档」如果把 fade 抹成 0，整段收起就什么也不做 ——
+                    // 窗口留在屏幕里、`visible` 却已是 false，之后怎么点都收不起来。
+                    fade_ms: m.fade_ms,
                     total_ms: if entering {
                         m.enter_total_ms()
                     } else {

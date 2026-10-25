@@ -51,8 +51,19 @@ fn version() -> (u32, u32) {
 /// 是不是 Windows 11（build 22000 起）。
 ///
 /// 注意 `ProductName` 一直写着 "Windows 10"，判断世代只能看 build 号。
+///
+/// `BOLUME_FORCE_WIN10=1` 可以把这一代强行判成 Win10：本机是 Win11，但「跟随系统」
+/// 那条分支里有一部分只对 Win10 生效，不这样没法在开发机上复现用户的报告。
 pub fn is_windows_11() -> bool {
+    if forced_windows_10() {
+        return false;
+    }
     build_number() >= 22000
+}
+
+/// 调试开关：环境里有 `BOLUME_FORCE_WIN10` 就按 Win10 走。
+fn forced_windows_10() -> bool {
+    std::env::var_os("BOLUME_FORCE_WIN10").is_some()
 }
 
 /// build 号（给设置页 / trace 里写一行用）。
@@ -62,13 +73,16 @@ pub fn build_number() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_number, is_windows_11};
+    use super::{build_number, forced_windows_10, is_windows_11};
 
     #[test]
     fn build_and_generation_agree() {
         let build = build_number();
         if build == 0 {
             return; // 非 Windows：不判
+        }
+        if forced_windows_10() {
+            return; // 调试开关压着世代，这一条前提不成立
         }
         assert_eq!(is_windows_11(), build >= 22000);
     }
