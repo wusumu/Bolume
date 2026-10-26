@@ -1,3 +1,4 @@
+pub mod app_menu;
 pub mod brightness;
 pub mod flyout;
 pub mod osd;
@@ -6,6 +7,7 @@ pub mod platform;
 pub mod settings;
 pub mod tray_menu;
 
+pub use app_menu::AppMenu;
 pub use brightness::Brightness;
 pub use flyout::Flyout;
 pub use osd::Osd;

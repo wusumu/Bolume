@@ -148,13 +148,34 @@ pub fn is_blocked_now() -> bool {
     list_blocked()
 }
 
-/// 调试用：把热键链路的关键节点追加写进环境变量 `BOLUME_TRACE` 指向的文件。
+/// 调试日志写到哪：环境变量 `BOLUME_TRACE` 指的路径；没有就看程序目录里
+/// 有没有 `trace.on` 这个哨兵文件，有就写同目录的 `trace.log`。
+///
+/// 哨兵是为「从别的程序里启动的实例」准备的（比如从 Directory Opus 里起）：
+/// 那种实例继承的是**启动它的那个程序**的环境块，改用户环境变量对它没用，
+/// 只有文件开关能生效。结果缓存一次 —— trace 在接管循环里是热路径。
+fn trace_path() -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        if let Some(path) = std::env::var_os("BOLUME_TRACE") {
+            return Some(std::path::PathBuf::from(path));
+        }
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        dir.join("trace.on")
+            .exists()
+            .then(|| dir.join("trace.log"))
+    })
+    .as_deref()
+}
+
+/// 调试用：把热键链路的关键节点追加写进调试日志（见 [`trace_path`]）。
 ///
 /// 媒体键走低级键盘钩子，出问题时「钩子没装上」和「键盘发的不是这个键码」
 /// 在界面上的表现完全一样（按了没反应），只能靠这条日志分开。
-/// 没设环境变量时整个函数就是一次 `var_os`，不影响钩子里的耗时。
+/// 没开调试时整个函数几乎零成本（一次查缓存）。
 pub fn trace(text: &str) {
-    let Some(path) = std::env::var_os("BOLUME_TRACE") else {
+    let Some(path) = trace_path() else {
         return;
     };
     let stamp = std::time::SystemTime::now()

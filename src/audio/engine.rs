@@ -1314,8 +1314,16 @@ impl Worker {
             }
 
             // 第一次接管这个应用：记下它此刻的音量，取消勾选时还原到这里。
+            //
+            // `app.level` 有可能是上一轮没还回去的 2%（进程被强杀 / 账本丢了）——
+            // 那不能当成用户的音量，否则一关均衡这个应用就哑了。按「满格」记。
             if !self.loudness_saved.contains_key(&app.key) {
-                self.loudness_saved.insert(app.key.clone(), app.level);
+                let saved = if app.level <= crate::audio::boost::ATTEN * 1.2 {
+                    1.0
+                } else {
+                    app.level
+                };
+                self.loudness_saved.insert(app.key.clone(), saved);
             }
 
             // 用户自己按的静音：把接管收掉（不然接管流会把静音绕过去），
@@ -1378,6 +1386,15 @@ impl Worker {
             // 1.0 上下这点（1.0–1.02，0.17dB）不值得开接管流，直接按 1.0 走。
             app.boost_gain = 1.0;
             let target = gain.min(1.0);
+            // 会话还停在被接管的位置（[`ATTEN`]）时一律不碰。
+            //
+            // 这一格是**别的实例**的接管流压下去的（多开一个进程、调试探针、
+            // 上一个实例还没退干净）。照 AGC 的目标写回 1.0，原声立刻满幅回来，
+            // 而那条接管流还在放大放同一段音频 —— 两路一起响，就是「叠加 + 炸」。
+            // 要等接管结束由它自己还原（`close()`），这里只负责别去掀它。
+            if app.level <= crate::audio::boost::ATTEN * 1.2 {
+                continue;
+            }
             // 差得太小就别写了：每 15ms 一次 COM 写入，几百个会话会白白烧 CPU，
             // USB / 蓝牙端点上还会让设备一直有事做。
             if (target - app.level).abs() < 0.0005 {

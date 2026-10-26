@@ -17,9 +17,9 @@ use crate::{
     audio::{AudioCommand, AudioEngine, DeviceInfo, Snapshot},
     config::{
         ActivityEffect, AppBlockEntry, AppBlockKind, BrightnessPlacement, Config, ConfigStore,
-        DisplayNameMode, Hotkey, HotkeySlots, MAX_TOOLTIP_LINE_CHARS, MAX_TOOLTIP_LINES, OsdAnchor,
-        OsdAnimStyle, OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout, PopupAnimStyle,
-        TrayIconStyle, TrayMotion,
+        DisplayNameMode, FooterSide, Hotkey, HotkeySlots, MAX_TOOLTIP_LINE_CHARS, MAX_TOOLTIP_LINES,
+        OsdAnchor, OsdAnimStyle, OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout,
+        PopupAnimStyle, TrayIconStyle, TrayMotion,
     },
     display::DisplayInfo,
     i18n::Lang,
@@ -28,7 +28,9 @@ use crate::{
     ui::{
         DEVICE_ICON_CHOICES, Picker, ScrollDragState, Scrollbar,
         color::{hex_of, hsv_to_rgb, parse_rgb, push_hex, rgb_to_hsv},
-        device_icon_resolved, icon, theme,
+        device_icon_resolved,
+        footer_preview::FooterEdit,
+        icon, theme,
     },
     windows::osd::{OsdState, OsdTarget},
 };
@@ -223,6 +225,11 @@ pub struct Settings {
     scroll_drag: ScrollDragState,
     /// 正在编辑托盘提示的哪一份内容（正常 / 静音），以及文本和光标。
     tooltip_edit: Option<TooltipEditor>,
+    /// 页脚可视化编辑器的拖拽 / 悬停 / 量到的矩形。
+    ///
+    /// 放在实体上而不是每次重画时新建：改一次配置整棵就重建，状态跟着重建
+    /// 就等于「拖到一半东西没了」。
+    footer_preview: crate::ui::footer_preview::FooterPreviewState,
     /// 「启动时设置应用音量」名单里某一行的就地编辑：(第几行, 已输入的字符)。
     app_edit: Option<(usize, String)>,
     /// 托盘菜单编辑器弹层是否打开。
@@ -1487,30 +1494,14 @@ impl FontTarget {
     }
 }
 
-/// 「跟随系统」模式下的两档主题槽位：亮色用哪套、深色用哪套。
+/// 「跟随系统」模式下的两档槽位：系统亮色用哪一套底色 / 强调色、深色用哪一套。
 ///
-/// 两个槽位存的都是主题名，各自占一个配置字段 —— 切到不跟随系统时它们还留着，
+/// 两档各自占两个配置字段 —— 切到不跟随系统时它们还留着，
 /// 下次打开「跟随系统」还是原来配的那两套。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ThemeSlot {
     Light,
     Dark,
-}
-
-impl ThemeSlot {
-    fn name(self, config: &Config) -> &str {
-        match self {
-            Self::Light => &config.theme_light,
-            Self::Dark => &config.theme_dark,
-        }
-    }
-
-    fn set(self, config: &mut Config, value: &str) {
-        match self {
-            Self::Light => config.theme_light = value.to_string(),
-            Self::Dark => config.theme_dark = value.to_string(),
-        }
-    }
 }
 
 /// 自选颜色作用在哪一项上。
@@ -1535,8 +1526,8 @@ enum ColorTarget {
 }
 
 impl ColorTarget {
-    /// 是不是底色。底色不给「跟随主题」那个空心块：底色的「跟随」就是上面
-    /// 那排主题本身的样子，再摆一个空心块只是多占一格。
+    /// 是不是底色。底色不给「跟随系统」那个空心块：底色的「跟随」= 打底模板自己的
+    /// 底色，再摆一个空心块只是多占一格（点掉已选中的色块也能回到模板）。
     fn is_surface(self) -> bool {
         matches!(self, Self::Surface | Self::LightSurface | Self::DarkSurface)
     }
@@ -1622,7 +1613,7 @@ struct ColorWheel {
 }
 
 impl ColorWheel {
-    /// 按当前配置里的色号造一个：空串（跟随主题）就用那套主题的默认值当起点。
+    /// 按当前配置里的色号造一个：空串（跟随）就用当前模板那一项的色号当起点。
     fn new(target: ColorTarget, x: f32, y: f32, value: &str) -> Self {
         let fallback = if target.is_surface() {
             (0x15, 0x15, 0x19)
@@ -1765,6 +1756,7 @@ impl Settings {
             picker_scroll: gpui::ScrollHandle::new(),
             scroll_drag: ScrollDragState::new(),
             tooltip_edit: None,
+            footer_preview: crate::ui::footer_preview::FooterPreviewState::default(),
             app_edit: None,
             tray_menu_open: false,
             tray_menu_scroll: gpui::ScrollHandle::new(),
@@ -4422,6 +4414,33 @@ fn repaint_theme(window: &mut Window, cx: &mut App) {
     crate::windows::platform::post_repaint(window);
 }
 
+/// 小节标题：一行粗一点的标题 + 一句说明，右边不挂控件。
+///
+/// 主题预设删掉之后，「亮色主题 / 深色主题」只剩下面那两行色块，
+/// 得有个东西把两组分开，否则两行「背景色 / 强调色」看着像重复了。
+fn section_row(title: &str, description: &str) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .px(px(9.))
+        .pt(px(10.))
+        .pb(px(2.))
+        .child(
+            div()
+                .text_size(theme::fs(13.))
+                .text_color(theme::text_primary())
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .text_size(theme::fs(10.5))
+                .text_color(theme::text_tertiary())
+                .child(description.to_string()),
+        )
+        .into_any_element()
+}
+
 /// 黑名单改了以后同步给钩子线程。
 ///
 /// 钩子里拿不到 gpui 的全局配置，它自己存了一份快照；不刷新的话
@@ -4561,11 +4580,16 @@ impl Settings {
     }
 
     fn general_page(&self, config: &Config, lang: Lang) -> Vec<AnyElement> {
-        // 开机自启显示的是注册表里的**实际**状态，不是配置里那个布尔值：
-        // 任务管理器「启动」页里改过之后，配置并不知道 —— 用户关掉再打开，
-        // 这里显示的还是老样子就成了谎话。开关的翻转方向也按实际状态算，
-        // 免得配置落后一格时点一下「反着来」。
-        let autostart_on = crate::platform::autostart::is_enabled();
+        // 开机自启显示的是系统里的**实际**状态，不是配置里那个布尔值：
+        // 任务管理器「启动」页里改过、或者在任务计划程序里删过任务之后，
+        // 配置并不知道 —— 用户关掉再打开，这里显示的还是老样子就成了谎话。
+        // 开关的翻转方向也按实际状态算，免得配置落后一格时点一下「反着来」。
+        //
+        // 方式同理：实际登记在哪边就显示哪边（都没有时按配置里记的那个）。
+        let method = crate::platform::autostart::detected().unwrap_or(config.launch_method);
+        let autostart_on = crate::platform::autostart::is_enabled(method);
+        // 启动时提权：任务那两档把它写进任务定义的 RunLevel，注册表那档往 Run 值里加参数。
+        let admin = config.run_as_admin;
         let autostart = self.toggle_row(
             "toggle-autostart",
             lang.pick("开机自动启动", "Launch at login"),
@@ -4577,16 +4601,109 @@ impl Settings {
             self.bind(move |config| {
                 let enable = !autostart_on;
                 config.launch_at_login = enable;
-                crate::platform::autostart::set_enabled(enable);
+                // 顺手把方式也按实际登记的那个写回去：配置落后一格时（系统里是
+                // 注册表、配置记着计划任务），照配置开就会在系统里留下两条。
+                config.launch_method = method;
+                crate::platform::autostart::set_enabled(method, enable, config.run_as_admin);
             }),
         );
+
+        // 三档：注册表 / 计划任务（登录）/ 计划任务（开机，SYSTEM 接管）。
+        let launch_method = {
+            let store = self.config.clone();
+            self.choice_row_owned(
+                "launch-method",
+                lang.pick("选择开机自启方式", "Pick the launch method"),
+                lang.pick(
+                    "速度：系统启动时启动最快，用户登录时启动次之，普通开机启动最慢",
+                    "Speed: boot start is fastest, then sign-in start, then the standard startup entry",
+                ),
+                vec![
+                    (0u32, lang.pick("普通开机启动", "Standard start").to_string()),
+                    (1u32, lang.pick("用户登录时启动", "At sign-in").to_string()),
+                    (2u32, lang.pick("系统启动时启动", "At system boot").to_string()),
+                ],
+                method.index(),
+                move |value, window, cx| {
+                    let next = crate::config::LaunchMethod::from_index(value);
+                    let now = crate::platform::autostart::detected()
+                        .unwrap_or(store.borrow().get().launch_method);
+                    if next == now {
+                        return;
+                    }
+                    let (was_on, admin) = {
+                        let store = store.borrow();
+                        (
+                            crate::platform::autostart::is_enabled(now),
+                            store.get().run_as_admin,
+                        )
+                    };
+                    // 三档互斥：先把原来那条彻底撤掉，开着的话再在新方式上建一条。
+                    // 顺序不能反 —— 中间那一下会两条同时在，启动两次。
+                    let _ = store
+                        .borrow_mut()
+                        .update(|config| config.launch_method = next);
+                    crate::platform::autostart::set_enabled(now, false, admin);
+                    if was_on {
+                        crate::platform::autostart::set_enabled(next, true, admin);
+                    }
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        // 启动时以管理员运行。任务那两档靠 RunLevel（任务计划程序静默提权），
+        // 注册表那档只能自己 runas 重开一次。
+        let run_as_admin = {
+            let store = self.config.clone();
+            self.toggle_row(
+                "toggle-run-as-admin",
+                lang.pick("启动时以管理员运行", "Run as administrator at startup"),
+                lang.pick(
+                    "以最高权限启动；计划任务方式静默提权，注册表方式需 UAC 确认",
+                    "Start with highest privileges; scheduled tasks raise it silently, a Run key asks for UAC once",
+                ),
+                admin,
+                move |window, cx| {
+                    let (on, method, enabled) = {
+                        let mut store = store.borrow_mut();
+                        let on = !store.get().run_as_admin;
+                        let _ = store.update(|config| config.run_as_admin = on);
+                        let config = store.get();
+                        (on, config.launch_method, config.launch_at_login)
+                    };
+                    // 任务里的 RunLevel 和 Run 值里的参数都是登记时写死的，改完得重登一次。
+                    if enabled {
+                        crate::platform::autostart::set_enabled(method, true, on);
+                    }
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        // 没提权时的提示：只在「刚试过需要管理员权限的那件事、而且失败了」时出现，
+        // 换成不需要权限的选项之后自动消失。用警示色 —— 这一句是「刚才没成功」，
+        // 不是那种可以略过的小字说明。
+        let admin_hint = crate::platform::autostart::admin_denied().then(|| {
+            div()
+                .px(px(9.))
+                .pb(px(3.))
+                .pt(px(1.))
+                .text_size(theme::fs(10.5))
+                .text_color(theme::danger())
+                .child(lang.pick(
+                    "需要管理员权限：请以管理员身份重新运行 Bolume",
+                    "Administrator rights required — restart Bolume as administrator",
+                ))
+                .into_any_element()
+        });
 
         let hide_focus = self.toggle_row(
             "toggle-focus",
             lang.pick("失去焦点时收起面板", "Close panel when focus is lost"),
             lang.pick(
-                "点击面板以外的地方时自动隐藏",
-                "Hide automatically when you click elsewhere",
+                "点击面板以外区域时自动隐藏",
+                "Hide automatically when you click outside the panel",
             ),
             config.hide_on_focus_lost,
             self.bind(|config| config.hide_on_focus_lost = !config.hide_on_focus_lost),
@@ -4627,7 +4744,7 @@ impl Settings {
                 "toggle-sounding-first",
                 lang.pick("正在播放的应用排最前", "Playing apps first"),
                 lang.pick(
-                    "面板打开时，正在发声的应用移动到列表顶部；上去之后就不再回退",
+                    "打开面板时，正在发声的应用移至列表顶部，之后不再回落",
                     "When the panel opens, apps that are playing move to the top of the list and stay there",
                 ),
                 config.sounding_apps_first,
@@ -4642,12 +4759,13 @@ impl Settings {
             )
         };
 
+        let mut general_rows = vec![autostart, launch_method, run_as_admin];
+        if let Some(hint) = admin_hint {
+            general_rows.push(hint);
+        }
+        general_rows.extend([hide_focus, language]);
         vec![
-            self.section(
-                lang.pick("常规", "General"),
-                "settings",
-                vec![autostart, hide_focus, language],
-            ),
+            self.section(lang.pick("常规", "General"), "settings", general_rows),
             self.section(
                 lang.pick("应用列表", "App list"),
                 "apps",
@@ -9527,7 +9645,7 @@ impl Settings {
             .into_any_element()
     }
 
-    /// 一行色块：「跟随主题」（只有强调色有）+ 预设色 + 自选（色轮）。
+    /// 一行色块：「跟随系统」（只有强调色有）+ 预设色 + 自选（色轮）。
     ///
     /// 抽出来是因为「跟随系统」的亮 / 暗两档各有一行底色、一行强调色，
     /// 但它们要的不是整块标题 + 描述的排版，而是两行紧凑的色块。
@@ -9561,8 +9679,8 @@ impl Settings {
                 .into_any_element()
         };
 
-        // 「跟随主题」只留给强调色。底色的「跟随」本来就是当前主题的样子 ——
-        // 上面那排主题图标已经能选，再摆一个空心块只是多占一格。
+        // 「跟随系统」只留给强调色。底色的「跟随」就是打底模板自己那一档 ——
+        // 点掉已选中的色块就能回去，再摆一个空心块只是多占一格。
         let mut swatches: Vec<AnyElement> = Vec::new();
         if !target.is_surface() {
             swatches.push(follow);
@@ -9597,7 +9715,7 @@ impl Settings {
                         style.child(div().size(px(6.)).flex_none().rounded(px(3.)).bg(dot))
                     })
                     .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
-                        // 再点一次已选中的色块 = 取消，回到跟随主题。
+                        // 再点一次已选中的色块 = 取消（底色回模板、强调色回跟随系统）。
                         let next = if selected {
                             String::new()
                         } else {
@@ -9703,7 +9821,7 @@ impl Settings {
         if self.color_wheel.as_ref().map(|wheel| wheel.target) == Some(target) {
             self.color_wheel = None;
         } else {
-            // 空串（跟随主题）就拿当前主题里那一项当起点，别用写死的默认色。
+            // 空串（跟随）就拿当前生效的那一项当起点，别用写死的默认色。
             let stored = target.current(self.config.borrow().get()).to_string();
             // 这格现在摆的是预设色 → 翻出上次在色轮里调的那一色（点预设不该把
             // 调好的颜色冲掉）；当前就是自选色时以它为准。
@@ -9729,7 +9847,7 @@ impl Settings {
         refresh_ui(window, cx);
     }
 
-    /// 写回自选色（空串 = 跟随主题），并让所有窗口立刻按新配色重画。
+    /// 写回自选色（空串 = 跟随），并让所有窗口立刻按新配色重画。
     fn set_custom_color(
         &mut self,
         target: ColorTarget,
@@ -9807,7 +9925,7 @@ impl Settings {
                 if let Some(wheel) = self.color_wheel.as_mut() {
                     wheel.picker.edit = None;
                 }
-                // 空串 + 回车 = 清掉自选色，回到跟随主题。
+                // 空串 + 回车 = 清掉自选色，回到跟随。
                 if apply {
                     if let Some(target) = target {
                         match parse_rgb(&buffer) {
@@ -9971,18 +10089,18 @@ impl Settings {
             ];
             let description = if !config.theme_follow_system {
                 lang.pick(
-                    "固定用一套主题；切成「跟随系统」后按 Windows 的亮暗自动换",
-                    "Always use one theme; switch to Follow Windows to track Windows light/dark",
+                    "固定用深色底；切成「跟随系统」后按 Windows 的亮暗换下面两套",
+                    "Always dark; switch to Follow Windows to use the two sets below",
                 )
             } else if crate::platform::system_theme::is_dark() {
                 lang.pick(
                     "Windows 现在是深色，用下面「深色主题」那一套",
-                    "Windows is dark right now; the dark theme below is in use",
+                    "Windows is dark right now; the dark set below is in use",
                 )
             } else {
                 lang.pick(
                     "Windows 现在是亮色，用下面「亮色主题」那一套",
-                    "Windows is light right now; the light theme below is in use",
+                    "Windows is light right now; the light set below is in use",
                 )
             };
             self.choice_row_owned(
@@ -10009,16 +10127,12 @@ impl Settings {
         rows.push(mode);
 
         if config.theme_follow_system {
-            rows.push(self.theme_slot_row(
-                "theme-light",
+            rows.push(section_row(
                 lang.pick("亮色主题", "Light theme"),
                 lang.pick(
                     "Windows 切到亮色时用这一套",
                     "Used when Windows switches to its light mode",
                 ),
-                ThemeSlot::Light,
-                config,
-                lang,
             ));
             rows.push(self.slot_colors_block(
                 "theme-light-color",
@@ -10027,16 +10141,12 @@ impl Settings {
                 config,
                 cx,
             ));
-            rows.push(self.theme_slot_row(
-                "theme-dark",
+            rows.push(section_row(
                 lang.pick("深色主题", "Dark theme"),
                 lang.pick(
                     "Windows 切到深色时用这一套",
                     "Used when Windows switches to its dark mode",
                 ),
-                ThemeSlot::Dark,
-                config,
-                lang,
             ));
             rows.push(self.slot_colors_block(
                 "theme-dark-color",
@@ -10045,126 +10155,16 @@ impl Settings {
                 config,
                 cx,
             ));
-            return rows;
         }
 
-        let mut strip = div().flex().items_center().gap(px(6.)).flex_1();
-
-        // 自选了背景色时，这三格一个都不打勾。
-        //
-        // 它们代表的是「整套配色」，而底色已经被自选色替掉了 —— 勾着某一套会让人
-        // 以为那套还在生效（实际上只有文字 / 描边的明暗跟着底色走）。
-        let following = config.theme_surface.trim().is_empty();
-        for (name, label) in theme::theme_options(lang) {
-            let selected = following && name == config.theme;
-            let store = self.config.clone();
-            let value = name.clone();
-            // 预览色直接取自那套主题：格子本身就是它的缩略图。
-            let (surface, accent, text) = theme::theme_preview(&name).unwrap_or((
-                theme::surface(),
-                theme::accent(),
-                theme::text_primary(),
-            ));
-            // 预览块自己画底色，所以底色也得是不透明的（否则格子里会透出当前主题）。
-            let surface = gpui::Hsla {
-                alpha: 1.0,
-                ..surface
-            };
-
-            strip = strip.child(
-                div()
-                    .id(SharedString::from(format!("theme-{name}")))
-                    .flex_1()
-                    .min_w_0()
-                    .h(px(34.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(6.))
-                    .rounded(px(theme::RADIUS_SMALL))
-                    .bg(surface)
-                    .border_2()
-                    .border_color(if selected {
-                        theme::accent()
-                    } else {
-                        theme::border_strong()
-                    })
-                    .cursor_pointer()
-                    .hover(|style| style.border_color(theme::text_tertiary()))
-                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
-                        if store.borrow().get().theme == value {
-                            return;
-                        }
-                        let _ = store
-                            .borrow_mut()
-                            .update(|config| config.theme = value.clone());
-                        // 先套主题、再叠用户自选的底色 / 强调色（`apply_theme_extras`
-                        // 里就是这个顺序），否则一换主题自定义色就没了。
-                        crate::gui::apply_theme_extras(&store.borrow().get().clone());
-                        // 换肤要整窗重画：先置脏，再给每扇开着的窗口补一条 WM_PAINT。
-                        repaint_theme(window, cx);
-                    }))
-                    // 小圆点是那套主题的强调色，正好区分「灰」和「黑」两套。
-                    .child(div().size(px(6.)).flex_none().rounded(px(3.)).bg(accent))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_size(theme::fs(12.))
-                            .text_color(text)
-                            .truncate()
-                            .child(label),
-                    )
-                    .when(selected, |style| style.child(icon("check", 13.0, accent))),
-            );
-        }
-
-        rows.push(div().px(px(9.)).py(px(6.)).child(strip).into_any_element());
         rows
-    }
-
-    /// 「跟随系统」下的一档主题：亮色用哪套 / 深色用哪套。
-    fn theme_slot_row(
-        &self,
-        id: &'static str,
-        title: &'static str,
-        description: &str,
-        slot: ThemeSlot,
-        config: &Config,
-        lang: Lang,
-    ) -> AnyElement {
-        let themes = theme::theme_options(lang);
-        let names: Vec<String> = themes.iter().map(|(name, _)| name.clone()).collect();
-        let options: Vec<(u32, String)> = themes
-            .iter()
-            .enumerate()
-            .map(|(index, (_, label))| (index as u32, label.clone()))
-            .collect();
-        let current = slot.name(config);
-        // 空串或改过名的老配置：落到第一套上，下拉里至少要有一项是选中的。
-        let value = names.iter().position(|name| name == current).unwrap_or(0) as u32;
-        let store = self.config.clone();
-        self.choice_row_owned(
-            id,
-            title,
-            description,
-            options,
-            value,
-            move |picked, window, cx| {
-                let Some(name) = names.get(picked as usize).cloned() else {
-                    return;
-                };
-                let _ = store.borrow_mut().update(|config| slot.set(config, &name));
-                crate::gui::apply_theme_extras(&store.borrow().get().clone());
-                repaint_theme(window, cx);
-            },
-        )
     }
 
     /// 「跟随系统」某一档自己的自选配色：两行色块（背景色 / 强调色）。
     ///
     /// 每档各存一套（见 `Config::theme_light_surface`）：共用一份自选色的话，
     /// 系统在亮暗之间切来切去界面一模一样，跟随就没意义了。
-    /// 一行都不选 = 用这套主题自己的颜色。
+    /// 底色点掉已选中的那格 = 回到模板自己的底色；强调色第一格 = 跟随系统强调色。
     fn slot_colors_block(
         &self,
         id: &str,
@@ -10214,6 +10214,84 @@ impl Settings {
             .into_any_element()
     }
 
+    /// 页脚编辑器要改配置时走它 —— 写配置、让开着的面板立刻重画、设置页重绘。
+    ///
+    /// 返回两个回调：`edit` 收编辑器抛出来的改动；`refresh` 只重画不碰配置
+    /// （拖动时跟着光标走的落点竖条、悬停显形的那个 × 都靠它）。
+    #[allow(clippy::type_complexity)]
+    fn footer_edit(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> (
+        Rc<dyn Fn(FooterEdit, &mut Window, &mut App)>,
+        Rc<dyn Fn(&mut Window, &mut App)>,
+    ) {
+        // 窗口级监听是纯闭包，拿不到实体，只能给弱引用：设置窗关掉以后
+        // 别把它吊着不放。
+        let weak = cx.entity().downgrade();
+        let refresh: Rc<dyn Fn(&mut Window, &mut App)> = {
+            let weak = weak.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                if let Some(this) = weak.upgrade() {
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                }
+                // × 是整块出现 / 消失的，光 notify 不够。
+                window.refresh();
+            })
+        };
+        let store = self.config.clone();
+        let after = refresh.clone();
+        let edit: Rc<dyn Fn(FooterEdit, &mut Window, &mut App)> =
+            Rc::new(move |edit, window, cx| {
+                let _ = store.borrow_mut().update(|config| match edit {
+                    FooterEdit::Hide(id) => config.footer.set_visible(&id, false),
+                    FooterEdit::Place { id, side, before } => {
+                        config.footer.place(&id, side, before.as_deref(), true);
+                    }
+                    // 放回来 = 回到它原来待的位置。竖排面板不画左边那一组，
+                    // 从「未放置」里点回来就是搬到右边去。
+                    FooterEdit::Restore(id) => {
+                        let on_left = config
+                            .footer
+                            .items
+                            .iter()
+                            .find(|item| item.id == id)
+                            .is_some_and(|item| item.side.is_left());
+                        if config.panel_layout.is_vertical() && on_left {
+                            config.footer.place(&id, FooterSide::Right, None, true);
+                        } else {
+                            config.footer.set_visible(&id, true);
+                        }
+                    }
+                });
+                // 面板开着就立刻重画；关着的话下次弹出自然就是新的。
+                crate::gui::refresh_flyout_footer(cx);
+                after(window, cx);
+                refresh_ui(window, cx);
+            });
+        (edit, refresh)
+    }
+
+    /// 「页脚按钮」这一整块：面板底边的 1:1 预览 + 没放上去的那些。
+    fn footer_section(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
+        let (edit, refresh) = self.footer_edit(cx);
+        let mut rows = vec![crate::ui::footer_preview::footer_preview(
+            config,
+            &self.footer_preview,
+            lang,
+            edit.clone(),
+            refresh,
+        )];
+        if let Some(tray) = crate::ui::footer_preview::unplaced_tray(config, lang, edit) {
+            rows.push(tray);
+        }
+        rows.push(self.note_row(lang.pick(
+            "上面那条就是面板底边的实际大小：拖按钮换位置（拖到空着的另一半就是搬到那一组），点右上角的 × 收起来，收起来的在「未放置」里点一下就能放回去。竖排面板太窄，只画右侧一组、而且只画图标",
+            "The strip above is the panel footer at actual size: drag a button to move it (drop it on the empty half to switch sides), click the × to take it off; anything taken off waits under “Not shown” and one click puts it back. Vertical panels are too narrow and only show the right group, icons only",
+        )));
+        self.section(lang.pick("页脚按钮", "Footer buttons"), "pin", rows)
+    }
+
     fn appearance_page(
         &self,
         config: &Config,
@@ -10229,8 +10307,8 @@ impl Settings {
                 "theme-surface",
                 lang.pick("背景色", "Background"),
                 lang.pick(
-                    "选一个底色，文字和描边会自动换成对比色；再点一次已选的色块就回到跟随主题",
-                    "Pick a base colour; text and borders flip to stay readable. Click the selected swatch again to follow the theme",
+                    "选一个底色，文字和描边会自动换成对比色；再点一次已选的色块就回到默认底色",
+                    "Pick a base colour; text and borders flip to stay readable. Click the selected swatch again to go back to the default",
                 ),
                 ColorTarget::Surface,
                 config,
@@ -10890,6 +10968,9 @@ impl Settings {
             rows
         });
 
+        // 页脚那一排按钮单独一张卡：放哪些、摆哪一边、谁在前谁在后。
+        let footer_section = self.footer_section(config, lang, cx);
+
         // 三个页签三组内容：界面 / 面板 / 托盘。
         let interface_sections = vec![
             self.section(lang.pick("主题", "Theme"), "palette", palette_rows),
@@ -10906,7 +10987,7 @@ impl Settings {
                 ],
             ),
         ];
-        let panel_sections = vec![panel_section];
+        let panel_sections = vec![panel_section, footer_section];
         let mut sections = vec![self.section(
             lang.pick("托盘图标", "Tray icon"),
             "speaker",

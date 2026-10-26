@@ -711,7 +711,14 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        // Bolume patch：只改尺寸，绝不动 z 序。
+                        // 以前只有 `SWP_NOMOVE`，`hWndInsertAfter` 是 `None`（= HWND_TOP），
+                        // 于是**每一次内容尺寸变化都会把窗口提到所在层的最前面**：
+                        // 置顶窗口（OSD / 面板 / 亮度卡片）就跑到任务栏前面去了 ——
+                        // 收起来那一段从任务栏上面划过去，正是「从任务栏前面消失」。
+                        // 只在第一次弹出时明显，因为窗口第一次提交首帧才会真的 resize
+                        // （初建尺寸 191×50 与布局结果差 1px 就会走这里）。
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                     )
                     .context("unable to set window content size")
                     .log_err();

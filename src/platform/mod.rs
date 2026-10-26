@@ -1,6 +1,8 @@
 pub mod app_icon;
 pub mod app_pick;
 pub mod autostart;
+pub mod bootstart;
+pub mod detach;
 pub mod fonts;
 pub mod fullscreen;
 pub mod hotkey;
@@ -8,6 +10,7 @@ pub mod legacy_osd;
 pub mod media;
 pub mod monitors;
 pub mod mouse_wheel;
+pub mod radio;
 pub mod restart;
 pub mod shell;
 pub mod single_instance;

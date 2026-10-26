@@ -761,6 +761,225 @@ impl TrayMenuConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 面板页脚那一排按钮：放哪些、摆哪一边、谁在前谁在后
+// ---------------------------------------------------------------------------
+
+/// 页脚按钮靠哪一边。
+///
+/// 页脚本来就是两头对齐的（`justify_between`）：一边是系统状态（WiFi / 蓝牙），
+/// 一边是面板自己的动作（响度均衡 / 混音器 / 设置 / 置顶）。所以「位置」有两层意思 ——
+/// 摆在哪一头，以及那一头里的第几个。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FooterSide {
+    #[default]
+    Left,
+    Right,
+}
+
+impl FooterSide {
+    pub fn is_left(self) -> bool {
+        matches!(self, FooterSide::Left)
+    }
+}
+
+/// 页脚上能放的一个按钮（注册表条目）。
+///
+/// **加一个新按钮只要两步**：这里加一条，`windows::flyout` 的 `footer_button`
+/// 里加一个 `match` 分支。设置页那张列表、显隐、排序、以及老配置的补全全是按这张
+/// 表生成的，不用再改别处。
+pub struct FooterItemSpec {
+    /// 配置里存的 id。改了就等于换了一个按钮（老配置里那条会变成不认识的条目）。
+    pub id: &'static str,
+    pub zh: &'static str,
+    pub en: &'static str,
+    /// 面板上的图标（`assets/icons` 里的名字）。
+    pub icon: &'static str,
+    /// 横排时带文字（响度均衡 / 混音器这种）。竖排列太窄，一律只画图标。
+    pub label: bool,
+    /// 第一次进配置时摆在哪一边、默认显不显示。
+    pub side: FooterSide,
+}
+
+/// 页脚按钮注册表。**顺序就是设置页列表里的顺序**，也是新按钮插进老配置时的锚点。
+pub const FOOTER_ITEMS: &[FooterItemSpec] = &[
+    FooterItemSpec {
+        id: "wifi",
+        zh: "WiFi",
+        en: "Wi-Fi",
+        icon: "wifi",
+        label: false,
+        side: FooterSide::Left,
+    },
+    FooterItemSpec {
+        id: "bluetooth",
+        zh: "蓝牙",
+        en: "Bluetooth",
+        icon: "bluetooth",
+        label: false,
+        side: FooterSide::Left,
+    },
+    FooterItemSpec {
+        id: "loudness",
+        zh: "响度均衡",
+        en: "Loudness",
+        icon: "levels",
+        label: true,
+        side: FooterSide::Right,
+    },
+    FooterItemSpec {
+        id: "mixer",
+        zh: "混音器",
+        en: "Mixer",
+        icon: "adjustments",
+        label: true,
+        side: FooterSide::Right,
+    },
+    FooterItemSpec {
+        id: "settings",
+        zh: "设置",
+        en: "Settings",
+        icon: "settings",
+        label: false,
+        side: FooterSide::Right,
+    },
+    FooterItemSpec {
+        id: "pin",
+        zh: "置顶",
+        en: "Pin",
+        icon: "pin",
+        label: false,
+        side: FooterSide::Right,
+    },
+];
+
+/// 按 id 找注册表条目。认不出来（用户手改过 / 从新版降级）就当没这个按钮。
+pub fn footer_spec(id: &str) -> Option<&'static FooterItemSpec> {
+    FOOTER_ITEMS.iter().find(|spec| spec.id == id)
+}
+
+/// 页脚上的一个按钮：哪个、显不显示、靠哪一边。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FooterItem {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub side: FooterSide,
+}
+
+impl FooterItem {
+    fn from_spec(spec: &FooterItemSpec) -> Self {
+        Self {
+            id: spec.id.to_string(),
+            visible: true,
+            side: spec.side,
+        }
+    }
+}
+
+/// 面板页脚的布局。`items` 的顺序就是**同一侧里的显示顺序**（两侧混排在一份列表里，
+/// 渲染时按 `side` 分两拨、各自保序）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FooterConfig {
+    pub items: Vec<FooterItem>,
+}
+
+impl Default for FooterConfig {
+    fn default() -> Self {
+        Self {
+            items: FOOTER_ITEMS.iter().map(FooterItem::from_spec).collect(),
+        }
+    }
+}
+
+impl FooterConfig {
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.items.iter().position(|item| item.id == id)
+    }
+
+    pub fn is_visible(&self, id: &str) -> bool {
+        self.items
+            .iter()
+            .find(|item| item.id == id)
+            .is_some_and(|item| item.visible)
+    }
+
+    pub fn set_visible(&mut self, id: &str, visible: bool) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            item.visible = visible;
+        }
+    }
+
+    /// 把 `id` 挪到 `side` 那一组里、插在 `before` 前面（`None` = 放进这组的末尾）。
+    ///
+    /// 设置页那个可视化面板拖一下就调这个：屏幕上的「插在第几个」先换算成
+    /// 「插在谁的签名儿上」，跨组搬家和组内换序都是同一条路。
+    ///
+    /// `show` 为真时顺手取消隐藏 —— 从「未放置」把按钮放回面板走的就是它。
+    ///
+    /// 返回真的动了没有：把按钮拖回原处不算改动，省一次落盘。
+    pub fn place(
+        &mut self,
+        id: &str,
+        side: FooterSide,
+        before: Option<&str>,
+        show: bool,
+    ) -> bool {
+        let Some(from) = self.index_of(id) else {
+            return false;
+        };
+        // 落在自己身上 = 没动。不先挡掉的话「锚点被移除」会让它顺势滑到组尾。
+        if before == Some(id) {
+            return false;
+        }
+        // 先在副本上做完再比：拖回原位（含「插到紧挨着自己后面」）就是一次空操作。
+        let mut next = self.clone();
+        let mut item = next.items.remove(from);
+        item.side = side;
+        item.visible = item.visible || show;
+        // 锚点在移除之后整体挪了一位，按 id 重新找。
+        let at = before
+            .and_then(|anchor| next.items.iter().position(|other| other.id == anchor))
+            .unwrap_or(next.items.len());
+        next.items.insert(at, item);
+        if next == *self {
+            return false;
+        }
+        *self = next;
+        true
+    }
+
+    /// 老配置补新按钮：注册表里有、配置里没有的，按注册表顺序插进去，默认显示。
+    ///
+    /// 每次载入都跑（幂等）。这样以后加按钮，老用户升级完就能看见，不用自己找；
+    /// 认不出来的旧 id 留着不删 —— 渲染时跳过，用户万一降级回去也还在。
+    pub fn ensure_all(&mut self) -> bool {
+        let mut changed = false;
+        for (order, spec) in FOOTER_ITEMS.iter().enumerate() {
+            if self.items.iter().any(|item| item.id == spec.id) {
+                continue;
+            }
+            // 插到「注册表里排在它后面的第一项」前面，保持注册表的相对顺序；
+            // 没有这样的项就放末尾。
+            let at = self
+                .items
+                .iter()
+                .position(|item| {
+                    FOOTER_ITEMS
+                        .iter()
+                        .position(|known| known.id == item.id)
+                        .is_some_and(|known_order| known_order > order)
+                })
+                .unwrap_or(self.items.len());
+            self.items.insert(at, FooterItem::from_spec(spec));
+            changed = true;
+        }
+        changed
+    }
+}
+
 /// 托盘提示的对齐方式。
 ///
 /// 系统的通知区域提示本身没有对齐参数（文字固定靠左），「居中」「靠右」都是靠
@@ -1071,7 +1290,11 @@ impl StartupProfile {
 /// 压缩比 / 平均窗口 / 最大增益）收成两个（`loudness.level` 最大放大级别、
 /// `loudness.smoothness` 音量变化级别）。老配置里那五个字段反序列化时被忽略，
 /// 落到新默认值 —— 默认仍然是「关」，所以老配置读进来音量行为照旧。
-const CONFIG_REV: u32 = 71;
+/// rev 72：主题去掉黑 / 灰 / 白三套预设（`theme` / `theme_light` / `theme_dark` 三个
+/// 字段一起删），打底只剩深色 / 浅色两套模板，外观全由底色 + 强调色决定。
+/// 亮暗两档的底色给了默认值（浅色档倒数第一个、深色档第四个），老配置里空着
+/// 的那两格一并填上 —— 空着的话亮色档会落到深色模板上。
+const CONFIG_REV: u32 = 72;
 
 /// 面板弹出动画的风格。
 ///
@@ -3217,6 +3440,10 @@ pub const UI_FONT_DEFAULT: &str = "";
 pub const DEFAULT_UI_FONT_WEIGHT: u32 = 400;
 /// 界面对比度的默认值（100% = 主题原样）。
 pub const DEFAULT_UI_CONTRAST: u32 = 100;
+/// 「跟随系统」时亮色档的默认底色：色块行里最后一个浅色。
+pub const DEFAULT_LIGHT_SURFACE: &str = "#f4efe6";
+/// 「跟随系统」时深色档的默认底色：色块行里第四个深色。
+pub const DEFAULT_DARK_SURFACE: &str = "#262b33";
 /// 界面对比度的可调范围（百分比）。低于 60 次级文字基本糊没了，高于 160 就刺眼。
 pub const UI_CONTRAST_RANGE: (u32, u32) = (60, 160);
 
@@ -3390,12 +3617,19 @@ impl LoudnessConfig {
     /// 把增益一路堆到上限 —— 下一句一开口就是几倍的爆音（用户听到的
     /// 「一开始播放突然很大声、音质很差地响几百毫秒」就是它）。
     pub const MIN_PEAK: f32 = 0.001;
-    /// 增益上限（8 倍 = +18dB）。
+    /// 增益上限（4 倍 = +12dB）。
     ///
-    /// 插件里 `vol` 也有上限（否则安静素材会把底噪一起抬成巨响）。8 倍能覆盖
-    /// 峰值在 0.1 以上（-20dB）的素材 —— 正常音乐/视频的音轨余量都在这个范围；
-    /// 再高的增益会把房间噪声、解码抖动一起抬起来，得不偿失。
-    pub const MAX_GAIN: f32 = 8.0;
+    /// 插件里 `vol` 也有上限（否则安静素材会把底噪一起抬成巨响）。插件跑在
+    /// Winamp 的 DSP 链里，面对的是「音频文件音轨基本顶到满幅」——那里 8 倍
+    /// （+18dB）几乎碰不到。
+    ///
+    /// 接在系统混音上是另一回事：播放器自己的音量旋钮在素材**之后**，用户把
+    /// 播放器音量调到 20%，会话电平表读到的峰值就只有 0.05 上下（-26dB）——
+    /// 8 倍会长期贴着上限跑，输出在 2 倍和 8 倍之间来回摆（实测 DOpus 播视频，
+    /// 12dB 的反复抽动，听感就是「一直往响里叠、很炸」）。4 倍能覆盖到 0.23
+    /// （-12.7dB）的素材，静的那一头不再硬顶；真要更响，把 `level` 调低的收益
+    /// 和风险都更明确（那是「响到多响」的旋钮，不是这个上限）。
+    pub const MAX_GAIN: f32 = 4.0;
 
     /// 目标峰值（线性幅度）。`level` 是百分比。
     ///
@@ -3420,6 +3654,46 @@ impl LoudnessConfig {
     }
 }
 
+/// 开机自启的落地方式。
+///
+/// 三条路的时机差得不少：注册表 `Run` 要等资源管理器把启动项逐个拉起来；
+/// 计划任务在**会话一建立**时就被任务计划程序拉起来 —— 早一两秒；
+/// 系统启动走开机触发的 SYSTEM 任务，用户会话一出现就把主程序送进去。
+///
+/// 只保留一种，同时存在就是启动两次（第二次被单实例挡掉，但白跑一遍）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaunchMethod {
+    /// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（Windows 的默认做法）。
+    #[default]
+    RunKey,
+    /// 计划任务：登录时触发。
+    Task,
+    /// 计划任务：开机时触发（SYSTEM），登录后把自己送进用户会话。
+    Boot,
+}
+
+impl LaunchMethod {
+    /// 优先级从早到晚：清理多余登记时按这个顺序决定留哪一条。
+    pub const ALL: [Self; 3] = [Self::Boot, Self::Task, Self::RunKey];
+
+    pub fn index(self) -> u32 {
+        match self {
+            Self::RunKey => 0,
+            Self::Task => 1,
+            Self::Boot => 2,
+        }
+    }
+
+    pub fn from_index(value: u32) -> Self {
+        match value {
+            1 => Self::Task,
+            2 => Self::Boot,
+            _ => Self::RunKey,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -3433,6 +3707,13 @@ pub struct Config {
     pub hide_on_focus_lost: bool,
     /// 开机自启动。
     pub launch_at_login: bool,
+    /// 开机自启用哪种方式落地（注册表 / 计划任务）。
+    pub launch_method: LaunchMethod,
+    /// 启动时以管理员身份运行。
+    ///
+    /// 计划任务那两档由任务计划程序按最高权限静默拉起（不弹 UAC）；注册表那档
+    /// 只能自己 `runas` 重开一次，UAC 开着的机器上会弹确认。
+    pub run_as_admin: bool,
 
     /// 列出「系统声音」会话。
     pub show_system_sounds: bool,
@@ -3625,6 +3906,12 @@ pub struct Config {
     /// 显式写数字就按它来，推子把多出来的高度吃掉 —— 调音台那种长推子。
     pub vertical_height: u32,
 
+    /// 面板页脚那一排按钮：放哪些、靠哪一边、谁在前谁在后。
+    ///
+    /// 见 [`FOOTER_ITEMS`] 那张注册表 —— 以后加按钮不用改这里。
+    #[serde(default)]
+    pub footer: FooterConfig,
+
     /// 打开 / 收起音量面板。每个动作可录三组。
     pub hotkey_flyout: HotkeySlots,
     /// 打开设置窗口。
@@ -3700,32 +3987,23 @@ pub struct Config {
     /// 别的程序里还是方向键。
     pub hotkey_numpad_raw: bool,
 
-    /// 界面主题名（内置主题的 `name`）。
+    /// 配色跟着 Windows 的亮暗走（默认开）。
     ///
-    /// 只在「不跟随系统」时生效；跟随系统时按系统亮暗从 `theme_light` /
-    /// `theme_dark` 里挑（这个值留着，切回来时还是原来那套）。
-    pub theme: String,
-    /// 主题跟随 Windows 的亮暗（默认开）。
-    ///
-    /// 打开后：系统是亮色用 `theme_light`，系统是深色用 `theme_dark`，
-    /// 系统一改（设置页里切「应用模式」）界面立刻跟着换。
+    /// 打开后：系统亮色用浅色模板、深色用深色模板，系统一改界面立刻跟着换；
+    /// 关掉就是固定用深色模板（底色仍可以自己挑）。
     pub theme_follow_system: bool,
-    /// 跟随系统时「亮色」用哪套主题（主题名，空 = 默认主题）。
-    pub theme_light: String,
-    /// 跟随系统时「深色」用哪套主题（主题名，空 = 默认主题）。
-    pub theme_dark: String,
-    /// 跟随系统时「亮色」那一档自己的自选底色（空 = 用那套主题自己的底色）。
+    /// 跟随系统时「亮色」那一档的底色（默认倒数第一个浅色）。
     ///
-    /// 亮暗两档各存一套：跟随时系统一换就整套配色换掉，两档共用一份自选色会
+    /// 亮暗两档各存一套：跟随时系统一换就整套配色换掉，两档共用一份底色会
     /// 让两档长得一模一样（换了跟没换一样），自定义也就失去意义了。
     pub theme_light_surface: String,
-    /// 跟随系统时「亮色」那一档自己的自选强调色（空 = 跟随 Windows 的强调色）。
+    /// 跟随系统时「亮色」那一档的强调色（空 = 跟随 Windows 的强调色）。
     pub theme_light_accent: String,
-    /// 跟随系统时「深色」那一档自己的自选底色（空 = 用那套主题自己的底色）。
+    /// 跟随系统时「深色」那一档的底色（默认第四个深色）。
     pub theme_dark_surface: String,
-    /// 跟随系统时「深色」那一档自己的自选强调色（空 = 跟随 Windows 的强调色）。
+    /// 跟随系统时「深色」那一档的强调色（空 = 跟随 Windows 的强调色）。
     pub theme_dark_accent: String,
-    /// 自选底色（`#rrggbb` / `#rrggbbaa`，空 = 跟随主题）。
+    /// 固定模式下用的底色（空 = 深色模板自己的底色）。
     ///
     /// 换底色会连带换掉文字和描边的明暗（浅底配黑字），否则会出现灰底白字看不清。
     pub theme_surface: String,
@@ -3812,6 +4090,8 @@ impl Default for Config {
             logarithmic_min_db: -40,
             hide_on_focus_lost: true,
             launch_at_login: false,
+            launch_method: LaunchMethod::default(),
+            run_as_admin: false,
             show_system_sounds: true,
             sounding_apps_first: false,
             use_scroll_wheel_in_tray: true,
@@ -3866,6 +4146,7 @@ impl Default for Config {
             panel_layout: PanelLayout::Horizontal,
             vertical_app_names: false,
             vertical_height: 0,
+            footer: FooterConfig::default(),
             // 快捷键默认全部为空，由用户自己录。
             hotkey_flyout: HotkeySlots::default(),
             hotkey_settings: HotkeySlots::default(),
@@ -3894,13 +4175,10 @@ impl Default for Config {
             hotkey_repeat_interval: DEFAULT_HOTKEY_REPEAT_INTERVAL,
             hotkey_ignore_system_repeat: true,
             hotkey_numpad_raw: false,
-            theme: crate::ui::theme::DEFAULT_THEME.to_string(),
             theme_follow_system: true,
-            theme_light: crate::ui::theme::DEFAULT_LIGHT_THEME.to_string(),
-            theme_dark: crate::ui::theme::DEFAULT_DARK_THEME.to_string(),
-            theme_light_surface: String::new(),
+            theme_light_surface: DEFAULT_LIGHT_SURFACE.to_string(),
             theme_light_accent: String::new(),
-            theme_dark_surface: String::new(),
+            theme_dark_surface: DEFAULT_DARK_SURFACE.to_string(),
             theme_dark_accent: String::new(),
             theme_surface: String::new(),
             theme_accent: String::new(),
@@ -4485,13 +4763,10 @@ impl ConfigStore {
             //
             // 底色按明暗分档搬：浅底只进亮档、深底只进暗档 —— 反着搬会让暗主题套上
             // 一个浅底、字看不见。强调色不挑明暗，两档都搬。
-            if config.config_rev < 48
-                && config.theme_follow_system
-                && config.theme_light_surface.is_empty()
-                && config.theme_light_accent.is_empty()
-                && config.theme_dark_surface.is_empty()
-                && config.theme_dark_accent.is_empty()
-            {
+            //
+            // rev 72 之后四档都有默认底色了，不能再拿「四格都空」当开关
+            // （反序列化时缺字段就是新默认），rev 号本身已经能说明「那四个字段不存在」。
+            if config.config_rev < 48 && config.theme_follow_system {
                 let accent = config.theme_accent.trim().to_string();
                 if !accent.is_empty() {
                     config.theme_light_accent = accent.clone();
@@ -4512,6 +4787,19 @@ impl ConfigStore {
                     } else {
                         config.theme_dark_surface = surface;
                     }
+                }
+            }
+            // rev 72：主题预设删掉之后，亮暗两档的底色成了决定外观的那一项。
+            //
+            // 老配置里这两格多半是空的（以前空着 = 用那套主题自己的底色），
+            // 现在空着就等于亮色档落到深色模板上 —— 填成新默认（浅色档倒数第一个、
+            // 深色档第四个）。迁移只按 rev 走一次，之后用户自己清空不会被填回来。
+            if config.config_rev < 72 {
+                if config.theme_light_surface.trim().is_empty() {
+                    config.theme_light_surface = DEFAULT_LIGHT_SURFACE.to_string();
+                }
+                if config.theme_dark_surface.trim().is_empty() {
+                    config.theme_dark_surface = DEFAULT_DARK_SURFACE.to_string();
                 }
             }
             // rev 29：黑名单落地。原来 OSD 有「全屏时不弹」、快捷键页有「全屏时禁用快捷键」，
@@ -4671,6 +4959,14 @@ impl ConfigStore {
             config.config_rev = CONFIG_REV;
             migrated = true;
         }
+        // 页脚按钮表：注册表里有、配置里没有的补进去（默认显示）。
+        //
+        // 故意放在 rev 判断**外面**、每次都跑：以后往 `FOOTER_ITEMS` 里加按钮，
+        // 老用户升级完就能在页脚上看到它，不用先自己找到设置页去打开。
+        // 幂等，已有的一项都不动（显隐、位置都是用户自己排的）。
+        if config.footer.ensure_all() {
+            migrated = true;
+        }
         let store = Self { path, config };
         // 首次运行就把默认配置落盘，便携版目录里一眼能看到 config.json。
         if existing.is_none() || !store.path.exists() || migrated {
@@ -4704,6 +5000,45 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 自启方式：默认注册表（跟以前的行为一致），老配置读进来也是注册表。
+    ///
+    /// 存的是 `run-key` / `task` / `boot` 这几个短名，跟 `panel_layout` 的写法统一；
+    /// 拆成短横线是为了以后能再加变体而不破坏已有配置文件。
+    #[test]
+    fn launch_method_defaults_to_run_key() {
+        assert_eq!(Config::default().launch_method, LaunchMethod::RunKey);
+        let old: Config = serde_json::from_str("{\"config_rev\": 61}").unwrap();
+        assert_eq!(old.launch_method, LaunchMethod::RunKey);
+        // 存盘再读回来还是同一个（枚举名改过就会在这里断）。
+        for method in LaunchMethod::ALL {
+            let mut config = Config::default();
+            config.launch_method = method;
+            let json = serde_json::to_string(&config).unwrap();
+            let back: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.launch_method, method);
+        }
+        let json = serde_json::to_string(&Config::default()).unwrap();
+        assert!(json.contains("\"launch_method\":\"run-key\""));
+    }
+
+    /// 「启动时以管理员运行」默认关着：不能一装好就向系统要管理员权限。
+    #[test]
+    fn run_as_admin_defaults_to_off() {
+        assert!(!Config::default().run_as_admin);
+        let old: Config = serde_json::from_str("{\"config_rev\": 61}").unwrap();
+        assert!(!old.run_as_admin);
+    }
+
+    /// 分段按钮用序号换回来，两边必须对得上（写错了点一下会跳回注册表）。
+    #[test]
+    fn launch_method_index_round_trips() {
+        for method in LaunchMethod::ALL {
+            assert_eq!(LaunchMethod::from_index(method.index()), method);
+        }
+        // 认不出来的序号按注册表算 —— 那是老行为，最保守。
+        assert_eq!(LaunchMethod::from_index(9), LaunchMethod::RunKey);
+    }
 
     /// 「禁用 Windows 音量条」默认关着：不能一装好就把人家的音量条干掉。
     #[test]
@@ -5009,21 +5344,13 @@ mod tests {
         // 新字段走默认值。
         assert_eq!(config.hotkey_volume_step, 2);
         assert!(!config.hotkey_volume_follow_log);
-        assert_eq!(config.theme, crate::ui::theme::DEFAULT_THEME);
-        // 「跟随系统」默认开着，两档槽位各给一档默认主题（空串也会落到那一档上）。
+        // 「跟随系统」默认开着，两档的底色各给一档默认（浅色档倒数第一个、深色档第四个）。
         assert!(config.theme_follow_system);
-        assert_eq!(config.theme_light, crate::ui::theme::DEFAULT_LIGHT_THEME);
-        assert_eq!(config.theme_dark, crate::ui::theme::DEFAULT_DARK_THEME);
-        // 亮 / 暗两档的自选色默认都是空串：强调色空串 = 跟随 Windows 的强调色，
-        // 底色空串 = 用各档主题自己的底色。
-        for slot in [
-            &config.theme_light_surface,
-            &config.theme_light_accent,
-            &config.theme_dark_surface,
-            &config.theme_dark_accent,
-        ] {
-            assert!(slot.is_empty());
-        }
+        assert_eq!(config.theme_light_surface, DEFAULT_LIGHT_SURFACE);
+        assert_eq!(config.theme_dark_surface, DEFAULT_DARK_SURFACE);
+        // 强调色默认空着 = 跟随 Windows 的强调色。
+        assert!(config.theme_light_accent.is_empty());
+        assert!(config.theme_dark_accent.is_empty());
     }
 
     /// 模板跟着「是谁触发的」走：音量 / 静音用音量模板，媒体键用媒体键模板。
@@ -5113,7 +5440,8 @@ mod tests {
         assert_eq!(store.get().theme_light_surface, "#f4efe6");
         assert_eq!(store.get().theme_light_accent, "#f87171");
         assert_eq!(store.get().theme_dark_accent, "#f87171");
-        assert_eq!(store.get().theme_dark_surface, "", "浅底不该进暗档");
+        // 浅底不该进暗档：暗档留着的就是 rev 72 的默认底色。
+        assert_eq!(store.get().theme_dark_surface, DEFAULT_DARK_SURFACE);
         // 全局那对留着不动：切回固定主题时还是原来那个。
         assert_eq!(store.get().theme_surface, "#f4efe6");
 
@@ -5126,7 +5454,7 @@ mod tests {
         .unwrap();
         let store = ConfigStore::load(dark);
         assert_eq!(store.get().theme_dark_surface, "#151519");
-        assert_eq!(store.get().theme_light_surface, "");
+        assert_eq!(store.get().theme_light_surface, DEFAULT_LIGHT_SURFACE);
 
         // 已经是新版本、档位被用户清空：不能再搬回来（迁移只按 rev 走一次）。
         let cleared = dir.join("cleared.json");
@@ -5137,7 +5465,8 @@ mod tests {
         )
         .unwrap();
         let store = ConfigStore::load(cleared);
-        assert!(store.get().theme_light_surface.is_empty());
+        // rev 72 之前还空着的底色会被填成新默认（那之后自己清空的不会再被填）。
+        assert_eq!(store.get().theme_light_surface, DEFAULT_LIGHT_SURFACE);
         assert!(store.get().theme_light_accent.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6306,8 +6635,11 @@ mod tests {
         std::fs::write(&path, legacy).expect("写临时配置");
         let config = ConfigStore::load(path.clone()).get().clone();
         assert!(config.theme_follow_system, "老配置要跟着新默认切到跟随系统");
-        // 主题名不搬：槽位空着就落到那一档的默认主题（见 `gui::theme_choice`）。
-        assert_eq!(config.theme, "Bolume Gray", "固定模式那套名字留着，切回来还在");
+        // 主题预设没了：老配置里的主题名读进来就丢掉，外观只认底色 + 强调色。
+        assert_eq!(
+            config.theme_light_surface, DEFAULT_LIGHT_SURFACE,
+            "空着的亮色档要填成默认底色"
+        );
         assert_eq!(config.config_rev, CONFIG_REV);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6754,5 +7086,140 @@ mod tests {
         // 越界的下标回落到第一项，不会 panic。
         assert_eq!(PanelLayout::from_index(99), PanelLayout::Horizontal);
         assert_eq!(DisplayNameMode::from_index(99), DisplayNameMode::Number);
+    }
+
+    /// 页脚默认就是老样子：左边 WiFi / 蓝牙、右边响度均衡 / 混音器 / 设置 / 置顶。
+    #[test]
+    fn footer_default_matches_the_old_row() {
+        let footer = FooterConfig::default();
+        let left: Vec<&str> = footer
+            .items
+            .iter()
+            .filter(|item| item.side.is_left())
+            .map(|item| item.id.as_str())
+            .collect();
+        let right: Vec<&str> = footer
+            .items
+            .iter()
+            .filter(|item| !item.side.is_left())
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(left, ["wifi", "bluetooth"]);
+        assert_eq!(right, ["loudness", "mixer", "settings", "pin"]);
+        assert!(footer.items.iter().all(|item| item.visible));
+    }
+
+    /// 组内换序：插到谁前面就是谁前面，拖回原处不算改动。
+    #[test]
+    fn footer_place_reorders_within_one_group() {
+        let mut footer = FooterConfig::default();
+        let right = |footer: &FooterConfig| -> Vec<String> {
+            footer
+                .items
+                .iter()
+                .filter(|item| !item.side.is_left())
+                .map(|item| item.id.clone())
+                .collect()
+        };
+        // 混音器拖到响度均衡前面。
+        assert!(footer.place("mixer", FooterSide::Right, Some("loudness"), false));
+        assert_eq!(right(&footer), ["mixer", "loudness", "settings", "pin"]);
+        // 同一个落点再放一次：位置没变，就不算改动（不会为了空操作落一次盘）。
+        assert!(!footer.place("mixer", FooterSide::Right, Some("loudness"), false));
+        // 拖到自己身上同理：插到自己前面等于没动，不能顺势滑到组尾。
+        assert!(!footer.place("mixer", FooterSide::Right, Some("mixer"), false));
+        assert_eq!(right(&footer), ["mixer", "loudness", "settings", "pin"]);
+        // 左侧那组一个字都没动。
+        let left: Vec<String> = footer
+            .items
+            .iter()
+            .filter(|item| item.side.is_left())
+            .map(|item| item.id.clone())
+            .collect();
+        assert_eq!(left, ["wifi", "bluetooth"]);
+    }
+
+    /// 跨组搬家：`None` = 放到那一组的末尾。
+    #[test]
+    fn footer_place_moves_between_groups() {
+        let mut footer = FooterConfig::default();
+        let left = |footer: &FooterConfig| -> Vec<String> {
+            footer
+                .items
+                .iter()
+                .filter(|item| item.side.is_left())
+                .map(|item| item.id.clone())
+                .collect()
+        };
+        let right = |footer: &FooterConfig| -> Vec<String> {
+            footer
+                .items
+                .iter()
+                .filter(|item| !item.side.is_left())
+                .map(|item| item.id.clone())
+                .collect()
+        };
+        // 设置拖到左边那组的末尾。
+        assert!(footer.place("settings", FooterSide::Left, None, false));
+        assert_eq!(left(&footer), ["wifi", "bluetooth", "settings"]);
+        assert_eq!(right(&footer), ["loudness", "mixer", "pin"]);
+
+        // 蓝牙拖到右边那组的**最前面**。
+        assert!(footer.place("bluetooth", FooterSide::Right, Some("loudness"), false));
+        assert_eq!(left(&footer), ["wifi", "settings"]);
+        assert_eq!(
+            right(&footer),
+            ["bluetooth", "loudness", "mixer", "pin"]
+        );
+    }
+
+    /// 从「未放置」放回来 = 摆到右边末尾 + 取消隐藏。
+    #[test]
+    fn footer_place_can_restore_a_hidden_item() {
+        let mut footer = FooterConfig::default();
+        footer.set_visible("pin", false);
+        assert!(!footer.is_visible("pin"));
+        assert!(footer.place("pin", FooterSide::Right, None, true));
+        assert!(footer.is_visible("pin"));
+        assert_eq!(
+            footer.items.last().map(|item| item.id.as_str()),
+            Some("pin")
+        );
+        // 认不出来的 id：认了但不动，别 panic。
+        assert!(!footer.place("gone", FooterSide::Left, None, true));
+    }
+
+    /// 老配置里没有 `footer` 字段：读进来就是默认那一排，不会凭空少几个按钮。
+    #[test]
+    fn footer_defaults_when_missing_from_config() {
+        let old: Config = serde_json::from_str("{\"config_rev\": 71}").unwrap();
+        assert_eq!(old.footer.items.len(), FOOTER_ITEMS.len());
+        assert!(old.footer.is_visible("settings"));
+
+        // 只存了一个按钮的老配置：认得出的保留，其余按注册表补齐。
+        let mut partial: Config = serde_json::from_str(
+            "{\"footer\":{\"items\":[{\"id\":\"pin\",\"visible\":false,\"side\":\"Right\"}]}}",
+        )
+        .unwrap();
+        assert_eq!(partial.footer.items.len(), 1, "读的时候不补，补在 store 里");
+        assert!(partial.footer.ensure_all());
+        assert_eq!(partial.footer.items.len(), FOOTER_ITEMS.len());
+        // 已有的那一条一个字都不动。
+        assert!(!partial.footer.is_visible("pin"));
+        // 再跑一次没有变化（幂等）。
+        assert!(!partial.footer.ensure_all());
+    }
+
+    /// 认不出来的 id（手改过配置 / 从新版降级）留着不删，渲染时跳过。
+    #[test]
+    fn footer_keeps_unknown_ids() {
+        let mut footer: FooterConfig = serde_json::from_str(
+            "{\"items\":[{\"id\":\"gone\",\"visible\":true,\"side\":\"Left\"}]}",
+        )
+        .unwrap();
+        footer.ensure_all();
+        assert!(footer.index_of("gone").is_some());
+        assert!(footer_spec("gone").is_none());
+        assert_eq!(footer.items.len(), FOOTER_ITEMS.len() + 1);
     }
 }

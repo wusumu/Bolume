@@ -56,6 +56,9 @@ struct AppState {
     settings: RefCell<Option<WindowHandle<Settings>>>,
     /// 托盘的「跟随主题」右键菜单（自绘）。原生菜单模式下它一直藏着。
     tray_menu: RefCell<Option<WindowHandle<crate::windows::TrayMenu>>>,
+    /// 应用右键菜单（自绘）：单独一扇小窗，尺寸只跟菜单内容走 ——
+    /// 画在面板里会被面板窗口裁掉（竖向排版的面板只有一百多像素高）。
+    app_menu: RefCell<Option<WindowHandle<crate::windows::AppMenu>>>,
     /// 显示器亮度窗口（只在启用亮度调节时显示）。
     brightness: RefCell<Option<WindowHandle<Brightness>>>,
     /// 屏幕提示条（OSD）：只在真的要用时创建，和亮度窗一样省一份合成表面。
@@ -135,7 +138,7 @@ pub fn run(
     osd_demo_media: bool,
     osd_demo_value: f32,
 ) {
-    const INSTANCE_NAME: &str = "Bolume.SingleInstance";
+    const INSTANCE_NAME: &str = crate::platform::single_instance::INSTANCE_NAME;
     // 重启副本：旧进程这会儿还在退出途中，锁还没松 —— 等一会儿再抢，
     // 不能像普通第二次启动那样直接「唤醒已有实例」然后自己退场。
     let acquired = if restart_wait {
@@ -180,24 +183,44 @@ pub fn run(
         display_engine.send(crate::display::DisplayCommand::Refresh);
     }
 
-    // 自启动状态与注册表对账：**注册表才是事实**，配置只跟着记一笔。
+    // 自启动状态与系统对账：**系统里登记的才是事实**，配置只跟着记一笔。
     //
     // 三件事都在这里做：
-    //  * 用户在任务管理器「启动」页里关掉 / 打开过 → 配置跟着改，设置页才不会一直显示错；
-    //  * 便携版移动了目录 → 把 `Run` 里那条路径改到当前 exe；
+    //  * 用户在任务管理器「启动」页里关掉 / 打开过、或者删掉了计划任务 → 配置跟着改，
+    //    设置页才不会一直显示错；
+    //  * 便携版移动了目录 → 把登记的那条路径改到当前 exe；
     //  * 两边都没有 → 配置也置为关闭。
     //
-    // 反过来的方向（配置开着、注册表里没有）不再自动补写：那多半是用户在任务管理器里
-    // 关掉的，替他重开等于跟用户对着干。
+    // 反过来的方向（配置开着、系统里没有）不再自动补写：那多半是用户自己关掉的，
+    // 替他重开等于跟用户对着干。
+    //
+    // 方式（注册表 / 计划任务）以**实际登记在哪边**为准：用户在任务计划程序里
+    // 手动删了任务、又自己加了注册表启动项，那就该按注册表那套走。
     {
-        let actual = crate::platform::autostart::is_enabled();
-        if actual {
-            crate::platform::autostart::ensure_path();
+        let method = crate::platform::autostart::detected()
+            .unwrap_or(config.borrow().get().launch_method);
+        let admin = config.borrow().get().run_as_admin;
+        // 三档里只留一档（老版本残留、或者用户自己加过注册表那一条）：
+        // 不去重的话会启动两次 —— 第二次虽然被单实例挡掉，但会平白弹一下面板。
+        for other in crate::config::LaunchMethod::ALL {
+            if other != method {
+                crate::platform::autostart::remove(other);
+            }
         }
-        if config.borrow().get().launch_at_login != actual {
-            let _ = config
-                .borrow_mut()
-                .update(|config| config.launch_at_login = actual);
+        let actual = crate::platform::autostart::is_enabled(method);
+        if actual {
+            crate::platform::autostart::ensure_path(method, admin);
+        }
+        let stale = {
+            let store = config.borrow();
+            let current = store.get();
+            current.launch_at_login != actual || current.launch_method != method
+        };
+        if stale {
+            let _ = config.borrow_mut().update(|config| {
+                config.launch_at_login = actual;
+                config.launch_method = method;
+            });
         }
     }
 
@@ -209,17 +232,8 @@ pub fn run(
     // 响度均衡：参数和单应用开关都在音频线程里生效。
     sync_loudness(&engine, &cfg0);
 
-    // 主题：全部内置，配置里存的是主题名。
-    // 名字对不上（改过名的老配置）就退回默认主题，并把配置改回真实生效的那个。
-    // 「跟随系统」时按系统亮暗从两个槽位里挑，写回的也是对应的那个槽位。
-    let wanted_theme = theme_name(&cfg0);
-    let applied_theme = theme::init(&wanted_theme);
-    if applied_theme != wanted_theme {
-        let _ = config
-            .borrow_mut()
-            .update(|config| set_theme_name(config, &applied_theme));
-    }
-    // 主题之上还有三样用户自己的东西：自选底色、自选强调色、字号缩放。
+    // 配色：打底深 / 浅两套模板，再叠用户自选的底色 / 强调色（没有主题预设了）。
+    // 「跟随系统」时模板跟着 Windows 的亮暗走，否则固定用深色那套。
     apply_theme_extras(&cfg0);
 
     // 全局快捷键：EarTrumpet 的 HotkeyManager。注册在独立的消息线程里，
@@ -312,6 +326,7 @@ pub fn run(
                 flyout: RefCell::new(None),
                 settings: RefCell::new(None),
                 tray_menu: RefCell::new(None),
+                app_menu: RefCell::new(None),
                 brightness: RefCell::new(None),
                 osd: RefCell::new(Vec::new()),
                 osd_editor: RefCell::new(None),
@@ -507,6 +522,57 @@ pub fn run(
                         .replace(handle);
                 }
                 Err(error) => eprintln!("无法创建托盘菜单窗口：{error}"),
+            }
+
+            // 应用右键菜单：同样隐藏创建，右键时按点在屏幕上的位置摆好再露头。
+            //
+            // 这扇窗用 `configure_osd` 那套（保留 `WS_EX_NOACTIVATE`）：菜单弹出时
+            // 绝不能把面板挤到后台 —— 面板一失焦就自动收起了，菜单就成了孤儿。
+            let app_menu_options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(216.), px(160.)),
+                ))),
+                kind: WindowKind::PopUp,
+                display_id: primary_id,
+                titlebar: Some(TitlebarOptions {
+                    appears_transparent: true,
+                    ..Default::default()
+                }),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                focus: false,
+                show: false,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                window_min_size: Some(size(px(120.), px(24.))),
+                ..Default::default()
+            };
+            match cx.open_window(app_menu_options, {
+                let config = config.clone();
+                let snapshot = shared_snapshot.clone();
+                let engine = engine.clone();
+                move |window, cx| {
+                    platform::configure_osd(window);
+                    platform::set_opacity(window, 0.0);
+                    window.refresh();
+                    cx.new(|_| {
+                        crate::windows::AppMenu::new(
+                            config.clone(),
+                            snapshot.clone(),
+                            engine.clone(),
+                        )
+                    })
+                }
+            }) {
+                Ok(handle) => {
+                    cx.global::<AppState>()
+                        .app_menu
+                        .borrow_mut()
+                        .replace(handle);
+                }
+                Err(error) => eprintln!("无法创建应用菜单窗口：{error}"),
             }
 
             // 托盘动作分发
@@ -765,6 +831,46 @@ pub fn run(
         });
 }
 
+/// 面板组（音量面板 + 亮度卡片）压回「任务栏之后」。
+///
+/// 两扇窗都是 topmost。被激活（用户点一下）的那一刻，系统会把它提到 topmost 组
+/// 最前面 —— 于是它比任务栏还靠前，收起时整段滑动就从任务栏**前面**划过去。
+/// 所以在激活时把两扇窗都重新插回任务栏后面（topmost 组里仅次于任务栏：
+/// 比别的置顶小工具都靠前，又不会压住任务栏）。
+///
+/// `window` / `visible` 是刚刚被激活的那扇窗：它正在自己的回调里，不能再 `update`。
+fn sink_panel_group(
+    window: &gpui::Window,
+    visible: bool,
+    self_is_brightness: bool,
+    cx: &mut App,
+) {
+    use crate::windows::platform;
+    if visible {
+        platform::present_behind_taskbar(window);
+    }
+    // 激活会让这一组窗口一起跳到最前面，另一扇也得压回去。
+    if self_is_brightness {
+        let handle = cx.global::<AppState>().flyout.borrow().clone();
+        if let Some(handle) = handle {
+            let _ = handle.update(cx, |flyout, window, _| {
+                if flyout.is_visible() {
+                    platform::present_behind_taskbar(window);
+                }
+            });
+        }
+    } else {
+        let handle = cx.global::<AppState>().brightness.borrow().clone();
+        if let Some(handle) = handle {
+            let _ = handle.update(cx, |view, window, _| {
+                if view.is_visible() {
+                    platform::present_behind_taskbar(window);
+                }
+            });
+        }
+    }
+}
+
 fn observe_activation(
     flyout: &mut Flyout,
     window: &mut gpui::Window,
@@ -776,6 +882,9 @@ fn observe_activation(
     cx.observe_window_activation(window, move |flyout, window, cx| {
         let active = window.is_window_active();
         let hide_on_blur = flyout.config.borrow().get().hide_on_focus_lost;
+        if active && !was_active {
+            sink_panel_group(window, flyout.is_visible(), false, cx);
+        }
         // 钉住的面板不等焦点：点别的窗口也赖在那儿（这正是「置顶」的意义）。
         if was_active && !active && hide_on_blur && flyout.is_visible() && !flyout.is_pinned() {
             // 点到亮度窗口上也算「还在这一组面板里」，不能把面板收掉：
@@ -796,8 +905,11 @@ fn observe_brightness_activation(
 ) {
     let _ = view;
     let mut was_active = false;
-    cx.observe_window_activation(window, move |_, window, cx| {
+    cx.observe_window_activation(window, move |view, window, cx| {
         let active = window.is_window_active();
+        if active && !was_active {
+            sink_panel_group(window, view.is_visible(), true, cx);
+        }
         if was_active && !active {
             schedule_group_blur_check(cx);
         }
@@ -980,7 +1092,9 @@ fn show_brightness(cx: &mut App) {
     if let Some(handle) = handle {
         let _ = handle.update(cx, |view, window, cx| {
             if view.is_visible() {
-                crate::windows::platform::bring_to_front(window);
+                // 已经在屏幕上：只压回「任务栏之后」，别再往上提。
+                // 用 `bring_to_front` 会把它插到任务栏**前面**，收起时就从上面划过去。
+                crate::windows::platform::present_behind_taskbar(window);
             } else {
                 view.show(window, cx);
             }
@@ -1000,6 +1114,8 @@ fn hide_brightness(cx: &mut App) {
 /// 钉住（页脚的置顶按钮）的面板不走：钉住的意思就是「别自己消失」，
 /// 这是自动收起的最后一道闸，别的失焦路径漏了也在这儿兜住。
 fn hide_flyout(cx: &mut App) {
+    // 面板一收，它上面那份右键菜单也跟着收：菜单是独立窗口，不会自己跟着走。
+    hide_app_menu(cx);
     let handle = cx.global::<AppState>().flyout.borrow().clone();
     if let Some(handle) = handle {
         let _ = handle.update(cx, |flyout, window, cx| {
@@ -1023,41 +1139,12 @@ pub fn refresh_brightness_window(cx: &mut App) {
     }
 }
 
-/// 当前该用哪套主题：跟随系统时按系统亮暗挑槽位，否则就是用户选的那套。
+/// 打底用哪种模板：跟着 Windows 亮暗（且开了跟随系统）时按系统走，否则一律深色。
 ///
-/// 槽位是空串（老配置 / 用户清空）时退回那一档的默认主题 —— 亮色槽不能掉进深色主题里。
-fn theme_choice(config: &Config) -> (String, &'static str) {
-    let dark = crate::platform::system_theme::is_dark();
-    if config.theme_follow_system {
-        let (slot, fallback) = if dark {
-            (&config.theme_dark, theme::DEFAULT_DARK_THEME)
-        } else {
-            (&config.theme_light, theme::DEFAULT_LIGHT_THEME)
-        };
-        let name = slot.trim();
-        let name = if name.is_empty() { fallback } else { name };
-        (name.to_string(), fallback)
-    } else {
-        (config.theme.clone(), theme::DEFAULT_THEME)
-    }
-}
-
-/// 当前生效的主题名（跟随系统时已经按系统亮暗解析过）。
-pub fn theme_name(config: &Config) -> String {
-    theme_choice(config).0
-}
-
-/// 把「真正生效的主题名」写回它该在的槽位：跟随系统时写当前那一档。
-pub fn set_theme_name(config: &mut Config, name: &str) {
-    if config.theme_follow_system {
-        if crate::platform::system_theme::is_dark() {
-            config.theme_dark = name.to_string();
-        } else {
-            config.theme_light = name.to_string();
-        }
-    } else {
-        config.theme = name.to_string();
-    }
+/// 固定模式下选浅色底也行 —— 底色自己会决定文字 / 描边的明暗，
+/// 这里的模板只负责「用户还没选底色时长什么样」。
+pub fn base_is_dark(config: &Config) -> bool {
+    !config.theme_follow_system || crate::platform::system_theme::is_dark()
 }
 
 /// 当前该用哪一套自选底色 / 强调色：跟随时取当前那一档自己的，否则取全局那对。
@@ -1066,8 +1153,8 @@ pub fn set_theme_name(config: &mut Config, name: &str) {
 /// 跟随系统一换档长得一模一样，用户会以为「没切换」。
 ///
 /// 强调色那一格空着 = **跟随 Windows 的强调色**（色块行第一个「跟随」就是它），
-/// 读不到系统的（键被策略锁住 / 不是 Windows）才退回主题自带的那一抹。
-/// 底色空着仍是「用这套主题自己的底色」。
+/// 读不到系统的（键被策略锁住 / 不是 Windows）才退回模板自带的那一抹。
+/// 底色空着 = 用模板自己的底色。
 pub fn theme_custom(config: &Config) -> (String, String) {
     let (surface, accent) = active_custom_slots(config);
     let accent = if accent.trim().is_empty() {
@@ -1096,18 +1183,16 @@ pub fn accent_follows_system(config: &Config) -> bool {
     active_custom_slots(config).1.trim().is_empty()
 }
 
-/// 把主题之外的几项外观设置推进界面层：自选底色、自选强调色、对比度、
+/// 把配色与几项外观设置推进界面层：打底模板、自选底色、自选强调色、对比度、
 /// 设置窗字号、界面不透明度、界面字体。
 ///
-/// 换主题名的时候必须跟着调一次（不然自定义色会被新主题整个盖掉），
-/// 改这几项里任何一项也要调。
+/// 改这几项里任何一项都要调一次，顺序不能反（先模板、后叠自选色）。
 pub fn apply_theme_extras(config: &Config) {
-    // 先按主题名重建一遍调色板，再叠自选色。
+    // 先把调色板重置成模板，再叠自选色。
     //
-    // `apply_custom` 只会在**当前**调色板上盖一层：自选色被清空（回到跟随主题）时，
+    // `apply_custom` 只会在**当前**调色板上盖一层：自选色被清空（点掉已选中的色块）时，
     // 直接在旧调色板上叠空串是撤不掉的 —— 窗口会一直停在最后一次自选的颜色上。
-    let (name, fallback) = theme_choice(config);
-    theme::apply_or(&name, fallback);
+    theme::set_mode(base_is_dark(config));
     let (surface, accent) = theme_custom(config);
     theme::apply_custom(&surface, &accent, config.ui_contrast);
     theme::set_font_scale(config.ui_font_scale as f32 / 100.0);
@@ -1180,6 +1265,17 @@ pub fn refresh_flyout_size(cx: &mut App) {
         let _ = handle.update(cx, |flyout, window, cx| flyout.refresh_layout(window, cx));
     }
     refresh_brightness_window(cx);
+}
+
+/// 设置页改了页脚按钮（放哪些、摆哪边、什么顺序）之后调一次。
+///
+/// 只刷开着的面板；关着的时候不用管，下次弹出直接读新配置 ——
+/// 为此把面板预览出来太打扰。
+pub fn refresh_flyout_footer(cx: &mut App) {
+    let handle = cx.global::<AppState>().flyout.borrow().clone();
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |flyout, window, cx| flyout.refresh_footer(window, cx));
+    }
 }
 
 /// 设置窗关掉时把它弹出来的面板一起收走。
@@ -2185,8 +2281,118 @@ fn apply_tray_menu(tray: &Rc<Tray>, devices: &[crate::audio::DeviceInfo], cfg: &
     tray.set_menu(build_tray_menu(cfg.language, devices, cfg));
 }
 
+/// 弹出应用右键菜单（面板里右键某个应用时调）。
+///
+/// `at` 是右键点在**屏幕**上的逻辑坐标。菜单是独立小窗，尺寸只跟内容走，
+/// 不再受面板窗口限制 —— 竖向排版的面板只有一百多像素高，画在里面根本放不下。
+pub(crate) fn open_app_menu(
+    cx: &mut App,
+    target: crate::windows::app_menu::MenuTarget,
+    at: (f32, f32),
+) {
+    let handle = cx.global::<AppState>().app_menu.borrow().clone();
+    let Some(handle) = handle else {
+        return;
+    };
+    // 托盘菜单开着就先收掉：两层菜单叠一起没法点。
+    hide_tray_menu(cx);
+    let _ = handle.update(cx, |menu, window, cx| {
+        menu.show_for(target, at, window, cx);
+    });
+}
+
+/// 应用右键菜单开着没有（面板那边要据此决定挂不挂悬停提示）。
+pub(crate) fn app_menu_visible(cx: &mut App) -> bool {
+    let handle = cx.global::<AppState>().app_menu.borrow().clone();
+    handle
+        .map(|handle| {
+            handle
+                .update(cx, |menu, _, _| menu.is_visible())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 收起应用右键菜单（面板收起、点了面板别处、打开设置时调）。
+pub(crate) fn hide_app_menu(cx: &mut App) {
+    let handle = cx.global::<AppState>().app_menu.borrow().clone();
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |menu, window, cx| {
+            if menu.is_visible() {
+                menu.hide(window, cx);
+            }
+        });
+    }
+}
+
+/// 应用右键菜单里的一项被点了。
+pub(crate) fn run_app_menu_action(
+    cx: &mut App,
+    target: &crate::windows::app_menu::MenuTarget,
+    action: crate::windows::app_menu::Action,
+) {
+    use crate::windows::app_menu::Action;
+    let (engine, config, flyout) = {
+        let state = cx.global::<AppState>();
+        (
+            state.engine.clone(),
+            state.config.clone(),
+            state.flyout.borrow().clone(),
+        )
+    };
+    match action {
+        Action::Rename => {
+            // 改名还是留在面板里（要用面板窗口的输入法焦点）。
+            let Some(flyout) = flyout else {
+                return;
+            };
+            let (x, y) = target.anchor;
+            let _ = flyout.update(cx, |flyout, window, cx| {
+                flyout.begin_rename(&target.key, &target.name, x, y, window, cx);
+            });
+        }
+        Action::ToggleHidden => {
+            let key = target.key.clone();
+            let hidden = !target.hidden;
+            let _ = config.borrow_mut().update(|config| {
+                config.hidden_apps.retain(|existing| existing != &key);
+                if hidden {
+                    config.hidden_apps.push(key.clone());
+                }
+            });
+            if let Some(flyout) = flyout {
+                let _ = flyout.update(cx, |flyout, window, cx| {
+                    // 折叠会改列表行数 / 列数，窗口尺寸得跟着重算。
+                    flyout.update_frame(window, cx);
+                    cx.notify();
+                });
+            }
+        }
+        Action::ToggleLoudness => {
+            let on = !target.loudness;
+            let mut changed = false;
+            let _ = config.borrow_mut().update(|config| {
+                changed = config.set_app_loudness(&target.key, Some(on));
+            });
+            if changed {
+                sync_loudness(&engine, config.borrow().get());
+            }
+            cx.refresh_windows();
+        }
+        Action::Route(device_id) => {
+            engine.send(AudioCommand::SetAppDevice {
+                pid: target.pid,
+                device_id,
+            });
+            cx.refresh_windows();
+        }
+    }
+}
+
 /// 右键托盘图标：弹自绘菜单（已经在显示就收起，第二次右键等于关掉）。
 pub(crate) fn open_tray_menu(cx: &mut App) {
+    // 应用菜单开着就先收掉：两层菜单叠一起没法点。
+    hide_app_menu(cx);
     let (style, handle) = {
         let state = cx.global::<AppState>();
         let style = state.config.borrow().get().tray_menu_style;

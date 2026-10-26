@@ -14,8 +14,8 @@ use std::{
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, ElementId, IntoElement, MouseButton,
-    MouseDownEvent, Pixels, Render, RenderImage, SharedString, TextRun, Window, div, img, point,
-    px, size,
+    MouseDownEvent, MouseUpEvent, Pixels, Render, RenderImage, SharedString, TextRun, Window, div,
+    img, point, px, size,
 };
 
 use crate::windows::platform::TaskbarEdge;
@@ -27,21 +27,11 @@ use crate::{
     config::{Config, ConfigStore},
     i18n::Lang,
     ui::{
-        ActivityState, Entrance, EntranceMotion, SliderDragState, VolumeSlider, anim, device_icon_resolved, icon,
-        load_png_rgba, theme, volume_icon_name, wheel_direction,
+        ActivityState, Entrance, EntranceMotion, SliderDragState, VolumeSlider, anim,
+        device_icon_resolved, icon, load_png_rgba, theme, wheel_direction,
     },
 };
 
-/// 应用条目右键菜单的尺寸（用于把菜单夹在窗口内）。
-///
-/// 菜单里除了「折叠 / 展开」还要摆一整串播放设备，168 太窄，
-/// 设备名（`Headphones (Meizu HiFi DAC…)`）会全被截掉。
-const MENU_WIDTH: f32 = 216.0;
-/// 菜单每一项的高度 / 上下内边距 / 分隔线与小标题占的高度。
-const MENU_ITEM: f32 = 28.0;
-const MENU_PAD: f32 = 4.0;
-const MENU_SEPARATOR: f32 = 9.0;
-const MENU_CAPTION: f32 = 20.0;
 /// 应用图标右上角的「已单独指定设备」标记直径。
 const ROUTE_BADGE: f32 = 6.0;
 /// 算「正在发声」的电平门槛。
@@ -50,6 +40,13 @@ const ROUTE_BADGE: f32 = 6.0;
 /// 照那个门槛排会让列表一直微微跳。过了这道门槛的应用会被记住（见 `promoted`），
 /// 之后哪怕声音落回去也不再挪位 —— 门槛只决定「什么时候挤进前排」。
 const SOUNDING_PEAK: f32 = 0.012;
+
+/// 面板开着时，多久对一次系统的 WiFi / 蓝牙状态（毫秒）。
+///
+/// 用户改无线电的操作都在面板外面（托盘、快速设置、设置页），我们收不到通知，
+/// 只能轮询。1.2 秒是「够快」和「别一直开后台线程跑 COM」之间的折中 ——
+/// 每次读都要起一个线程枚举一遍 `Radio::GetRadiosAsync`。
+const RADIO_POLL_MS: u64 = 1200;
 
 /// 竖向排版（一路一条推子，像调音台）的尺寸。
 ///
@@ -343,8 +340,6 @@ pub struct Flyout {
     hover_tip: Rc<RefCell<Option<HoverTip>>>,
     /// 提示的请求序号：移开 / 换图标就推一格，晚到的定时器看见序号变了就退场。
     hover_tip_seq: Rc<Cell<u64>>,
-    /// 应用条目右键菜单（窗口坐标），None 表示没打开。
-    menu: Rc<RefCell<Option<AppMenu>>>,
     /// 设备切换菜单（窗口坐标），None 表示没打开。
     device_menu: Rc<RefCell<Option<DeviceMenu>>>,
     /// 是否把「已折叠」的应用也展开出来。只在本次打开面板期间有效。
@@ -392,29 +387,18 @@ pub struct Flyout {
     text_marked: Option<std::ops::Range<usize>>,
     /// 改名输入框画在哪：输入法要把候选窗摆到它旁边。
     rename_bounds: Rc<Cell<Option<gpui::Bounds<Pixels>>>>,
-}
-
-/// 应用条目的右键菜单。
-#[derive(Clone)]
-struct AppMenu {
-    key: String,
-    name: String,
-    /// 当前是否已被折叠（决定菜单显示「折叠」还是「展开」）。
-    hidden: bool,
-    /// 这个应用当前是否在做响度均衡（决定菜单项前的勾）。
-    loudness: bool,
-    /// 系统声音：不给开响度均衡（音频线程那边也会跳过它）。
-    is_system: bool,
-    /// 这个应用被单独指定到的设备；`None` = 跟随系统默认设备。
-    device_id: Option<String>,
-    /// 应用进程 id（改路由按 pid 下发）。
-    pid: u32,
-    /// 能不能改：系统声音没有独立会话，未公开接口拿不到时也不给改。
-    movable: bool,
-    x: f32,
-    y: f32,
-    /// 菜单实际宽度：竖向排版的面板只有一百多像素宽，写死 216 会伸到窗口外被裁掉。
-    width: f32,
+    /// WiFi 无线电开关状态；`None` = 还没读过。
+    wifi_on: Rc<Cell<Option<bool>>>,
+    /// 蓝牙无线电开关状态；同上。
+    bt_on: Rc<Cell<Option<bool>>>,
+    /// 面板可见期间那个「盯系统状态」的循环的代际号。
+    ///
+    /// 每次弹出都 +1，旧循环下一轮发现号不对就自己退出 —— 不然反复开关面板
+    /// 会堆起一堆并行的轮询。
+    radio_watch_token: Rc<Cell<u64>>,
+    /// 正在等 `SetStateAsync` 落地的操作数。非零时轮询先别插手，
+    /// 免得把用户刚点的那一下覆盖回旧值。
+    radio_busy: Rc<Cell<u32>>,
 }
 
 /// 设备名点开的「更换播放设备」菜单（浮层，不占布局）。
@@ -581,7 +565,6 @@ impl Flyout {
             hovered_name: Rc::new(RefCell::new(None)),
             hover_tip: Rc::new(RefCell::new(None)),
             hover_tip_seq: Rc::new(Cell::new(0)),
-            menu: Rc::new(RefCell::new(None)),
             device_menu: Rc::new(RefCell::new(None)),
             show_hidden: false,
             last_height: 0.0,
@@ -600,6 +583,10 @@ impl Flyout {
             rename: None,
             text_marked: None,
             rename_bounds: Rc::new(Cell::new(None)),
+            wifi_on: Rc::new(Cell::new(None)),
+            bt_on: Rc::new(Cell::new(None)),
+            radio_watch_token: Rc::new(Cell::new(0)),
+            radio_busy: Rc::new(Cell::new(0)),
         }
     }
 
@@ -716,54 +703,6 @@ impl Flyout {
         !app.is_system && self.snapshot.app_routing
     }
 
-    /// 右键菜单的高度：重命名 + 折叠 +（可改时）分隔线 / 小标题 / 设备列表。
-    ///
-    /// 用来把菜单夹在面板里 —— 设备多的机器上它会比面板还高，
-    /// 只能保证菜单顶边不越界（gpui 的浮层不做滚动）。
-    fn app_menu_height(&self, movable: bool, loudness: bool) -> f32 {
-        // 菜单行高是固定值（不跟面板字号缩放），这里照着常量算就行。
-        // 普通应用三行（重命名 / 折叠此应用 / 响度均衡），系统声音只有前两行。
-        let rows = if loudness { 3.0 } else { 2.0 };
-        let base = MENU_PAD * 2.0 + MENU_ITEM * rows;
-        if !movable {
-            return base;
-        }
-        let devices = self
-            .snapshot
-            .devices
-            .iter()
-            .filter(|device| device.enabled)
-            .count() as f32;
-        base + MENU_SEPARATOR + MENU_CAPTION + MENU_ITEM * (1.0 + devices)
-    }
-
-    fn set_hidden(&mut self, key: &str, hidden: bool) {
-        let key = key.to_string();
-        let _ = self.config.borrow_mut().update(|config| {
-            config.hidden_apps.retain(|existing| existing != &key);
-            if hidden {
-                config.hidden_apps.push(key.clone());
-            }
-        });
-    }
-
-    /// 打开 / 关掉这个应用的响度均衡。
-    ///
-    /// 设成和全局一样时配置里不会留条目（`set_app_loudness` 自己会清），
-    /// 这样以后改全局开关，没单独设过的应用都会跟着走。
-    fn set_app_loudness(&mut self, key: &str, enabled: bool) {
-        let key = key.to_string();
-        // 先落配置，再把结果推给音频线程 —— 推的时候要读配置，两段别套在一起。
-        let _ = self
-            .config
-            .borrow_mut()
-            .update(|config| {
-                config.set_app_loudness(&key, Some(enabled));
-            });
-        let config = self.config.borrow();
-        crate::gui::sync_loudness(&self.engine, config.get());
-    }
-
     /// 面板页脚那个按钮：一把开关全局响度均衡。
     ///
     /// 和设置页「全局响度均衡」写的是同一个字段（`config.loudness.enabled`），
@@ -776,6 +715,130 @@ impl Flyout {
         cx.notify();
     }
 
+    /// WiFi 开关状态（只读字段）。还没读到就按「关」显示。
+    ///
+    /// 真正的读取在 `show_inner`（弹出时读一次）和 `watch_radios`（开着期间每
+    /// 1.2 秒对一次）里 —— render 里不能 spawn，会把 App 重入借用。
+    fn wifi_on(&self, _cx: &mut Context<Self>) -> bool {
+        self.wifi_on.get().unwrap_or(false)
+    }
+
+    /// 蓝牙开关状态（只读字段）。同上。
+    fn bt_on(&self, _cx: &mut Context<Self>) -> bool {
+        self.bt_on.get().unwrap_or(false)
+    }
+
+    /// 后台读一次 WiFi / 蓝牙的实际开关状态，回到 UI 线程写进字段。
+    ///
+    /// 用 `std::thread::spawn`（不是 gpui 的 `background_executor`）：WinRT 的
+    /// `.join()` 会跑 COM 消息泵，放 gpui 线程池会把主线程重入、刷屏
+    /// `RefCell already borrowed`。结果经 `async_channel` 发回，UI 线程 receive。
+    ///
+    /// 值没变就不 `notify`：轮询每 1.2 秒跑一次，没必要每次都重画。
+    fn refresh_radios(&self, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::unbounded::<(bool, bool)>();
+        std::thread::spawn(move || {
+            let _ = tx.try_send(crate::platform::radio::enabled_both());
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok((wifi, bt)) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    let changed =
+                        this.wifi_on.get() != Some(wifi) || this.bt_on.get() != Some(bt);
+                    this.wifi_on.set(Some(wifi));
+                    this.bt_on.set(Some(bt));
+                    if changed {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 面板开着的时候盯着系统状态。
+    ///
+    /// 用户可能从任务栏托盘、快速设置、或者设置页里关掉 WiFi / 蓝牙 ——
+    /// 那些都不是我们改的，光在弹出时读一次会一直挂着旧状态（图标亮着，
+    /// 实际上早就断了）。所以整个可见期间每 1.2 秒对一次。
+    ///
+    /// 面板一收起，或者又弹了一次（`token` 变了），这条循环下一轮就自己退出。
+    fn watch_radios(&mut self, cx: &mut Context<Self>) {
+        let token = self.radio_watch_token.get().wrapping_add(1);
+        self.radio_watch_token.set(token);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(RADIO_POLL_MS))
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    if !this.visible || this.radio_watch_token.get() != token {
+                        return false;
+                    }
+                    // 正在等 SetStateAsync 落地时不插手，免得把用户刚点的覆盖回去。
+                    if this.radio_busy.get() == 0 {
+                        this.refresh_radios(cx);
+                    }
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 点 WiFi 双按钮的左半边：翻转开关，完成后按系统实际状态回写。
+    fn toggle_wifi(&mut self, cx: &mut Context<Self>) {
+        let want = !self.wifi_on(cx);
+        self.wifi_on.set(Some(want));
+        self.radio_busy.set(self.radio_busy.get() + 1);
+        let (tx, rx) = async_channel::unbounded::<bool>();
+        std::thread::spawn(move || {
+            let ok = crate::platform::radio::set_wifi_sync(want);
+            let _ = tx.try_send(ok);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(ok) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.wifi_on.set(Some(ok));
+                    this.radio_busy.set(this.radio_busy.get().saturating_sub(1));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 点蓝牙双按钮的左半边：同上。
+    fn toggle_bt(&mut self, cx: &mut Context<Self>) {
+        let want = !self.bt_on(cx);
+        self.bt_on.set(Some(want));
+        self.radio_busy.set(self.radio_busy.get() + 1);
+        let (tx, rx) = async_channel::unbounded::<bool>();
+        std::thread::spawn(move || {
+            let ok = crate::platform::radio::set_bluetooth_sync(want);
+            let _ = tx.try_send(ok);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(ok) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.bt_on.set(Some(ok));
+                    this.radio_busy.set(this.radio_busy.get().saturating_sub(1));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// WiFi 双按钮的右半边：展开系统 WiFi 列表。
+    /// 蓝牙双按钮的右半边：展开系统蓝牙设置页。
+    ///
+    /// 两者都在页脚里内联调 `shell::open_url("ms-availablenetworks:")` /
+    /// `shell::settings_page("bluetooth")`，这里不再单独包装。
+
     // ---------- 就地改名（右键 →「重命名」） ----------
     //
     // 面板平时不吃键盘，只有这一段会临时接管：输入框画在名字那一格，
@@ -785,6 +848,22 @@ impl Flyout {
     /// 这一行现在是不是正在改名。
     fn renaming(&self, key: &str) -> bool {
         self.rename.as_ref().is_some_and(|state| state.key == key)
+    }
+
+    /// 右键菜单（独立窗口）里点了「重命名」：转进就地改名。
+    ///
+    /// 菜单在另一扇窗里画，改名还是留在面板里做 —— 输入法焦点、字符提交都在
+    /// 面板那扇窗上。所以那边只把 key / 名字 / 点击点传过来。
+    pub(crate) fn begin_rename(
+        &mut self,
+        key: &str,
+        name: &str,
+        x: f32,
+        y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_rename(key, name.to_string(), x, y, window, cx);
     }
 
     /// 进入改名：把**自定义名**装进输入框（没改过就是空 + 占位提示），光标放末尾。
@@ -1345,6 +1424,8 @@ impl Flyout {
         let open_device_menu = cx.listener(
             move |_: &mut Self, _: &MouseDownEvent, window: &mut Window, cx| {
                 // 再点一下设备名就收起来（同一个按钮一开一关）。
+                // 正常路径是菜单的遮罩把这一下吃掉再收（见 `device_menu_view`），
+                // 这里留一份兜底：遮罩没盖住这块时也不会「点了没反应」。
                 if device_menu_slot.borrow().is_some() {
                     *device_menu_slot.borrow_mut() = None;
                     cx.notify();
@@ -1798,50 +1879,38 @@ impl Flyout {
             cx,
         );
 
-        // 右键菜单：把光标位置和当前隐藏状态记下来，菜单内容在 render 里画。
-        let menu_slot = self.menu.clone();
+        // 右键菜单交给独立小窗画：面板窗口太矮（竖排只有一百多像素），
+        // 菜单画在面板自己的浮层里会被窗口裁掉半截。
         let key_for_menu = key.clone();
+        let name_for_menu = name.clone();
         let hidden_for_menu = hidden;
         let loudness_for_menu = self.cfg().loudness_for(&key);
         let system_for_menu = app.is_system;
         let device_for_menu = app.device_id.clone();
         let pid_for_menu = app.pid;
         let movable_for_menu = self.is_movable(app);
-        let menu_height = self.app_menu_height(movable_for_menu, !app.is_system);
         let open_menu = cx.listener(
             move |this: &mut Self, event: &MouseDownEvent, window: &mut Window, cx| {
-                // 用真实窗口尺寸而不是 viewport_size：面板淡出时 viewport 报得比窗口高，
-                // 按它夹会把菜单放到窗口外面去（下半截被裁掉）。
-                let size = window.bounds().size;
-                // 竖向排版的面板只有一百多像素宽，固定 216 会伸到窗口外被裁掉，宽度跟着窗口走。
-                let menu_width = MENU_WIDTH.min((size.width.as_f32() - 8.0).max(80.0));
-                let x = event
-                    .position
-                    .x
-                    .as_f32()
-                    .min((size.width.as_f32() - menu_width - 4.0).max(4.0))
-                    .max(4.0);
-                let click_y = event.position.y.as_f32();
-                let height = size.height.as_f32();
-                // 默认在光标下方展开；下方放不下就翻到上方，两边都不够就贴顶。
-                let y = if click_y + menu_height + 6.0 <= height {
-                    click_y + 2.0
-                } else {
-                    (click_y - menu_height - 2.0).max(4.0)
-                };
-                *menu_slot.borrow_mut() = Some(AppMenu {
-                    key: key_for_menu.clone(),
-                    name: name.clone(),
-                    hidden: hidden_for_menu,
-                    loudness: loudness_for_menu,
-                    is_system: system_for_menu,
-                    device_id: device_for_menu.clone(),
-                    pid: pid_for_menu,
-                    movable: movable_for_menu,
-                    x,
-                    y,
-                    width: menu_width,
-                });
+                let anchor = (event.position.x.as_f32(), event.position.y.as_f32());
+                let origin = window.bounds().origin;
+                crate::gui::open_app_menu(
+                    cx,
+                    crate::windows::app_menu::MenuTarget {
+                        key: key_for_menu.clone(),
+                        name: name_for_menu.clone(),
+                        pid: pid_for_menu,
+                        is_system: system_for_menu,
+                        movable: movable_for_menu,
+                        device_id: device_for_menu.clone(),
+                        loudness: loudness_for_menu,
+                        hidden: hidden_for_menu,
+                        anchor,
+                    },
+                    (
+                        origin.x.as_f32() + anchor.0,
+                        origin.y.as_f32() + anchor.1,
+                    ),
+                );
                 // 打开菜单即视为不再悬停，免得名字继续滚动。
                 *this.hovered_name.borrow_mut() = None;
                 *this.hover_tip.borrow_mut() = None;
@@ -2057,6 +2126,14 @@ impl Flyout {
                 }
                 // 面板已经收起来了就别挂：这条会一直留在那块看不见的窗口里。
                 if !this.visible {
+                    return;
+                }
+                // 改名卡片已经弹出来了就别挂：提示条会压在输入框上面。
+                if this.rename.is_some() {
+                    return;
+                }
+                // 右键菜单开着也别挂：菜单是另一扇窗，提示条会在它旁边闪一下很怪。
+                if crate::gui::app_menu_visible(cx) {
                     return;
                 }
                 let tip = this.hover_tip_layout(tip);
@@ -2514,8 +2591,7 @@ impl Flyout {
             None
         };
 
-        // 右键菜单：和横排同一个浮层，位置按点击点算。
-        let menu_slot = self.menu.clone();
+        // 右键菜单：和横排同一扇独立小窗，位置按点在屏幕上的坐标算。
         let key_for_menu = key.clone();
         let hidden = self.is_hidden(&key);
         let loudness_for_menu = self.cfg().loudness_for(&key);
@@ -2524,42 +2600,29 @@ impl Flyout {
         let device_for_menu = app.device_id.clone();
         let pid_for_menu = app.pid;
         let movable_for_menu = self.is_movable(app);
-        let menu_height = self.app_menu_height(movable_for_menu, !app.is_system);
         let open_menu = cx.listener(
             move |this: &mut Self, event: &MouseDownEvent, window: &mut Window, cx| {
                 cx.stop_propagation();
-                // 用真实窗口尺寸而不是 viewport_size：面板淡出时 viewport 报得比窗口高，
-                // 按它夹会把菜单放到窗口外面去（下半截被裁掉）。
-                let size = window.bounds().size;
-                // 竖向排版的面板只有一百多像素宽，固定 216 会伸到窗口外被裁掉，宽度跟着窗口走。
-                let menu_width = MENU_WIDTH.min((size.width.as_f32() - 8.0).max(80.0));
-                let x = event
-                    .position
-                    .x
-                    .as_f32()
-                    .min((size.width.as_f32() - menu_width - 4.0).max(4.0))
-                    .max(4.0);
-                let click_y = event.position.y.as_f32();
-                let height = size.height.as_f32();
-                // 默认在光标下方展开；下方放不下就翻到上方，两边都不够就贴顶。
-                let y = if click_y + menu_height + 6.0 <= height {
-                    click_y + 2.0
-                } else {
-                    (click_y - menu_height - 2.0).max(4.0)
-                };
-                *menu_slot.borrow_mut() = Some(AppMenu {
-                    key: key_for_menu.clone(),
-                    name: name_for_menu.clone(),
-                    hidden,
-                    loudness: loudness_for_menu,
-                    is_system: system_for_menu,
-                    device_id: device_for_menu.clone(),
-                    pid: pid_for_menu,
-                    movable: movable_for_menu,
-                    x,
-                    y,
-                    width: menu_width,
-                });
+                let anchor = (event.position.x.as_f32(), event.position.y.as_f32());
+                let origin = window.bounds().origin;
+                crate::gui::open_app_menu(
+                    cx,
+                    crate::windows::app_menu::MenuTarget {
+                        key: key_for_menu.clone(),
+                        name: name_for_menu.clone(),
+                        pid: pid_for_menu,
+                        is_system: system_for_menu,
+                        movable: movable_for_menu,
+                        device_id: device_for_menu.clone(),
+                        loudness: loudness_for_menu,
+                        hidden,
+                        anchor,
+                    },
+                    (
+                        origin.x.as_f32() + anchor.0,
+                        origin.y.as_f32() + anchor.1,
+                    ),
+                );
                 *this.hovered_name.borrow_mut() = None;
                 *this.hover_tip.borrow_mut() = None;
                 cx.notify();
@@ -2733,238 +2796,23 @@ impl Flyout {
             .into_any_element()
     }
 
-    /// 应用条目的右键菜单：一层可点掉的遮罩 + 浮在上面的小卡片。
-    ///
-    /// 上半是「重命名 / 折叠」，下半（能改路由时）是这台应用用哪个播放设备 ——
-    /// 和 EarTrumpet 的「移动」按钮同一套语义：`默认设备` + 分隔线 + 每台设备，
-    /// 当前生效的那一项打勾。
-    fn context_menu(&self, menu: AppMenu, cx: &mut Context<Self>) -> AnyElement {
-        let lang = self.cfg().language;
-        let (label, next_hidden) = if menu.hidden {
-            (lang.pick("取消折叠此应用", "Uncollapse this app"), false)
-        } else {
-            (lang.pick("折叠此应用", "Collapse this app"), true)
-        };
-        let key = menu.key.clone();
-
-        let dismiss = cx.listener(|this: &mut Self, _, _, cx| {
-            *this.menu.borrow_mut() = None;
-            cx.notify();
-        });
-        let activate = cx.listener(move |this: &mut Self, _, window: &mut Window, cx| {
-            this.set_hidden(&key, next_hidden);
-            *this.menu.borrow_mut() = None;
-            // 折叠/展开会改变列表行数，窗口高度得跟着重新算。
-            this.update_frame(window, cx);
-            cx.notify();
-        });
-
-        // 「重命名」：收掉菜单，把这一行的名字换成输入框（回车落盘、Esc 取消）。
-        let rename_key = menu.key.clone();
-        let rename_placeholder = menu.name.clone();
-        let (menu_x, menu_y) = (menu.x, menu.y);
-        let start_rename = cx.listener(move |this: &mut Self, _, window: &mut Window, cx| {
-            *this.menu.borrow_mut() = None;
-            this.start_rename(
-                &rename_key,
-                rename_placeholder.clone(),
-                menu_x,
-                menu_y,
-                window,
-                cx,
-            );
-        });
-
-        let mut items = div().flex().flex_col()
-            .child(self.menu_row(
-                "app-menu-rename",
-                lang.pick("重命名", "Rename"),
-                None,
-                false,
-                start_rename,
-            ))
-            .child(self.menu_row("app-menu-hide", label, None, false, activate));
-
-        // 「响度均衡」：勾上就把这个应用的音量自动拉齐，不勾就按用户自己拖的来。
-        // 系统声音没有这一项（音频线程那边也会跳过它）。
-        if !menu.is_system {
-            let loudness_key = menu.key.clone();
-            let loudness_on = menu.loudness;
-            let toggle_loudness = cx.listener(move |this: &mut Self, _, _, cx| {
-                this.set_app_loudness(&loudness_key, !loudness_on);
-                // 点完就收：勾掉的时候音量会当场还原，菜单留着会挡住滑条
-                // 和读数，看不见它回到了哪儿。
-                *this.menu.borrow_mut() = None;
-                cx.notify();
-            });
-            items = items.child(self.menu_row(
-                "app-menu-loudness",
-                lang.pick("响度均衡", "Loudness equalization"),
-                None,
-                menu.loudness,
-                toggle_loudness,
-            ));
-        }
-
-        if menu.movable {
-            items = items
-                .child(
-                    div()
-                        .h(px(1.))
-                        .mx(px(6.))
-                        .my(self.su((MENU_SEPARATOR - 1.0) / 2.0))
-                        .bg(theme::border()),
-                )
-                .child(
-                    div()
-                        .h(self.su(MENU_CAPTION))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(self.fs(10.))
-                        .text_color(theme::text_tertiary())
-                        .child(lang.pick("指定此应用播放设备", "Playback device for this app")),
-                );
-
-            // 第一项永远是「跟随默认设备」—— 和 EarTrumpet 一样，
-            // 选它就是把这个应用的持久化设置清掉。
-            let engine = self.engine.clone();
-            let slot = self.menu.clone();
-            let pid = menu.pid;
-            let follow_default = cx.listener(move |this: &mut Self, _, _, cx| {
-                engine.send(AudioCommand::SetAppDevice {
-                    pid,
-                    device_id: None,
-                });
-                // 菜单留着：用户要能看见勾选跑到「跟随默认设备」上。
-                *slot.borrow_mut() = None;
-                cx.notify();
-                let _ = this;
-            });
-            items = items.child(self.menu_row(
-                "app-route-default",
-                lang.pick("跟随默认设备", "Default device"),
-                None,
-                menu.device_id.is_none(),
-                follow_default,
-            ));
-
-            let cfg = self.cfg();
-            for device in self.snapshot.devices.iter().filter(|device| device.enabled) {
-                let engine = self.engine.clone();
-                let slot = self.menu.clone();
-                let pid = menu.pid;
-                let device_id = device.id.clone();
-                let checked = menu.device_id.as_deref() == Some(device.id.as_str());
-                let select = cx.listener(move |_: &mut Self, _, _, cx| {
-                    engine.send(AudioCommand::SetAppDevice {
-                        pid,
-                        device_id: Some(device_id.clone()),
-                    });
-                    *slot.borrow_mut() = None;
-                    cx.notify();
-                });
-                items = items.child(self.menu_row(
-                    &format!("app-route-{}", device.id),
-                    &cfg.device_label(&device.id, &device.name),
-                    Some(device_icon_resolved(&cfg, &device.id, device.kind)),
-                    checked,
-                    select,
-                ));
-            }
-        }
-
-        div()
-            .absolute()
-            .size_full()
-            .on_mouse_down(MouseButton::Left, dismiss)
-            .child(
-                div()
-                    .absolute()
-                    .left(px(menu.x))
-                    .top(px(menu.y))
-                    .w(px(menu.width))
-                    .p(self.su(MENU_PAD))
-                    .flex()
-                    .flex_col()
-                    .rounded(px(theme::RADIUS_SMALL + 2.0))
-                    .bg(theme::surface_elevated())
-                    .border_1()
-                    .border_color(theme::border_strong())
-                    // 卡片自己吃掉按下事件：外面那层遮罩靠 `on_mouse_down` 收起菜单，
-                    // 不挡住的话点菜单项会先被遮罩清掉，菜单项的点击永远等不到。
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(items),
-            )
-            .into_any_element()
-    }
-
-    /// 菜单里的一行：可选图标 + 文字 +（选中时）右侧小圆点。
-    fn menu_row(
-        &self,
-        id: &str,
-        label: &str,
-        icon_name: Option<std::borrow::Cow<'static, str>>,
-        checked: bool,
-        on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        let mut row = div()
-            .id(SharedString::from(id.to_string()))
-            .h(self.su(MENU_ITEM))
-            .flex_none()
-            .px(px(8.))
-            .flex()
-            .items_center()
-            .gap(px(7.))
-            .rounded(px(theme::RADIUS_SMALL))
-            .cursor_pointer()
-            .hover(|style| style.bg(theme::surface_hover()))
-            .on_mouse_down(MouseButton::Left, on_click);
-        if let Some(name) = icon_name {
-            let color = if checked {
-                theme::accent()
-            } else {
-                theme::text_tertiary()
-            };
-            row = row.child(icon(&name, 13.0, color));
-        }
-        row.child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(self.fs(12.))
-                .text_color(if checked {
-                    theme::accent()
-                } else {
-                    theme::text_primary()
-                })
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .child(label.to_string()),
-        )
-        .when(checked, |style| {
-            style.child(
-                div()
-                    .size(px(6.))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme::accent()),
-            )
-        })
-        .into_any_element()
-    }
-
-    /// 「更换播放设备」浮层：点设备名弹出，选一个就设为默认设备。
+    /// 设备名点开的「更换播放设备」菜单：一层可点掉的遮罩 + 浮在上面的小卡片。
     ///
     /// 完全是绝对定位的浮层，不改面板尺寸，也不挤动下面任何一行。
     fn device_menu_view(&self, menu: DeviceMenu, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.cfg().language;
 
+        // 遮罩要把这一下**吃掉**：gpui 的鼠标事件是「所有命中框都收到」，
+        // 遮罩虽然盖在设备名上面，设备名那颗按钮照样会收到同一次按下。
+        // 只收菜单不吞事件的话，落在设备名上的第二下会「先关（这里）再开（按钮）」，
+        // 看起来就是点了没反应。吞掉之后：点别处 = 关闭，点设备名 = 也是关闭，
+        // 菜单里那几行自己 stop_propagation，选设备照旧。
         let dismiss = cx.listener(|this: &mut Self, _, _, cx| {
-            *this.device_menu.borrow_mut() = None;
-            cx.notify();
+            let was_open = this.device_menu.borrow_mut().take().is_some();
+            if was_open {
+                cx.stop_propagation();
+                cx.notify();
+            }
         });
 
         let mut items = div().flex().flex_col();
@@ -3126,6 +2974,9 @@ impl Flyout {
     ///
     /// `active` 时图标与文字都走强调色、垫一层淡底 —— 和置顶那个纯图标按钮
     /// 是同一套「亮着」的表示法。
+    ///
+    /// `label` 传空就是纯图标（收成 22×22，和 `footer_icon_button` 同宽）：
+    /// 竖排面板一列只有四十来像素，文字放不下。
     fn footer_label_button(
         &self,
         id: &'static str,
@@ -3139,80 +2990,248 @@ impl Flyout {
         } else {
             theme::text_tertiary()
         };
+        let with_text = !label.is_empty();
         let mut button = div()
             .id(id)
             .h(px(22.))
-            .px(px(8.))
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(5.))
+            .justify_center()
             .rounded(px(theme::RADIUS_SMALL))
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_hover()))
             .on_click(onclick)
-            .child(icon(name, 13.0, color))
-            .child(div().text_size(self.fs(11.)).text_color(color).child(label));
+            .child(icon(name, 13.0, color));
+        if with_text {
+            button = button
+                .px(px(8.))
+                .gap(px(5.))
+                .child(div().text_size(self.fs(11.)).text_color(color).child(label));
+        } else {
+            button = button.w(px(22.));
+        }
         if active {
             button = button.bg(theme::accent_soft());
         }
         button.into_any_element()
     }
 
-    fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let lang = self.cfg().language;
-        let loud_on = self.config.borrow().get().loudness.enabled;
-        // 从左到右：响度均衡 · 混音器 · 设置 · 置顶。
-        //
-        // 响度均衡这个按钮和设置页的「全局响度均衡」是同一个字段，改哪边都一样；
-        // 开着的时候图标和文字走强调色 + 淡底（和置顶按钮同一套「亮着」的表示）。
-        let mut actions = div().flex().items_center().gap(px(2.));
-        actions = actions.child(self.footer_label_button(
-            "toggle-loudness",
-            "levels",
-            lang.pick("响度均衡", "Loudness"),
-            loud_on,
-            cx.listener(|this: &mut Self, _, _window, cx| {
-                this.toggle_global_loudness(cx);
-            }),
-        ));
-        actions = actions.child(self.footer_label_button(
-            "open-mixer",
-            "adjustments",
-            lang.pick("混音器", "Mixer"),
-            false,
-            |_, _, _| {
-                let _ = std::process::Command::new("sndvol.exe").spawn();
-            },
-        ));
-        if let Some(callback) = self.on_open_settings.clone() {
-            actions = actions.child(Self::footer_icon_button(
-                "open-settings",
-                "settings",
-                false,
-                move |_, window, cx| callback(window, cx),
-            ));
-        }
-        actions = actions.child(Self::footer_icon_button(
-            "pin-flyout",
-            "pin",
-            self.pinned,
-            cx.listener(|this: &mut Self, _, window, cx| {
-                this.set_pinned(!this.pinned, window, cx);
-            }),
-        ));
-
+    /// WiFi / 蓝牙的「双按钮」：左半边开关、右半边展开，中间一条竖分隔线。
+    ///
+    /// 左半用设备自己的图标（wifi / bluetooth），亮 = 开、灰 = 关；右半是展开箭头。
+    ///
+    /// 动作一律在**抬起**时执行（`on_mouse_up`），按下只吃掉事件：
+    /// 按下即切换太容易被误触，也看不到「点了哪个」。按下那一下仍然要
+    /// `stop_propagation`，否则会冒泡到面板本体的监听里（那边管着点空白收起）。
+    fn radio_pair_button(
+        &self,
+        cx: &mut Context<Self>,
+        id: &'static str,
+        icon_name: &'static str,
+        on: bool,
+        toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        expand: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let color = if on {
+            theme::accent()
+        } else {
+            theme::text_tertiary()
+        };
         div()
+            .id(id)
+            .h(px(22.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .rounded(px(theme::RADIUS_SMALL))
+            .cursor_pointer()
+            .overflow_hidden()
+            .child(
+                div()
+                    .h_full()
+                    .w(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _window, cx| {
+                            cx.stop_propagation();
+                            toggle(this, cx);
+                        }),
+                    )
+                    .child(icon(icon_name, 13.0, color)),
+            )
+            .child(
+                div()
+                    .w(px(1.))
+                    .h(px(12.))
+                    .flex_none()
+                    .bg(theme::border()),
+            )
+            .child(
+                div()
+                    .h_full()
+                    .w(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_up(MouseButton::Left, move |event, window, cx| {
+                        cx.stop_propagation();
+                        expand(event, window, cx);
+                    })
+                    .child(icon("chevron-down", 11.0, theme::text_tertiary())),
+            )
+            .into_any_element()
+    }
+
+    /// 页脚上的一个按钮：按注册表 id 分派到具体的画法。
+    ///
+    /// **以后加按钮就在这儿加一个分支**，别的都不用动 —— 显隐、排序、设置页里那张
+    /// 列表、老配置的自动补全，全是照 `config::FOOTER_ITEMS` 那张表生成的。
+    /// `compact` = 竖排：带文字的按钮退化成纯图标。
+    fn footer_button(
+        &self,
+        cx: &mut Context<Self>,
+        spec: &'static crate::config::FooterItemSpec,
+        lang: Lang,
+        compact: bool,
+    ) -> AnyElement {
+        let label: &'static str = if spec.label && !compact {
+            lang.pick(spec.zh, spec.en)
+        } else {
+            ""
+        };
+        match spec.id {
+            "wifi" => {
+                let on = self.wifi_on(cx);
+                self.radio_pair_button(
+                    cx,
+                    "footer-wifi",
+                    "wifi",
+                    on,
+                    |this, cx| this.toggle_wifi(cx),
+                    |_, _, _| crate::platform::shell::open_url("ms-availablenetworks:"),
+                )
+            }
+            "bluetooth" => {
+                let on = self.bt_on(cx);
+                self.radio_pair_button(
+                    cx,
+                    "footer-bluetooth",
+                    "bluetooth",
+                    on,
+                    |this, cx| this.toggle_bt(cx),
+                    |_, _, _| crate::platform::shell::bluetooth_panel(),
+                )
+            }
+            "loudness" => {
+                let on = self.cfg().loudness.enabled;
+                self.footer_label_button(
+                    "footer-loudness",
+                    "levels",
+                    label,
+                    on,
+                    cx.listener(|this: &mut Self, _, _window, cx| {
+                        this.toggle_global_loudness(cx);
+                    }),
+                )
+            }
+            "mixer" => self.footer_label_button(
+                "footer-mixer",
+                "adjustments",
+                label,
+                false,
+                |_, _, _| {
+                    let _ = std::process::Command::new("sndvol.exe").spawn();
+                },
+            ),
+            // 没有「打开设置」的回调就不画（OSD 那种独立实例没有设置页）。
+            "settings" => match self.on_open_settings.clone() {
+                Some(callback) => Self::footer_icon_button(
+                    "footer-settings",
+                    "settings",
+                    false,
+                    move |_, window, cx| callback(window, cx),
+                ),
+                None => div().into_any_element(),
+            },
+            "pin" => Self::footer_icon_button(
+                "footer-pin",
+                "pin",
+                self.pinned,
+                cx.listener(|this: &mut Self, _, window, cx| {
+                    this.set_pinned(!this.pinned, window, cx);
+                }),
+            ),
+            // 注册表里有、这里还没画（忘了加分支）或者配置里是个不认识的 id。
+            _ => div().into_any_element(),
+        }
+    }
+
+    fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let config = self.cfg();
+        let lang = config.language;
+        let vertical = config.panel_layout.is_vertical();
+
+        // 页脚是两头对齐的：左边一拨（系统状态）、右边一拨（面板自己的动作）。
+        // 哪一拨摆在哪儿、谁在前谁在后，全看配置里那份列表 —— 同一侧里保序。
+        //
+        // 竖排一列只有四十来像素宽：两拨塞不下，也画不了带文字的按钮，
+        // 所以沿用老规矩只画右边那拨、且只画图标。
+        let mut left = div().flex().items_center().gap(px(2.));
+        let mut right = div().flex().items_center().gap(px(2.));
+        let (mut has_left, mut has_right) = (false, false);
+        for item in &config.footer.items {
+            if !item.visible {
+                continue;
+            }
+            let Some(spec) = crate::config::footer_spec(&item.id) else {
+                continue;
+            };
+            if vertical && item.side.is_left() {
+                continue;
+            }
+            let element = self.footer_button(cx, spec, lang, vertical);
+            if item.side.is_left() {
+                left = left.child(element);
+                has_left = true;
+            } else {
+                right = right.child(element);
+                has_right = true;
+            }
+        }
+
+        let mut footer = div()
             .h(self.su(theme::FOOTER_HEIGHT))
             .px(px(14.))
             .flex()
             .flex_none()
             .items_center()
-            .justify_end()
+            // 按钮多到放不下时从右边裁，不要溢出到旁边的窗格上。
+            .overflow_hidden()
             .border_t_1()
-            .border_color(theme::border())
-            .child(actions)
-            .into_any_element()
+            .border_color(theme::border());
+
+        footer = if vertical {
+            footer.justify_end().child(right)
+        } else {
+            match (has_left, has_right) {
+                // 两拨都在才两头对齐。只剩一拨时别用 `justify_between` ——
+                // 它会把孤零零那一拨顶到左边去，看着像「位置被改了」。
+                (true, true) => footer.justify_between().child(left).child(right),
+                (true, false) => footer.justify_start().child(left),
+                (false, true) => footer.justify_end().child(right),
+                (false, false) => footer,
+            }
+        };
+
+        footer.into_any_element()
     }
 }
 
@@ -3495,6 +3514,10 @@ impl Flyout {
     fn show_inner(&mut self, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         self.activity.reset();
+        // WiFi / 蓝牙开关状态：弹出时先读一次，之后由 `watch_radios` 在可见期间盯着。
+        // 这里不是 render 上下文，`refresh_radios` 里的 spawn 不会把 App 重入借用。
+        self.refresh_radios(cx);
+        self.watch_radios(cx);
         // 每次弹出都从列表顶部开始，别接着上次的滚动位置。
         self.apps_scroll.scroll_to_item(0);
         // 排序记忆也从头开始：这次一打开就正在响的应用，在下面第一次算列表时
@@ -3598,7 +3621,8 @@ impl Flyout {
         // 正在改名时面板被收起（点了托盘 / 快捷键 / 点了别处）：名字照样要落盘，
         // 不然用户刚打的字跟着面板一起消失，还以为是没生效。
         self.commit_rename(window, cx);
-        *self.menu.borrow_mut() = None;
+        // 独立窗口的右键菜单也要一起收（它不会跟着面板走）。
+        crate::gui::hide_app_menu(cx);
         *self.device_menu.borrow_mut() = None;
         self.engine.send(AudioCommand::SetVisible(false));
         let animate = self.config.borrow().get().popup_animation && !cx.reduce_motion();
@@ -3733,6 +3757,17 @@ impl Flyout {
 
     /// 设置页改了面板外观之后调（宽度 / 高度 / 字号 / 行距 / 排版 …）。
     ///
+    /// 页脚按钮的配置变了：面板开着就立刻重画，关着什么都不用做。
+    ///
+    /// 和 `refresh_layout` 不一样，这里**不预览** —— 改一个页脚按钮的显隐不值得
+    /// 把面板从屏幕底下拉出来；关着的时候下次弹出自然就是新的。
+    pub fn refresh_footer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
+        self.update_frame(window, cx);
+    }
+
     /// 面板没开着就**按手动打开那套弹出来**（预览）；已经开着就跟着新尺寸重排。
     pub fn refresh_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
@@ -3949,12 +3984,6 @@ impl Render for Flyout {
             Vec::new()
         };
 
-        let overlay = self
-            .menu
-            .borrow()
-            .clone()
-            .map(|menu| self.context_menu(menu, cx));
-
         // 设备切换菜单也是浮层：挂在内容最上层，不改窗口尺寸，面板位置纹丝不动。
         let device_overlay = self
             .device_menu
@@ -4022,7 +4051,6 @@ impl Render for Flyout {
                         .children(columns),
                 )
                 .child(self.footer(cx))
-                .children(overlay)
                 .children(device_overlay)
                 .children(tip_overlay)
                 .children(rename_overlay)
@@ -4044,7 +4072,6 @@ impl Render for Flyout {
                         .children(rows),
                 )
                 .child(self.footer(cx))
-                .children(overlay)
                 .children(device_overlay)
                 .children(tip_overlay)
         };
@@ -4080,6 +4107,9 @@ impl Render for Flyout {
             // 不算「点别处」—— 那一格要留着继续改。
             .capture_any_mouse_down(cx.listener(
                 |this: &mut Self, event: &MouseDownEvent, window: &mut Window, cx| {
+                    // 右键菜单是独立窗口，点面板任何地方都先把它收起来
+                    // （右键打开菜单那一下也走这里，此时它还没开，收不到东西）。
+                    crate::gui::hide_app_menu(cx);
                     if this.rename.is_none() {
                         return;
                     }

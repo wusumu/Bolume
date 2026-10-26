@@ -55,6 +55,30 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // 系统启动那一档：任务是开机触发、SYSTEM 身份跑的。那个进程不画界面，
+    // 只等用户会话出现、再把自己送进去（详见 `platform::bootstart`）。
+    if args
+        .iter()
+        .any(|arg| arg == platform::autostart::BOOT_HANDOFF_FLAG)
+    {
+        platform::bootstart::handoff(
+            args.iter()
+                .any(|arg| arg == platform::autostart::ELEVATE_FLAG),
+        );
+        return;
+    }
+
+    // 「启动时以管理员运行」在注册表那条路上的落地：Run 值里带 `--elevate`，
+    // 这里先 `runas` 拉起提权后的自己，再退场。
+    if args
+        .iter()
+        .any(|arg| arg == platform::autostart::ELEVATE_FLAG)
+        && !platform::autostart::is_elevated()
+    {
+        platform::bootstart::elevate_self();
+        return;
+    }
+
     if let Some(index) = args.iter().position(|arg| arg == "--icon") {
         if let Some(path) = args.get(index + 1) {
             let pixels = args
@@ -142,6 +166,17 @@ fn main() {
             .and_then(|value| value.parse::<u64>().ok());
         probe::run(watch);
         return;
+    }
+
+    // 从文件管理器 / 第三方启动器里双击运行时，本进程是它们的子进程。process
+    // loopback 按**进程树**抓音频 —— 接管那个父进程会把我们自己的输出也一起抓
+    // 进去，形成闭环回授（一段不断重复、辨不出源头的怪音，源停了也不消失）。
+    // 先换成独立的父进程再继续，见 `platform::detach`。
+    #[cfg(feature = "gui")]
+    if platform::detach::needs_detach(&args) {
+        if platform::detach::respawn(&args) {
+            return;
+        }
     }
 
     #[cfg(feature = "gui")]

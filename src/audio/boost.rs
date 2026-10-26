@@ -35,6 +35,13 @@
 //! 不用另做补偿）。压到 2% 时原声残留在 -34dB，相对接管后的输出约 -41dB，
 //! 听不出来；而 2% 的信号在 float32 通路里乘 50 倍回来不会有量化损失。
 //!
+//! **但上表不是所有进程都成立**：实测 Dopus 播放视频时，会话被压到 2%（回读
+//! 确认过），抓到的峰值仍是 0.985 满幅 —— 它的捕获点在会话音量**之前**。
+//! 那种进程按上表乘 50 倍就是「满幅原声 × 50」→ 削顶失真。不过这不是靠猜能解决的：
+//! 用「压前 / 压后的能量比」去判，会被内容自己的起伏带偏（后段常常虚高），
+//! 实测直接导致「声音只剩一成」。所以增益固定按 `1 / ATTEN` 走，能量比只记进
+//! 诊断行（`ratio`）留着以后分析。
+//!
 //! # 已知代价（都是这条路绕不过去的）
 //!
 //! * 声音会比画面对晚 40ms 上下；
@@ -60,8 +67,9 @@ use windows::Win32::Media::Audio::{
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-    IAudioCaptureClient, IAudioClient, IAudioRenderClient, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
+    IAudioCaptureClient, IAudioClient, IAudioRenderClient, IAudioSessionControl,
+    IAudioSessionControl2, IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator,
+    ISimpleAudioVolume,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     eMultimedia, eRender,
 };
@@ -82,7 +90,24 @@ const PENDING_MS: u32 = 24;
 /// ring 里最多留多少毫秒的捕获数据。超了丢最老的，避免延迟越滚越大。
 const RING_MS: u32 = 120;
 /// 接管期间核对会话音量的间隔（见 `Hub::tick` 末尾的兜底）。
-const GUARD_EVERY: Duration = Duration::from_millis(500);
+///
+/// 250ms 是权衡：太稀的话，应用新开一条会话（浏览器换流、播放器重开音频端点）
+/// 到我们把它压下去之间，原声会和接管流叠着响一整段；太密就是每 250ms 一次
+/// 会话枚举的 COM 开销。一次枚举只有几毫秒。
+const GUARD_EVERY: Duration = Duration::from_millis(250);
+/// 刚压下去的那一小段用更密的间隔核对。
+///
+/// 这两秒最危险：别的程序（或者我们自己上一轮留下的还原动作）一旦把会话音量
+/// 抬回 100%，原声就和接管流（增益可能到 8 / 2% = 400 倍）叠在一起，
+/// 500ms 的间隔足够炸两下。密到 60ms，最坏也就漏一拍。
+const GUARD_TIGHT: Duration = Duration::from_secs(2);
+const GUARD_TIGHT_EVERY: Duration = Duration::from_millis(60);
+/// 压音量没压住时，最多试几次 / 两次之间隔多久（共约 380ms）。
+///
+/// 有的应用会自己把会话音量写回去（换集、换音轨、切全屏），一次没压住不代表
+/// 压不下去；给几轮重试，比立刻关流（听感就是「开了均衡没反应」）强。
+const ATTEN_TRIES: u8 = 12;
+const ATTEN_RETRY_EVERY: Duration = Duration::from_millis(30);
 /// 增益下降的平滑系数（每次 `pump` ≈ 8ms，0.25 约 30ms 走完）。
 const GAIN_FALL: f32 = 0.25;
 /// 增益上升的平滑系数（慢一些，避免「刚压下去又抬上来」的抽吸）。
@@ -106,15 +131,14 @@ const RETRY_AFTER: Duration = Duration::from_secs(10);
 ///
 /// 2% = -34dB：原声残留相对接管后的输出约 -41dB，听不出来；
 /// 抓到的信号再乘 `1/ATTEN` = 50 倍补回来，float32 通路里没有量化损失。
-const ATTEN: f32 = 0.02;
-/// 写过 [`ATTEN`] 之后，捕获里要看到峰值掉到这个比例以下才敢往外送。
+pub(crate) const ATTEN: f32 = 0.02;
+/// 写过 [`ATTEN`] 之后静音多久再放声。
 ///
-/// 音量写下去到捕获流里反映出来有几十毫秒延迟，这段里抓到的还是**压之前**的
-/// 满幅数据（实测：接管刚开的那一下设备电平表直接顶到 1.0，就是这一包乘了
-/// `1/ATTEN` 放出去的）。
-const SETTLE_FACTOR: f32 = 0.15;
-/// 上面那条判据的兜底：内容刚好静音时读数判不出来，等够 [`SETTLE_MAX`] 就走。
-const SETTLE_MAX: Duration = Duration::from_millis(150);
+/// 音量写下去到捕获流里反映出来有几十毫秒延迟，这段里抓到的还是压之前的满幅
+/// 数据（实测：接管刚开的那一下设备电平表直接顶到 1.0，就是这一包乘了
+/// `1/ATTEN` 放出去的）。固定等这么久，比「看见峰值变小才放行」可靠 ——
+/// 后者会被内容里的静音间隙骗过。
+const COMP_WINDOW: Duration = Duration::from_millis(150);
 
 /// 引擎发给接管线程的一条目标。
 #[derive(Clone, Debug, PartialEq)]
@@ -337,6 +361,26 @@ impl Hub {
                     continue;
                 }
             }
+            // 本程序是这个进程的后代时不能接管。
+            //
+            // process loopback 按**进程树**抓音频：从文件管理器（Dopus、Explorer
+            // 的第三方替代品）里双击启动时，Bolume 就成了它的子进程，自己渲染出去
+            // 那条流也在同一棵树里 —— 抓进来乘增益再送出去，是一个闭环回授。
+            // 听感是一段不断重复、辨不出源头的怪音；源停了也不消失（回授自己维持），
+            // 只有手动改一下那个应用的音量强行退出接管才会安静。
+            if is_descendant_of(target.pid) {
+                crate::platform::hotkey::trace(&format!(
+                    "boost open REFUSED pid {} (本程序是它的子进程，会回授)",
+                    target.pid
+                ));
+                self.failed.insert(target.pid, Instant::now());
+                let _ = self.events.send(BoostEvent::Failed {
+                    pid: target.pid,
+                    reason: "Bolume 由该应用启动，接管会形成回授。请从桌面或开始菜单启动".into(),
+                    retry: false,
+                });
+                continue;
+            }
             match Stream::open(
                 &self.enumerator,
                 &target,
@@ -383,20 +427,57 @@ impl Hub {
         // 静音（实测 in 恒 0）。所以先让捕获流跑起来、收到真的非静音数据，
         // 再把原会话压到 [`ATTEN`]。压完**不立即**放行 —— `zero_pending` 由
         // `pump()` 在捕获里真的看到信号变小之后才清（见那里的说明）。
+        let mut not_attened: Vec<u32> = Vec::new();
         for stream in self.streams.values_mut() {
             if stream.zero_pending && stream.heard && stream.attened_at.is_none() {
+                if stream.atten_retry_at.is_some_and(|at| at > Instant::now()) {
+                    continue;
+                }
                 if let Some(saved) = stream.saved_volume {
                     let device = stream.device_id.as_deref();
                     if set_session_volume(&self.enumerator, device, stream.pid, ATTEN).is_some() {
-                        remember_zeroed(stream.pid, saved, device);
-                        stream.attened_at = Some(Instant::now());
-                        crate::platform::hotkey::trace(&format!(
-                            "boost atten pid {} saved {saved:.3} -> {ATTEN}",
-                            stream.pid
-                        ));
+                        // 写下去不等于真的生效（受保护的内容 / 独占模式 / 别的程序
+                        // 正在改这一格）。没压住就绝不能放声：原声会和接管流
+                        // （增益最高 8 / 2% = 400 倍）叠在一起，那就是「炸」。
+                        let landed = session_volume(&self.enumerator, device, stream.pid)
+                            .map(|value| value <= ATTEN * 2.0)
+                            .unwrap_or(false);
+                        if landed {
+                            remember_zeroed(stream.pid, saved, device);
+                            stream.attened_at = Some(Instant::now());
+                            crate::platform::hotkey::trace(&format!(
+                                "boost atten pid {} saved {saved:.3} -> {ATTEN}",
+                                stream.pid
+                            ));
+                        } else if stream.atten_tries + 1 < ATTEN_TRIES {
+                            // 隔一会儿再试。这期间 `zero_pending` 还挂着，一个样本都不放。
+                            stream.atten_tries += 1;
+                            stream.atten_retry_at = Some(Instant::now() + ATTEN_RETRY_EVERY);
+                        } else {
+                            let readback = session_volume(&self.enumerator, device, stream.pid)
+                                .unwrap_or(-1.0);
+                            crate::platform::hotkey::trace(&format!(
+                                "boost atten FAILED pid {} saved {saved:.3} readback {readback:.3} tries {}",
+                                stream.pid, stream.atten_tries + 1
+                            ));
+                            // 可能压了一半：先按记下的音量还原，再关流。
+                            let _ = set_session_volume(&self.enumerator, device, stream.pid, saved);
+                            not_attened.push(stream.pid);
+                        }
                     }
                 }
             }
+        }
+        for pid in not_attened {
+            if let Some(stream) = self.streams.remove(&pid) {
+                stream.close(&self.enumerator);
+            }
+            self.failed.insert(pid, Instant::now());
+            let _ = self.events.send(BoostEvent::Failed {
+                pid,
+                reason: "原声压不下去（会话音量被别的程序占着）".into(),
+                retry: true,
+            });
         }
 
         let mut dead = Vec::new();
@@ -405,15 +486,50 @@ impl Hub {
                 dead.push(*pid);
             }
         }
+        // 每秒一行诊断：`cap` 是这一秒捕获到的峰值，`heard` 是压之前捕获到的峰值，
+        // `vol` 是回读到的会话音量，`ratio` 是压完之后量到的能量比。
+        //
+        // 三种组合各说明一件事：
+        // * `cap ≈ heard × ATTEN`、`vol = 0.02`、`ratio ≈ 0.02` → 捕获在音量之后；
+        // * `cap ≈ heard`、`vol = 0.02`、`ratio ≈ 1` → 捕获在音量之前（乘 50 会削顶）；
+        // * `cap` 满幅、`vol = 1.0` → 会话被抬回去了（或者音频跑到了别的 pid）。
+        for stream in self.streams.values_mut() {
+            if stream.diag_at.elapsed() < Duration::from_secs(1) {
+                continue;
+            }
+            let vol = session_volume(&self.enumerator, stream.device_id.as_deref(), stream.pid)
+                .unwrap_or(-1.0);
+            crate::platform::hotkey::trace(&format!(
+                "boost level pid {} cap={:.4} heard={:.4} vol={vol:.3} ratio={:.3} gain={:.3} lim={:.3} zero={}",
+                stream.pid,
+                stream.cap_peak,
+                stream.heard_peak,
+                stream.seen_ratio,
+                stream.gain,
+                stream.lim,
+                stream.zero_pending
+            ));
+            stream.diag_at = Instant::now();
+            stream.cap_peak = 0.0;
+        }
+
         // 兜底：接管期间会话音量被**外部**改大（在播放器界面里拖音量、系统
         // ducking 结束把别人的音量恢复回来），原声就回来了 —— 它会跟我们这条
-        // 放大后的流叠在一起，听感是回声 + 爆音，正好是用户报的「炸」。
+        // 放大后的流叠在一起，听感是回声 + 爆音。
         //
         // 每 `GUARD_EVERY` 核对一次，偏离 [`ATTEN`] 就写回去。用户拖的是
         // Bolume 自己的滑条时走的是引擎那条路（会先退出接管、关流），
         // 这里最多抢跑半秒，随后 `close()` 会把音量还原。
         for stream in self.streams.values_mut() {
-            if stream.attened_at.is_none() || stream.guard_at.elapsed() < GUARD_EVERY {
+            let Some(attened_at) = stream.attened_at else {
+                continue;
+            };
+            let every = if attened_at.elapsed() < GUARD_TIGHT {
+                GUARD_TIGHT_EVERY
+            } else {
+                GUARD_EVERY
+            };
+            if stream.guard_at.elapsed() < every {
                 continue;
             }
             stream.guard_at = Instant::now();
@@ -484,16 +600,36 @@ struct Stream {
     saved_volume: Option<f32>,
     /// 已经抓到过非静音数据（此时才敢把原会话压到 [`ATTEN`]）。
     heard: bool,
-    /// 压下去之前抓到的最大峰值。用来判断「捕获里现在是不是已经变小声了」：
-    /// 比它小 `SETTLE_FACTOR` 倍才算真的压到了。
+    /// 压下去之前抓到的最大峰值（诊断用）。
     heard_peak: f32,
+    /// 压之前抓到的能量（平方和 + 样本数），用来和压之后的比。
+    heard_sq: f64,
+    heard_n: u64,
+    /// 压之后 [`COMP_WINDOW`] 内抓到的能量（同上）。
+    post_sq: f64,
+    post_n: u64,
+    /// 压完之后量到的「后段能量 / 前段能量」（**只做诊断**，不参与增益）。
+    ///
+    /// 按设计应该是 1/[`ATTEN`]（≈0.02，说明捕获点在会话音量之后）；要是接近 1，
+    /// 说明捕获点在音量之前 —— 那种进程乘 50 倍会削顶。但这个比值只能当线索：
+    /// 内容自己在变（压下去那几十毫秒抓到的还是压前的数据，后段就虚高），
+    /// 拿它直接决定增益会算错，实测出现过的后果是「声音只剩一成」。
+    seen_ratio: f32,
     /// 已经往会话写过 [`ATTEN`] 的时刻（`None` = 还没写）。
     attened_at: Option<Instant>,
+    /// 压音量已经试了几次。
+    ///
+    /// 写下去之后可能被应用自己立刻抬回来（不少播放器每换一集就重写一次自己的
+    /// 会话音量）。一次没压住就判失败太急：隔几十毫秒再试，`ATTEN_TRIES` 次都
+    /// 不行才认定压不住、关流 —— 这一小段 `zero_pending` 还挂着，不会放声。
+    atten_tries: u8,
+    /// 下一次重试的时刻（`None` = 立刻可以试）。
+    atten_retry_at: Option<Instant>,
     /// 还没把原会话压下去。这期间**只输出静音**。
     ///
-    /// 抓到的数据是会话音量**之后**的：压下去之前那一小段是满幅的，
-    /// 万一被渲染出去就是「乘了 50 倍的原声」—— 一开口就是一声炸。
-    /// 所以压之前一个样本都不往外送（也不进 ring，省得压下去之后把旧的放出来）。
+    /// 压下去之前抓到的数据是**没被压过**的（捕获点在会话音量之前，见
+    /// [`COMP_WINDOW`]），这一段要是被渲染出去就是「原声 × 补偿倍数」——
+    /// 一开口就是一声炸。所以压之前一个样本都不往外送（也不进 ring）。
     zero_pending: bool,
     /// 连着多少拍输出顶到削顶。正常不该出现（AGC 的目标在 91.6% 以下），
     /// 出现了说明要么原声没压住、要么在自激，立刻关流重来。
@@ -510,8 +646,15 @@ struct Stream {
     out_started: bool,
     /// `zero_pending` 变 false 的时刻（攒不满时的兜底）。
     released_at: Option<Instant>,
-    /// 上次核对会话音量的时刻（见 `Hub::tick` 末尾那段兜底）。
+    /// 上一次核对会话音量的时刻（见 `Hub::tick` 末尾那段兜底）。
     guard_at: Instant,
+    /// 最近一秒里捕获到的峰值（诊断用，见 `Hub::tick` 里那行 `boost level`）。
+    ///
+    /// 要和 `heard_peak`（压之前的峰值）与回读的 `vol` 一起看，才能分清
+    /// 「捕获在会话音量之后」「捕获在之前」「会话被抬回去了」这三种情况。
+    cap_peak: f32,
+    /// 上一次记诊断行的时刻。
+    diag_at: Instant,
     /// 输出端限幅器当前的增益（1.0 = 没在压）。
     ///
     /// AGC 是「外部」的：它只能 15ms 读一次会话电平表，再用这个估计去决定
@@ -656,13 +799,22 @@ impl Stream {
                 saved_volume: None,
                 heard: false,
                 heard_peak: 0.0,
+                heard_sq: 0.0,
+                heard_n: 0,
+                post_sq: 0.0,
+                post_n: 0,
+                seen_ratio: 0.0,
                 attened_at: None,
+                atten_tries: 0,
+                atten_retry_at: None,
                 zero_pending: true,
                 clip_run: 0,
                 prefill: (PREFILL_MS * frames_per_ms) as usize * channels,
                 out_started: false,
                 released_at: None,
                 guard_at: Instant::now(),
+                cap_peak: 0.0,
+                diag_at: Instant::now(),
                 lim: 1.0,
             };
             // 让原声让位：把会话音量压到 [`ATTEN`]（**不是静音**，静音会让捕获变哑，
@@ -676,10 +828,13 @@ impl Stream {
             };
             // 读到的音量如果已经是被我们压过的（换设备后新会话会继承那个 2%），
             // 就换成这一轮之前记下的用户音量 —— 不然退出接管时会把应用还原成 2%。
+            //
+            // 账上也没有（进程重启、账本丢了）时按 1.0 算：2% 只可能是我们上一轮
+            // 压下去又没来得及还的，当成用户的音量会让这个应用一直哑着。
             let saved = if saved <= ATTEN * 1.2 {
                 known_volume
                     .filter(|value| *value > ATTEN * 1.2)
-                    .unwrap_or(saved)
+                    .unwrap_or(1.0)
             } else {
                 saved
             };
@@ -728,29 +883,29 @@ impl Stream {
                 } else {
                     let slice = std::slice::from_raw_parts(data as *const f32, samples);
                     let peak = slice.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+                    self.cap_peak = self.cap_peak.max(peak);
                     if self.zero_pending {
-                        self.heard_peak = self.heard_peak.max(peak);
-                        if !self.heard {
-                            self.heard = peak > 0.0001;
-                        }
-                        // 音量已经写下去了，但捕获里还是压之前的满幅数据：
-                        // 继续丢。等真的看见它变小（或者等够兜底时间）才放行。
-                        if let Some(written) = self.attened_at {
-                            let settled = peak <= (self.heard_peak * SETTLE_FACTOR).max(0.0005)
-                                || written.elapsed() >= SETTLE_MAX;
-                            if settled {
-                                crate::platform::hotkey::trace(&format!(
-                                    "boost release pid {} peak={peak:.4} heard={:.4} waited={}ms",
-                                    self.pid,
-                                    self.heard_peak,
-                                    written.elapsed().as_millis()
-                                ));
+                        let energy: f64 = slice.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                        if self.attened_at.is_none() {
+                            // 压之前：记下「内容本身的能量」，用来和压之后的比。
+                            self.heard_peak = self.heard_peak.max(peak);
+                            self.heard_sq += energy;
+                            self.heard_n += samples as u64;
+                            if !self.heard {
+                                self.heard = peak > 0.0001;
+                            }
+                        } else {
+                            // 压之后：再攒满 [`COMP_WINDOW`]，然后量捕获点在哪一侧。
+                            self.post_sq += energy;
+                            self.post_n += samples as u64;
+                            if self.settle() {
                                 self.zero_pending = false;
                                 self.released_at = Some(Instant::now());
                             }
                         }
                     }
-                    // 还没把会话压下去：这段是满幅原声，进了 ring 就会被放大 50 倍放出来。
+                    // 还没放行：这一段没经过（或者没确认经过）判定，进 ring 就有
+                    // 乘错倍数的风险，所以一个样本都不收。
                     if !self.zero_pending {
                         self.ring.extend(slice.iter().copied());
                     }
@@ -761,6 +916,8 @@ impl Stream {
                     self.ring.pop_front();
                 }
             }
+
+            // 每秒一行的诊断在 `Hub::tick` 里（那边才有设备枚举器，能回读会话音量）。
 
             // ---- ring → 渲染，压着水位填 ----
             let padding = match self.render.GetCurrentPadding() {
@@ -864,6 +1021,45 @@ impl Stream {
         }
     }
 
+    /// 压完之后静音一段，够 [`COMP_WINDOW`] 就放行。
+    ///
+    /// 为什么要等：音量写下去到捕获流里反映出来有几十毫秒延迟，这段里抓到的还是
+    /// 压之前的满幅数据 —— 放出去就是「原声 × 50」，一开口一声炸。
+    ///
+    /// 顺手把「后段能量 / 前段能量」记进 `seen_ratio`，**只做诊断**：正常应该是
+    /// 0.02 上下（捕获在会话音量之后）。拿它决定增益是不行的 —— 内容自己在变，
+    /// 后段常常虚高，实测出现过「判成 1 倍 → 声音只剩一成」。
+    fn settle(&mut self) -> bool {
+        let Some(written) = self.attened_at else {
+            return false;
+        };
+        if written.elapsed() < COMP_WINDOW {
+            return false;
+        }
+        let heard = if self.heard_n > 0 {
+            (self.heard_sq / self.heard_n as f64).sqrt() as f32
+        } else {
+            0.0
+        };
+        let post = if self.post_n > 0 {
+            (self.post_sq / self.post_n as f64).sqrt() as f32
+        } else {
+            0.0
+        };
+        self.seen_ratio = if heard < 0.0005 || post <= 0.0 {
+            0.0
+        } else {
+            post / heard
+        };
+        crate::platform::hotkey::trace(&format!(
+            "boost release pid {} heard={heard:.4} post={post:.4} ratio={:.3} waited={}ms",
+            self.pid,
+            self.seen_ratio,
+            written.elapsed().as_millis()
+        ));
+        true
+    }
+
     /// 停流并把原会话的音量还回去。
     fn close(&self, enumerator: &IMMDeviceEnumerator) {
         unsafe {
@@ -964,13 +1160,35 @@ fn endpoint(enumerator: &IMMDeviceEnumerator, device: Option<&str>) -> Option<IM
     }
 }
 
-/// 读某个 pid 在指定端点上的会话音量（第一条会话）。找不到会话返回 `None`。
+/// 本进程是不是 `pid` 的后代（含它自己）。见 [`crate::platform::detach`]。
+fn is_descendant_of(pid: u32) -> bool {
+    crate::platform::detach::is_descendant_of(pid)
+}
+
+/// 这条会话是不是已经结束了（进程退出后系统还没收走）。
+///
+/// 过期会话不能算：写进去也不生效、读出来还是旧值 —— 拿它当「还有会话在满幅放」
+/// 的证据，压完回读就永远过不了，接管流会被判失败直接关掉，听感是「开了均衡没反应」。
+fn expired(control: &IAudioSessionControl) -> bool {
+    // AudioSessionState：0 未激活、1 激活、2 已过期。
+    unsafe { control.GetState() }.map(|value| value.0 == 2).unwrap_or(false)
+}
+
+/// 读某个 pid 在指定端点上的会话音量，取**所有**会话里最大的那个。
+///
+/// 一个进程可以有多条会话（浏览器换流、播放器重开音频端点时会新建一条，新会话
+/// 一律从 100% 起）。只读第一条会被这种情况骗过去：第一条还被我们压着 2%，
+/// 第二条已经在满幅放原声 —— 原声叠在接管流上，听感是回声 + 爆音。取最大值，
+/// 「有没有会话还在满幅放」这个问题才回答得对。
+///
+/// 找不到会话返回 `None` —— 说明这个进程的声音根本不在这台端点上。
 fn session_volume(enumerator: &IMMDeviceEnumerator, device: Option<&str>, pid: u32) -> Option<f32> {
     unsafe {
         let device = endpoint(enumerator, device)?;
         let manager = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None).ok()?;
         let list = manager.GetSessionEnumerator().ok()?;
         let count = list.GetCount().ok()?;
+        let mut loudest: Option<f32> = None;
         for index in 0..count {
             let Ok(control) = list.GetSession(index) else {
                 continue;
@@ -981,18 +1199,22 @@ fn session_volume(enumerator: &IMMDeviceEnumerator, device: Option<&str>, pid: u
             if control2.GetProcessId().unwrap_or(0) != pid {
                 continue;
             }
+            if expired(&control) {
+                continue;
+            }
             let Ok(volume) = control.cast::<ISimpleAudioVolume>() else {
                 continue;
             };
-            return Some(volume.GetMasterVolume().unwrap_or(1.0));
+            let level = volume.GetMasterVolume().unwrap_or(1.0);
+            loudest = Some(loudest.map_or(level, |max: f32| max.max(level)));
         }
-        None
+        loudest
     }
 }
 
 /// 把某个 pid 在指定端点上的所有会话压到 `volume_level`。
 ///
-/// 返回它原来的音量（第一条会话的读数）；找不到会话返回 `None` ——
+/// 返回它原来的音量（所有会话里最大的那个）；找不到会话返回 `None` ——
 /// 那就说明这个进程的声音根本不在这台端点上。
 fn set_session_volume(
     enumerator: &IMMDeviceEnumerator,
@@ -1006,7 +1228,7 @@ fn set_session_volume(
         let list = manager.GetSessionEnumerator().ok()?;
         let count = list.GetCount().ok()?;
         let context = GUID::zeroed();
-        let mut previous = None;
+        let mut previous: Option<f32> = None;
         for index in 0..count {
             let Ok(control) = list.GetSession(index) else {
                 continue;
@@ -1017,12 +1239,14 @@ fn set_session_volume(
             if control2.GetProcessId().unwrap_or(0) != pid {
                 continue;
             }
+            if expired(&control) {
+                continue;
+            }
             let Ok(volume) = control.cast::<ISimpleAudioVolume>() else {
                 continue;
             };
-            if previous.is_none() {
-                previous = Some(volume.GetMasterVolume().unwrap_or(1.0));
-            }
+            let level = volume.GetMasterVolume().unwrap_or(1.0);
+            previous = Some(previous.map_or(level, |max: f32| max.max(level)));
             let _ = volume.SetMasterVolume(volume_level, &context);
         }
         previous
@@ -1061,6 +1285,9 @@ fn restore_session_volume(
                 continue;
             };
             if control2.GetProcessId().unwrap_or(0) != pid {
+                continue;
+            }
+            if expired(&control) {
                 continue;
             }
             let Ok(volume) = control.cast::<ISimpleAudioVolume>() else {

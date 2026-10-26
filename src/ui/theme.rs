@@ -1,19 +1,14 @@
 //! 视觉主题：统一的色彩与尺寸令牌。
 //!
-//! 主题全部内置：每套主题是一份 JSON，编译期随程序打包，设置页里选中哪个就整套
-//! 换掉，立即生效。JSON 里只需要写想改的色值，其余回落到内置默认。
+//! 没有「一套一套的预设」了：打底只有深色 / 浅色两套模板（`Palette::template`），
+//! 具体长什么样由用户选的背景色 + 强调色决定 —— 选了浅色底，文字和描边自动翻成
+//! 深色；强调色空着就跟 Windows 的强调色走。
 //!
 //! 所有取色函数都读运行时的 `Palette`，所以界面代码不用改一行就能换肤。
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-};
+use std::cell::{Cell, RefCell};
 
 use gpui::{Hsla, Pixels, SharedString, px, rgb_to_hsla, rgba};
-use serde::Deserialize;
-
-use crate::i18n::Lang;
 
 /// `#rrggbb` / `#rrggbbaa` / `rrggbb` → `Hsla`。解析不了返回 `None`。
 ///
@@ -28,21 +23,6 @@ pub fn parse_hex(text: &str) -> Option<Hsla> {
     };
     Some(rgb_to_hsla(rgba(color)))
 }
-
-/// 内置主题（编译期打包，和 QcClip 的 `EmbeddedThemeAssets` 一个思路）。
-const BUILTIN_THEMES: &[&str] = &[
-    include_str!("../../themes/bolume-dark.json"),
-    include_str!("../../themes/bolume-gray.json"),
-    include_str!("../../themes/bolume-light.json"),
-];
-
-/// 默认主题名：配置里为空 / 找不到时用它。
-pub const DEFAULT_THEME: &str = "Bolume Dark";
-
-/// 「跟随系统」模式下，系统是亮色时默认用哪套。
-pub const DEFAULT_LIGHT_THEME: &str = "Bolume Light";
-/// 「跟随系统」模式下，系统是深色时默认用哪套。
-pub const DEFAULT_DARK_THEME: &str = "Bolume Dark";
 
 /// 一套配色。颜色统一存成 Win32 风格的 `0xRRGGBBAA`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,33 +72,6 @@ impl Default for Palette {
 }
 
 impl Palette {
-    /// 按色名写入一个颜色；认不出的色名忽略（外部主题写错 key 不会整包失效）。
-    fn set(&mut self, key: &str, value: u32) -> bool {
-        let slot = match key {
-            "surface" => &mut self.surface,
-            "surface_sunken" => &mut self.surface_sunken,
-            "surface_elevated" => &mut self.surface_elevated,
-            "surface_hover" => &mut self.surface_hover,
-            "surface_active" => &mut self.surface_active,
-            "border" => &mut self.border,
-            "border_strong" => &mut self.border_strong,
-            "accent" => &mut self.accent,
-            "accent_soft" => &mut self.accent_soft,
-            "accent_glow" => &mut self.accent_glow,
-            "muted_fill" => &mut self.muted_fill,
-            "track" => &mut self.track,
-            // `peak` 是旧色名，外部主题里写了照样认。
-            "activity" | "peak" => &mut self.activity,
-            "text_primary" => &mut self.text_primary,
-            "text_secondary" => &mut self.text_secondary,
-            "text_tertiary" => &mut self.text_tertiary,
-            "danger" => &mut self.danger,
-            _ => return false,
-        };
-        *slot = value;
-        true
-    }
-
     /// 深色 / 浅色模板：用户自选底色时，文字、描边、悬停层的浓淡都从这两套里取，
     /// 免得选了浅色底还配上白字。
     fn template(light: bool) -> Self {
@@ -251,70 +204,6 @@ fn tint(color: u32, amount: f32) -> u32 {
     out
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThemeMode {
-    Dark,
-    Light,
-}
-
-impl ThemeMode {
-    fn default_for(name: &str) -> Self {
-        if name.to_ascii_lowercase().contains("light") {
-            Self::Light
-        } else {
-            Self::Dark
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Theme {
-    pub name: String,
-    pub mode: ThemeMode,
-    pub palette: Palette,
-}
-
-#[derive(Deserialize)]
-#[serde(default)]
-struct ThemeFile {
-    name: String,
-    mode: Option<ThemeMode>,
-    colors: BTreeMap<String, String>,
-}
-
-impl Default for ThemeFile {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            mode: None,
-            colors: BTreeMap::new(),
-        }
-    }
-}
-
-impl Theme {
-    fn from_file(file: ThemeFile, fallback_name: &str) -> Self {
-        let name = if file.name.trim().is_empty() {
-            fallback_name.to_string()
-        } else {
-            file.name.trim().to_string()
-        };
-        let mut palette = Palette::default();
-        for (key, value) in &file.colors {
-            if let Some(color) = parse_color(value) {
-                palette.set(key, color);
-            }
-        }
-        let mode = file.mode.unwrap_or_else(|| ThemeMode::default_for(&name));
-        Self {
-            name,
-            mode,
-            palette,
-        }
-    }
-}
-
 /// `#RRGGBB` / `#RRGGBBAA`（也接受不带 # 的写法）→ `0xRRGGBBAA`。
 pub fn parse_color(text: &str) -> Option<u32> {
     let text = text.trim().trim_start_matches('#');
@@ -327,10 +216,8 @@ pub fn parse_color(text: &str) -> Option<u32> {
 }
 
 thread_local! {
-    /// 当前生效的配色与可选主题列表（只在界面线程上读写）。
+    /// 当前生效的配色（只在界面线程上读写）。
     static CURRENT: RefCell<Palette> = RefCell::new(Palette::default());
-    static THEMES: RefCell<Vec<Theme>> = RefCell::new(Vec::new());
-    static CURRENT_NAME: RefCell<String> = RefCell::new(DEFAULT_THEME.to_string());
     /// 界面字号缩放倍数（1.0 = 原始字号）。
     static FONT_SCALE: Cell<f32> = const { Cell::new(1.0) };
     /// 窗口整体不透明度（1.0 = 完全实心）。
@@ -400,7 +287,7 @@ pub fn ui_opacity() -> f32 {
 
 /// 把用户自选的底色 / 强调色 / 对比度叠到当前主题上；传空串表示跟随主题，100 = 原样。
 ///
-/// 必须排在 `apply()` 之后调用：它是「在主题之上再盖一层」，不是独立的一套主题。
+/// 必须排在 `set_mode()` 之后调用：它是「在模板之上再盖一层」，不是独立的一套配色。
 /// 三个覆盖都是从内置模板重生算的，重复调用结果一样（幂等）。
 pub fn apply_custom(surface: &str, accent: &str, contrast: u32) {
     let mut palette = CURRENT.with(|slot| *slot.borrow());
@@ -414,112 +301,13 @@ pub fn apply_custom(surface: &str, accent: &str, contrast: u32) {
     CURRENT.with(|slot| *slot.borrow_mut() = palette);
 }
 
-/// 载入内置主题（只有内置，不读外部文件）。
-pub fn load_themes() -> Vec<Theme> {
-    let mut themes: Vec<Theme> = Vec::new();
-    for (index, json) in BUILTIN_THEMES.iter().enumerate() {
-        if let Ok(file) = serde_json::from_str::<ThemeFile>(json) {
-            let fallback = if index == 0 {
-                DEFAULT_THEME
-            } else {
-                "Bolume Theme"
-            };
-            themes.push(Theme::from_file(file, fallback));
-        }
-    }
-    THEMES.with(|slot| *slot.borrow_mut() = themes.clone());
-    themes
-}
-
-/// 启动时载入内置主题并应用配置里那一套（找不到就用默认主题）。
+/// 打底：深色 / 浅色两套模板之一。
 ///
-/// 返回真正生效的主题名：配置里存的是旧名字时会跟着改回真实值。
-pub fn init(name: &str) -> String {
-    load_themes();
-    apply(name)
-}
-
-/// 按名字切换配色，返回真正生效的主题名。
-pub fn apply(name: &str) -> String {
-    apply_or(name, DEFAULT_THEME)
-}
-
-/// 按名字切换配色，找不到时退回 `fallback`，再找不到才用默认主题。
-///
-/// 「跟随系统」的两个槽位各有自己的兜底：亮色槽配错了不能掉进深色主题里。
-pub fn apply_or(name: &str, fallback: &str) -> String {
-    if THEMES.with(|slot| slot.borrow().is_empty()) {
-        load_themes();
-    }
-    let themes = THEMES.with(|slot| slot.borrow().clone());
-    let theme = themes
-        .iter()
-        .find(|theme| theme.name == name)
-        .or_else(|| themes.iter().find(|theme| theme.name == fallback))
-        .or_else(|| themes.iter().find(|theme| theme.name == DEFAULT_THEME))
-        .or_else(|| themes.first());
-    match theme {
-        Some(theme) => {
-            CURRENT.with(|slot| *slot.borrow_mut() = theme.palette);
-            CURRENT_NAME.with(|slot| *slot.borrow_mut() = theme.name.clone());
-            theme.name.clone()
-        }
-        None => DEFAULT_THEME.to_string(),
-    }
-}
-
-/// 可选主题列表：(内部名, 显示名)。
-/// 设置页里的主题列表：`(配置里存的名字, 显示的标签)`。
-///
-/// 配置里存的永远是英文名（换语言不能把用户的选择弄丢），
-/// 标签按语言翻：中文叫「黑 / 灰 / 白」，英文还是 Dark / Gray / Light。
-pub fn theme_options(lang: Lang) -> Vec<(String, String)> {
-    THEMES.with(|slot| {
-        slot.borrow()
-            .iter()
-            .map(|theme| {
-                let label = theme_label(&theme.name, lang);
-                (theme.name.clone(), label)
-            })
-            .collect()
-    })
-}
-
-/// 主题名 → 界面上的标签。
-pub fn theme_label(name: &str, lang: Lang) -> String {
-    match name {
-        "Bolume Dark" => lang.pick("黑", "Dark").to_string(),
-        "Bolume Gray" => lang.pick("灰", "Gray").to_string(),
-        "Bolume Light" => lang.pick("白", "Light").to_string(),
-        // 用户自己加的主题（以后从 themes/ 读）就照原名显示。
-        other => other.to_string(),
-    }
-}
-
-pub fn current_theme_name() -> String {
-    CURRENT_NAME.with(|slot| slot.borrow().clone())
-}
-
-/// 主题预览用的三色：底色 / 强调色 / 文字色。
-///
-/// 设置页里的主题改成一排小图标，靠这三色就能直接把「黑 / 灰 / 白」画出来，
-/// 点之前就知道长什么样；名字只当标签。
-pub fn theme_preview(name: &str) -> Option<(Hsla, Hsla, Hsla)> {
-    if THEMES.with(|slot| slot.borrow().is_empty()) {
-        load_themes();
-    }
-    THEMES.with(|slot| {
-        slot.borrow()
-            .iter()
-            .find(|theme| theme.name == name)
-            .map(|theme| {
-                (
-                    color(theme.palette.surface),
-                    color(theme.palette.accent),
-                    color(theme.palette.text_primary),
-                )
-            })
-    })
+/// 只是把调色板重置回模板 —— 用户的背景色 / 强调色要接着用 `apply_custom` 叠上去，
+/// 而且必须**先**调这个再叠：模板本身就是「没自选色时的样子」，反过来的话
+/// 上一轮的自选色会留在调色板里撤不掉。
+pub fn set_mode(dark: bool) {
+    CURRENT.with(|slot| *slot.borrow_mut() = Palette::template(!dark));
 }
 
 /// `0xRRGGBBAA` → `#rrggbb`。
@@ -629,39 +417,36 @@ mod tests {
         assert_eq!(parse_color("nope"), None);
     }
 
+    /// 打底只有深 / 浅两套模板，切回来必须是「干净的样子」——
+    /// 叠过自选色之后还能靠 `set_mode` 整个撤掉，不然浅色档会一直停在上一轮的颜色上。
     #[test]
-    fn builtin_themes_load_and_apply() {
-        let themes = load_themes();
-        assert!(themes.iter().any(|theme| theme.name == DEFAULT_THEME));
-        assert!(themes.iter().any(|theme| theme.mode == ThemeMode::Light));
+    fn set_mode_resets_the_palette() {
+        set_mode(true);
+        assert!(is_light(Palette::default().text_primary), "深色模板配浅色字");
+        assert_eq!(surface_hex(), to_hex(Palette::default().surface));
+
+        set_mode(false);
         assert!(
-            themes
-                .iter()
-                .any(|theme| theme.name == "Bolume Gray" && theme.mode == ThemeMode::Dark),
-            "灰色主题要能读进来，而且算深色（配的是浅色文字）"
+            !is_light(Palette::template(true).text_primary),
+            "浅色模板配深色字"
         );
-        let applied = apply(DEFAULT_THEME);
-        assert_eq!(applied, DEFAULT_THEME);
-        assert_eq!(current_theme_name(), DEFAULT_THEME);
+        assert_eq!(surface_hex(), to_hex(Palette::template(true).surface));
+
+        // 叠一层自选底色，再切回深色：必须回到模板，而不是留着刚才那层。
+        apply_custom("#f4efe6", "", 100);
+        assert_eq!(surface_hex(), to_hex(parse_color("#f4efe6").unwrap()));
+        set_mode(true);
+        assert_eq!(surface_hex(), to_hex(Palette::default().surface));
     }
 
-    /// 「跟随系统」的两个槽位各有兜底：亮色槽配错名字时不能掉进深色主题里。
+    /// 强调色传空串 = 跟随系统（调用方负责把系统强调色填进来），
+    /// 这里只验「不传就不动」：模板自带的强调色要原样留着。
     #[test]
-    fn apply_or_falls_back_to_the_slot_default() {
-        assert_eq!(apply_or("Nope", DEFAULT_LIGHT_THEME), DEFAULT_LIGHT_THEME);
-        assert_eq!(apply_or("Nope", "Also Nope"), DEFAULT_THEME);
-        assert_eq!(
-            apply_or(DEFAULT_LIGHT_THEME, DEFAULT_LIGHT_THEME),
-            "Bolume Light"
-        );
-    }
-
-    #[test]
-    fn unknown_keys_are_ignored() {
-        let mut palette = Palette::default();
-        assert!(!palette.set("nope", 0xffffff));
-        assert!(palette.set("accent", 0x11223344));
-        assert_eq!(palette.accent, 0x11223344);
+    fn empty_accent_keeps_the_template_accent() {
+        set_mode(true);
+        let before = accent_hex();
+        apply_custom("", "", 100);
+        assert_eq!(accent_hex(), before);
     }
 
     /// 换了底色，文字必须反过来：浅底配深字、深底配浅字，否则读不出来。
@@ -710,16 +495,4 @@ mod tests {
         assert_eq!(font_scale(), 1.0);
     }
 
-    /// 主题名只在中文下翻译：配置里存的永远是英文名，换语言不能弄丢选择。
-    #[test]
-    fn theme_labels_follow_the_language() {
-        assert_eq!(theme_label("Bolume Dark", Lang::Zh), "黑");
-        assert_eq!(theme_label("Bolume Gray", Lang::Zh), "灰");
-        assert_eq!(theme_label("Bolume Light", Lang::Zh), "白");
-        assert_eq!(theme_label("Bolume Dark", Lang::En), "Dark");
-        assert_eq!(theme_label("Bolume Gray", Lang::En), "Gray");
-        assert_eq!(theme_label("Bolume Light", Lang::En), "Light");
-        // 以后用户自己放的主题照原名显示，不会被翻成一个看不懂的字。
-        assert_eq!(theme_label("Solarized", Lang::Zh), "Solarized");
-    }
 }

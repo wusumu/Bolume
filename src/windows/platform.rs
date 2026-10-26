@@ -571,16 +571,15 @@ pub fn behind_taskbar(window: &Window) {
         return;
     };
     unsafe {
-        let taskbar = FindWindowW(windows::core::w!("Shell_TrayWnd"), None);
-        if taskbar.is_err() || taskbar.as_ref().map(|h| h.0.is_null()).unwrap_or(true) {
+        let taskbar = match FindWindowW(windows::core::w!("Shell_TrayWnd"), None) {
+            Ok(handle) if !handle.0.is_null() => handle,
             // 没有任务栏（被 explorer 重启/第三方任务栏替代）就退化成普通置前，
             // 否则面板可能被别的置顶窗口压在下面点不到。
-            bring_to_front(window);
-            return;
-        }
+            _ => return bring_to_front(window),
+        };
         let _ = SetWindowPos(
             hwnd,
-            Some(taskbar.unwrap()),
+            Some(taskbar),
             0,
             0,
             0,

@@ -1307,7 +1307,9 @@ impl Osd {
                 self.last_offset = f32::NAN;
                 self.alpha = if enters { alpha } else { 1.0 };
                 self.apply_alpha(window, &cfg);
-                crate::windows::platform::bring_to_front(window);
+                // 只能压回「任务栏之后」：`bring_to_front` 会把它插到任务栏前面，
+                // 之后收起（哪怕是淡出）就从任务栏上面过去了。
+                crate::windows::platform::present_behind_taskbar(window);
             }
         } else {
             // 位置和透明度这一轮归滑动线程管，`place` 先按目标位置摆好。
@@ -1345,7 +1347,10 @@ impl Osd {
                     0.0,
                 );
             } else {
-                crate::windows::platform::bring_to_front(window);
+                // 连续调节（卡片已经在屏幕上）：只压回任务栏之后。
+                // 以前这里是 `bring_to_front`，第二次调节就把它顶到任务栏前面，
+                // 收起时整张卡从任务栏上面滑下去。
+                crate::windows::platform::present_behind_taskbar(window);
             }
             self.apply_alpha(window, &cfg);
         }
@@ -1822,8 +1827,10 @@ impl Osd {
                         self.phase = Phase::Hold {
                             until: now + Duration::from_millis(cfg.hold_ms as u64),
                         };
-                        // 滑到位了：从任务栏后面提回最上层，别让它一直压在任务栏下面。
-                        crate::windows::platform::bring_to_front(window);
+                        // 滑到位了：留在任务栏之后（topmost 组里仅次于任务栏）。
+                        // 别在这里提回最上层 —— 一提就压到任务栏前面，之后出场那一段
+                        // 就变成「从任务栏上面消失」。
+                        crate::windows::platform::present_behind_taskbar(window);
                     }
                 } else {
                     self.offset = 0.0;
@@ -1842,6 +1849,9 @@ impl Osd {
                 self.offset = 0.0;
                 self.alpha = 1.0;
                 if now >= until {
+                    // 出场前再压一次：整段动画里只有这一步会「从任务栏前面滑下去」，
+                    // 谁在这之前把它提上去了（首帧 resize、激活、系统重排）在这儿兜住。
+                    crate::windows::platform::behind_taskbar(window);
                     // 系统风格：出场也交给滑动线程（滑下去 + 快淡出）。
                     if cfg.anim_style.is_system() && cfg.animate && self.slide > 0.5 {
                         self.start_slide(
@@ -2078,7 +2088,8 @@ impl Osd {
                 self.state = self.build_state(&OsdRequest::device(OsdFunction::Volume), &cfg);
                 self.place(window, cx, &cfg);
                 crate::windows::platform::set_visible(window, true);
-                crate::windows::platform::bring_to_front(window);
+                // 预览也一样：排任务栏之后，别顶到它前面去。
+                crate::windows::platform::present_behind_taskbar(window);
                 self.visible = true;
             }
             self.alpha = 1.0;

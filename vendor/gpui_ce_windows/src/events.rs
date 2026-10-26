@@ -94,7 +94,22 @@ impl WindowsWindowInner {
             // whichever window was active before the click. If that handler consumes the
             // press, `DefWindowProc` never sees it, so the window is never activated at all.
             // So, let's eagerly activate the window.
-            WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
+            // Bolume patch：带 `WS_EX_NOACTIVATE` 的窗口（OSD / 独立右键菜单 /
+            // 各类提示条）点一下也**不许**被激活。
+            //
+            // 以前这里一律回 `MA_ACTIVATE`：一激活，系统就把这扇 topmost 窗口提到
+            // topmost 组最前面 —— 也就是跑到任务栏**前面**。之后它收起来时那一段
+            // 就从任务栏上面划过去（用户在 OSD 上拖一下音量条、或者点一下就中招，
+            // 而只按键触发时不点它，所以看着像「只有某些时候有问题」）。
+            // 这类窗口自己的样式已经写了「别激活我」，照着它办就行。
+            WM_MOUSEACTIVATE => {
+                let ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
+                if ex_style & WS_EX_NOACTIVATE.0 != 0 {
+                    Some(MA_NOACTIVATE as isize)
+                } else {
+                    Some(MA_ACTIVATE as isize)
+                }
+            }
             WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),

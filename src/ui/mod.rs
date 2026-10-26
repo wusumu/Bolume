@@ -1,6 +1,7 @@
 pub mod anim;
 pub mod assets;
 pub mod color;
+pub mod footer_preview;
 pub mod picker;
 pub mod scrollbar;
 pub mod slider;

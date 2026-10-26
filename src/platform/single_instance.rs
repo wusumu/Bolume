@@ -3,10 +3,14 @@
 use windows::Win32::{
     Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE},
     System::Threading::{
-        CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
+        CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, OpenMutexW,
+        SYNCHRONIZATION_SYNCHRONIZE, SetEvent, WaitForSingleObject,
     },
 };
 use windows::core::PCWSTR;
+
+/// 互斥体名：全进程共用一个（界面层、开机交接都用这个名字）。
+pub const INSTANCE_NAME: &str = "Bolume.SingleInstance";
 
 /// 事件名：第二个实例用它叫醒第一个实例把面板弹出来。
 const ACTIVATE_SUFFIX: &str = ".Activate";
@@ -48,6 +52,19 @@ impl SingleInstance {
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    }
+
+    /// 有没有实例在跑：**只看不叫**（开机交接用 —— 那会儿弹面板只会吓人）。
+    pub fn is_running(name: &str) -> bool {
+        let mutex_name = wide(name);
+        unsafe {
+            let Ok(mutex) = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(mutex_name.as_ptr()))
+            else {
+                return false;
+            };
+            let _ = CloseHandle(mutex);
+            true
         }
     }
 

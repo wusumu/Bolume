@@ -223,11 +223,12 @@ pub fn run_theme() {
         crate::platform::system_theme::accent_hex()
     );
     println!(
-        "主题 = {}（亮色槽 {:?} / 深色槽 {:?} / 固定槽 {:?}）",
-        crate::gui::theme_name(&config),
-        config.theme_light,
-        config.theme_dark,
-        config.theme
+        "打底模板 = {}（跟随系统时由系统亮暗决定，固定模式一律深色）",
+        if crate::gui::base_is_dark(&config) {
+            "深色"
+        } else {
+            "浅色"
+        }
     );
     let (surface, accent) = crate::gui::theme_custom(&config);
     println!("自选底色 = {surface:?} / 自选强调色 = {accent:?}");

@@ -64,6 +64,8 @@ icon_assets!(
     "search",
     "adjustments",
     "levels",
+    "wifi",
+    "bluetooth",
 );
 
 pub struct Assets;
