@@ -4,7 +4,7 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写 · 单文件 exe · 绿色免安装 · 配置就在 exe 旁边 · 中英双语界面**
 
-目前版本 **0.84** · [下载](../../releases) · [English](#english)
+目前版本 **0.85** · [下载](../../releases) · [English](#english)
 
 ---
 
@@ -18,7 +18,7 @@ Windows 自带的音量合成器能用，但有几件事一直不舒服：
 - 屏幕亮度得进系统设置翻；
 - 界面是系统画的，改不了。
 
-Bolume 把这些收进一个右下角弹出的面板里：一台默认设备 + 正在出声的应用各一行，每行一根滑条一个静音键；快捷键、滚轮、屏幕提示都能挂上去。
+Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + 正在出声的应用各一行，每行一根滑条一个静音键；快捷键、滚轮、屏幕提示都能挂上去。多屏时面板跟光标走 —— 在哪台屏上点就在哪台屏上弹出。
 
 ## 功能
 
@@ -47,6 +47,7 @@ Bolume 把这些收进一个右下角弹出的面板里：一台默认设备 + �
 - 走 DDC/CI，直接调显示器硬件亮度，不靠 gamma 蒙
 - 当前屏 / 全部屏 / 指定第 N 台三种目标，快捷键可以分开绑
 - 亮度面板可以和音量面板融合成一块：横排时铺在音频上方 / 下方，竖排时贴在左侧 / 右侧，排版跟着音量面板走
+- 保存的预设整块底部一排（几台屏共用）：点一下套给光标所在那台、按住中键套给全部、拖到某台的亮度条上只套给那台；右键删除前会先确认
 
 **屏幕提示（OSD）**
 
@@ -196,6 +197,8 @@ vendor/
 - Per-app volume (percentage / logarithmic / fixed dB), per-app mute, volume caps
 - Switch playback & recording devices, rename them, restore a saved device state at startup
 - Monitor brightness over DDC/CI (current / all / a specific display), optionally merged into the volume panel itself — above/below when it is horizontal, left/right when vertical
+- Saved brightness presets in one row at the bottom of the block: click to apply to the display under the cursor, middle-click to apply to all, drag onto another display's slider for just that one, right-click to delete after a confirm
+- On multi-monitor setups the panel pops up on the display where the cursor is, not always on the primary
 - Its own on-screen display for volume, mute, track changes and brightness, with a layout editor
 - Global hotkeys for everything, including media keys taken over through a low-level keyboard hook, hold-to-repeat, and an app blocklist that gets out of the way in fullscreen games
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
