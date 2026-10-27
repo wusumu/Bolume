@@ -499,6 +499,11 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if is_up {
         // 松开也走这个钩子：把「按下表」里那一位清掉，下一发才算新的一次按下。
         forget_key_down(info.vkCode);
+        // 小键盘在 NumLock 关着时报的是方向 / Del，按下时照数字键码多挂了一位，
+        // 这里一并清掉 —— 否则连发循环会以为这颗键一直按着，松手了还在往下走。
+        if let Some(numpad_key) = numpad_vk_from_scan(info) {
+            forget_key_down(numpad_key);
+        }
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     // 这一发按下来之前，这颗键是不是还按着 —— 是的话就是系统「长按重复」补出来的
@@ -516,6 +521,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     // （吞掉之后 `RegisterHotKey` 那一路自然不会再响，不会重复触发）。
     if numpad_raw() {
         if let Some(numpad_key) = numpad_vk_from_scan(info) {
+            // NumLock 关着时系统记下的是方向 / Del 那一位，`Num4` 从来没进过按下表。
+            // 连发循环问的是 `Num4`（快捷键本身就是按数字键码配的），所以照数字再挂一位，
+            // 松手时由上面那段一并清掉。不然按住小键盘的键只走一档就停。
+            mark_key_down(numpad_key);
             let mods = current_modifiers();
             if CAPTURING.load(Ordering::SeqCst) {
                 // 录制中：按小键盘的键码记下来，NumLock 开不开录的都是同一格。
@@ -626,7 +635,17 @@ pub fn is_key_held(key: u32) -> bool {
     if is_hook_key(key) {
         return tracked_down(key);
     }
+    // 小键盘：NumLock 关着时系统那边按的是方向 / Del，问 `Num4` 永远问不到，
+    // 而钩子已经把它照数字键码记进按下表了（见 `keyboard_proc` 的小键盘分支）。
+    if is_numpad_key(key) {
+        return tracked_down(key) || is_key_down(key);
+    }
     is_key_down(key)
+}
+
+/// 小键盘的数字 / 符号键码（`VK_NUMPAD0`..`VK_DIVIDE`）。
+fn is_numpad_key(key: u32) -> bool {
+    (0x60..=0x6F).contains(&key)
 }
 
 /// 按下表里那一位还挂着没有。
@@ -1320,6 +1339,30 @@ mod tests {
         assert!(!is_key_held(key), "keyup 之后表里的位要清掉");
         // 越界伪键码（鼠标键）不进表，也不该报「按着」。
         assert!(!is_key_held(VK_MOUSE_WHEEL_UP));
+    }
+
+    /// 小键盘按住不放：NumLock 关着时系统记的是方向键，连发循环问的是数字键。
+    ///
+    /// 两边得对得上，否则「按住连发」只走一档就停（问 `Num4` 永远问不到）。
+    #[test]
+    fn numpad_digits_stay_held_while_numlock_is_off() {
+        let mut info = KBDLLHOOKSTRUCT::default();
+        info.scanCode = 0x4B; // 小键盘 4
+        info.vkCode = 0x25; // NumLock 关着时系统报的是 VK_LEFT
+        forget_key_down(info.vkCode);
+        forget_key_down(0x64);
+
+        // 按下：钩子照数字键码再挂一位，连发循环才问得到「还按着」。
+        mark_key_down(info.vkCode);
+        let numpad_key = numpad_vk_from_scan(&info).expect("扫描码要认回 Num4");
+        mark_key_down(numpad_key);
+        assert!(is_key_held(numpad_key), "按住不放");
+        assert_ne!(numpad_key, info.vkCode, "两个键码不是同一个");
+
+        // 松开：方向和数字两位一起清，连发要停。
+        forget_key_down(info.vkCode);
+        forget_key_down(numpad_key);
+        assert!(!is_key_held(numpad_key), "松手之后不能再报按着");
     }
 
     /// 小键盘和主键盘是两套键码：录下来的 `Num0` 不能跟主键盘的 `0` 撞。
