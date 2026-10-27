@@ -4253,13 +4253,15 @@ impl Render for Flyout {
                         .track_scroll(&self.apps_scroll)
                         .on_scroll_wheel(cx.listener(Self::on_apps_wheel))
                         .children(rows),
-                )
-                .child(self.footer(cx));
+                );
+            // 「下方」是相对音频说的，页脚永远是面板最底那一栏 ——
+            // 亮度块插在列表和页脚之间，别把它顶到页脚下面去。
             if merge_below {
                 content = content
                     .child(merge_rule(false))
                     .child(brightness_pane.take().expect("亮度块"));
             }
+            content = content.child(self.footer(cx));
             content
                 .children(device_overlay)
                 .children(tip_overlay)
