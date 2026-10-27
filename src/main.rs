@@ -102,6 +102,11 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--probe-bt") {
+        probe::run_bt();
+        return;
+    }
+
     if let Some(index) = args.iter().position(|arg| arg == "--probe-block") {
         // 可选一个 pid：不给就看当前前台窗口。
         let pid = args

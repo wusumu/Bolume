@@ -72,192 +72,44 @@ pub fn legacy_sound_panel(tab: &str) {
     });
 }
 
-/// 打开「蓝牙设备面板」（就是托盘快速设置里点蓝牙磁贴箭头进去的那层，
-/// 标题是「蓝牙」、里面有「新设备 / 更多蓝牙设置」）。
+/// 打开「蓝牙设备面板」—— 快速设置里那张小面板：标题「蓝牙」，下面列已配对设备。
 ///
-/// Windows 没有和 `ms-availablenetworks:` 对称的蓝牙飞出 URI：
-/// - `ms-settings:bluetooth` 是**整页设置**（不是面板）；
-/// - `ms-controlcenter:` 只到快速设置的**磁贴页**，还差一层。
+/// Win11 支持**带参数的快速设置**：`ms-controlcenter:bluetooth` 会让面板
+/// **直接以蓝牙页打开**。用它的好处是两头都省：
 ///
-/// 所以 Win11 上只能：先打开快速设置，再用 UI Automation 点蓝牙磁贴里的
-/// 「管理蓝牙设备」按钮（AutomationId 固定为 `SplitL2Button`，挂在
-/// `Microsoft.QuickAction.Bluetooth` 下面 —— **这两个 ID 不随系统语言变**，
-/// 所以不用去匹配「管理蓝牙设备」这种会翻译的名字）。
+/// * 用户看不到中间那张磁贴总面板。对比 `ms-controlcenter:`（不带参数）只到磁贴页，
+///   还得再点一次磁贴上的展开按钮；而点那一下要等面板画出来（UIA 树几十毫秒就绪，
+///   第一帧画面要一百多毫秒），中间状态总会露出来；
+/// * 不用 UI Automation 去点系统 UI —— 少一层跨进程调用，也少一种会随系统更新失效的做法。
 ///
 /// Win10 没有这一层：操作中心里的蓝牙磁贴只能开关，设备列表只在设置页里，
-/// 所以老系统退回 `ms-settings:bluetooth`。
+/// 所以退回 `ms-settings:bluetooth`。
 pub fn bluetooth_panel() {
     if windows_build() >= 22_000 {
-        spawn_background(|| {
-            // 整个流程共用一个 UIA 实例：轮询里反复 CoCreateInstance 既慢又多余。
-            let Some(automation) = ui_automation() else {
-                return;
-            };
-            // 快速设置已经开着就直接点，别再多弹一次。
-            if click_manage_bluetooth(&automation) {
-                return;
-            }
-            open_uri_blocking("ms-controlcenter:");
-            // 面板是 XAML 岛，弹出来要一两百毫秒，轮询等它把树建好。
-            for _ in 0..30 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                if click_manage_bluetooth(&automation) {
-                    return;
-                }
-            }
-            // 蓝牙磁贴被用户从快速设置里编辑掉了：至少退回设置页，别点了没反应。
-            open_uri_blocking("ms-settings:bluetooth");
-        });
+        spawn_background(|| open_control_center("bluetooth"));
     } else {
         settings_page("bluetooth");
     }
 }
 
-/// 建一个 UI Automation 根对象。失败（COM 没起、UIA 被策略关掉）返回 `None`。
-fn ui_automation() -> Option<windows::Win32::UI::Accessibility::IUIAutomation> {
-    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
-
-    unsafe {
-        CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
-    }
-}
-
-/// 快速设置面板的 UIA 标识。全部取自系统的 XAML 自动化 Peer，
-/// **都是英文常量、不随系统语言变**，所以不用去匹配「蓝牙」「管理蓝牙设备」这类会翻译的文字。
-mod uia {
-    /// 快速设置顶层窗口的 `ClassName`。
-    pub const CONTROL_CENTER_CLASS: &str = "ControlCenterWindow";
-    /// 蓝牙磁贴的开关按钮 —— 磁贴页和详情页顶部那个开关**用的是同一个 ID**。
-    pub const BLUETOOTH_TILE: &str = "Microsoft.QuickAction.Bluetooth";
-    /// 磁贴右下角那个「展开」小按钮（挂在磁贴的 ListItem 上，是开关的兄弟节点）。
-    pub const SPLIT_BUTTON: &str = "SplitL2Button";
-    /// 二级页（详情页）的容器。
-    pub const PAGE_WINDOW: &str = "PageWindow";
-    /// 二级页左上角的返回箭头。
-    pub const BACK_BUTTON: &str = "BackButton";
-}
-
-/// 在当前已打开的快速设置里点「管理蓝牙设备」，把面板带到蓝牙设备页。
+/// 打开快速设置，并让它直接停在某个磁贴的详情页。
 ///
-/// 返回 `true` 表示「现在就在蓝牙设备页」（可能是本来就开着），调用方不用再开面板；
-/// 返回 `false` 表示快速设置没开 / 蓝牙磁贴被用户移掉了。
-fn click_manage_bluetooth(automation: &windows::Win32::UI::Accessibility::IUIAutomation) -> bool {
-    unsafe {
-        let Some(control_center) = find_control_center(automation) else {
-            return false;
-        };
-
-        // 已经在二级页：蓝牙页就到此为止，别的页（WLAN 等）先退回去。
-        if let Some(page) = find_by_aid(automation, &control_center, uia::PAGE_WINDOW) {
-            if find_by_aid(automation, &page, uia::BLUETOOTH_TILE).is_some() {
-                return true;
-            }
-            let Some(back) = find_by_aid(automation, &page, uia::BACK_BUTTON) else {
-                return false;
-            };
-            if !invoke(&back) {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let Some(control_center) = find_control_center(automation) else {
-                return false;
-            };
-            return click_split_button(automation, &control_center);
-        }
-
-        click_split_button(automation, &control_center)
-    }
-}
-
-/// 在磁贴页上点蓝牙磁贴的展开按钮。
-fn click_split_button(
-    automation: &windows::Win32::UI::Accessibility::IUIAutomation,
-    control_center: &windows::Win32::UI::Accessibility::IUIAutomationElement,
-) -> bool {
-    unsafe {
-        let Some(tile) = find_by_aid(automation, control_center, uia::BLUETOOTH_TILE) else {
-            return false;
-        };
-        // 展开按钮是磁贴（ListItem）的兄弟节点，不在磁贴自己的子树里，
-        // 得先沿 raw view 往上走一层拿 ListItem。
-        let Ok(walker) = automation.RawViewWalker() else {
-            return false;
-        };
-        let Ok(item) = walker.GetParentElement(&tile) else {
-            return false;
-        };
-        let Some(split) = find_by_aid(automation, &item, uia::SPLIT_BUTTON) else {
-            return false;
-        };
-        invoke(&split)
-    }
-}
-
-/// 找快速设置顶层窗口。没开时返回 `None`。
+/// `action` 用磁贴名的小写形式（`bluetooth` / `wifi` / `airplanemode` 都认，实测
+/// Win11 26200）；认不出来就退回磁贴页，不会报错。
 ///
-/// 不按名字（`"快速设置"` / `"Quick settings"`）找，按 `ClassName` 找 —— 那个是常量。
-/// 从桌面根节点直接 Descendants 搜会把整个桌面遍历一遍（几百毫秒），
-/// 所以只在顶层窗口里挨个比类名。
-fn find_control_center(
-    automation: &windows::Win32::UI::Accessibility::IUIAutomation,
-) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
-    use windows::Win32::UI::Accessibility::{TreeScope_Children, UIA_ClassNamePropertyId};
-
-    unsafe {
-        let root = automation.GetRootElement().ok()?;
-        let all = automation.CreateTrueCondition().ok()?;
-        let windows = root.FindAll(TreeScope_Children, &all).ok()?;
-        let count = windows.Length().ok()?;
-
-        for index in 0..count {
-            let Ok(window) = windows.GetElement(index) else {
-                continue;
-            };
-            let Ok(class) = window.GetCurrentPropertyValue(UIA_ClassNamePropertyId) else {
-                continue;
-            };
-            // VARIANT 转字符串：BSTR 的情况才可能是类名。
-            let Ok(name) = windows::core::BSTR::try_from(&class) else {
-                continue;
-            };
-            if name.to_string() == uia::CONTROL_CENTER_CLASS {
-                return Some(window);
-            }
-        }
-        None
-    }
-}
-
-/// 在 `parent` 的子树里按 `AutomationId` 找第一个元素。
-fn find_by_aid(
-    automation: &windows::Win32::UI::Accessibility::IUIAutomation,
-    parent: &windows::Win32::UI::Accessibility::IUIAutomationElement,
-    automation_id: &str,
-) -> Option<windows::Win32::UI::Accessibility::IUIAutomationElement> {
-    use windows::core::Interface;
-    use windows::Win32::System::Variant::VARIANT;
-    use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_AutomationIdPropertyId};
-
-    unsafe {
-        let condition = automation
-            .CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from(automation_id))
-            .ok()?;
-        let element = parent.FindFirst(TreeScope_Descendants, &condition).ok()?;
-        (!element.as_raw().is_null()).then_some(element)
-    }
-}
-
-/// 对元素调 `Invoke`。没有该模式（不是按钮）返回 `false`。
-fn invoke(element: &windows::Win32::UI::Accessibility::IUIAutomationElement) -> bool {
-    use windows::Win32::UI::Accessibility::{IUIAutomationInvokePattern, UIA_InvokePatternId};
-
-    unsafe {
-        let Ok(pattern) = element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
-        else {
-            return false;
-        };
-        pattern.Invoke().is_ok()
+/// 不用 `ShellExecuteW("ms-controlcenter:…")`：那条路走完整的 shell 执行流程，
+/// 光是派发出去就要 200ms 上下（实测 211ms）。协议处理器注册的命令是固定的
+/// `%SystemRoot%\System32\ShellHost.exe url=%1`，直接起它只要几毫秒。
+/// 起不来再退回 `ShellExecuteW`（万一系统改了这条注册）。
+fn open_control_center(action: &str) {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let host = format!("{root}\\System32\\ShellHost.exe");
+    let spawned = Command::new(&host)
+        .arg(format!("url=ms-controlcenter:{action}"))
+        .spawn()
+        .is_ok();
+    if !spawned {
+        open_uri_blocking(&format!("ms-controlcenter:{action}"));
     }
 }
 

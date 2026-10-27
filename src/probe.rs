@@ -207,6 +207,16 @@ pub fn run_appdev(pid: Option<u32>, device: Option<&str>) {
     engine.send(AudioCommand::Shutdown);
 }
 
+/// 探针：走一遍「打开蓝牙设备面板」这条入口。
+///
+/// 面板是系统 UI，我们只管把 `ms-controlcenter:bluetooth` 发出去，
+/// 顺带用系统自带的 UIA 看一眼它是不是真的停在蓝牙页。
+pub fn run_bt() {
+    crate::platform::shell::bluetooth_panel();
+    std::thread::sleep(Duration::from_secs(2));
+    println!("已发送 ms-controlcenter:bluetooth");
+}
+
 /// 探针：当前解析出来的主题 / 自选色（跟随系统 + Windows 强调色）。
 ///
 /// 用来确认「外观模式」「强调色第一个跟随」到底落在哪个颜色上 —— 界面里那些
