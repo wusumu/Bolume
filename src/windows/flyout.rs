@@ -79,6 +79,20 @@ pub fn panel_scale(cfg: &Config) -> f32 {
     (size / crate::config::PANEL_BASE_FONT_SIZE).clamp(0.3, 8.0)
 }
 
+/// 面板里一行应用的高度（逻辑像素）。
+///
+/// 用户填了「行高」（`panel_line_height`）就以它为准；没填就跟着图标大小长，
+/// 最小 `theme::ROW_HEIGHT`（44）。做成自由函数是因为**亮度块也要读它** ——
+/// 融合在面板里的那块亮度，每一行都按这个高度等比伸缩。
+pub fn panel_row_height(cfg: &Config) -> f32 {
+    let custom = cfg.panel_line_height;
+    if custom.is_finite() && custom > 0.5 {
+        return custom;
+    }
+    let icon = cfg.app_icon_size.clamp(16, 64) as f32;
+    (icon + 20.0).max(theme::ROW_HEIGHT)
+}
+
 /// 面板字体族：空串 = 跟随系统默认字体（`None` 就不写这一条）。
 fn panel_font_family(cfg: &Config) -> Option<SharedString> {
     let value = cfg.panel_font.trim();
@@ -1280,11 +1294,7 @@ impl Flyout {
     /// 用户自己填了「行高」就以它为准。**不跟面板字号走**：字号只改文字大小，
     /// 行高不够就自己填一个 —— 这是「面板字号不影响面板大小」的另一半。
     fn row_height(&self) -> f32 {
-        let custom = self.cfg().panel_line_height;
-        if custom.is_finite() && custom > 0.5 {
-            return custom;
-        }
-        (self.icon_size() + 20.0).max(theme::ROW_HEIGHT)
+        panel_row_height(&self.cfg())
     }
 
     /// 窗口高度 = 内容高度，逐项累加，不留弹性空位。
@@ -1350,7 +1360,8 @@ impl Flyout {
         let base = vertical_panel_height(&cfg);
         if cfg.brightness.merged_with_audio() && cfg.panel_layout.is_vertical() {
             base.max(
-                crate::windows::brightness::min_embed_height(&cfg) + theme::FOOTER_HEIGHT,
+                crate::windows::brightness::min_embed_height(&cfg, self.display_count())
+                    + theme::FOOTER_HEIGHT,
             )
         } else {
             base

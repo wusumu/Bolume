@@ -13136,8 +13136,8 @@ impl Settings {
                 .text_size(theme::fs(10.5))
                 .text_color(theme::text_tertiary())
                 .child(lang.pick(
-                    "亮度通过 DDC/CI 直接写给显示器；笔记本内屏或走转接头的显示器通常不支持。\n亮度面板里点数值可以手动填写，点「保存预设」把当前亮度存成预设，右键预设可删除。\n在亮度条上滚动滚轮也能调：一格走多少个百分点可以自己填。",
-                    "Brightness is written to the display over DDC/CI; laptop panels and adapters often do not support it.\nClick the value in the brightness panel to type a level, press Save preset to store it, right-click a preset to remove it.\nScrolling on a brightness slider works too: one notch moves a fixed step you can set yourself.",
+                    "亮度通过 DDC/CI 直接写给显示器；笔记本内屏或走转接头的显示器通常不支持。\n亮度面板里点数值可以手动填写，点「保存预设」把当前亮度存成预设。预设排在面板底部：左键套给光标所在的显示器，中键套给全部，拖到某台显示器的亮度条上则套给那台，右键删除（需确认）。\n在亮度条上滚动滚轮也能调：一格走多少个百分点可以自己填。",
+                    "Brightness is written to the display over DDC/CI; laptop panels and adapters often do not support it.\nClick the value in the brightness panel to type a level, press Save preset to store it. Presets sit along the bottom of the panel: left-click applies one to the display under the cursor, middle-click applies it to every display, drag it onto a display's slider to apply it there, right-click to delete it (with confirmation).\nScrolling on a brightness slider works too: one notch moves a fixed step you can set yourself.",
                 ))
                 .into_any_element(),
         ]

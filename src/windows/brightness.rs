@@ -15,11 +15,11 @@ use std::{
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, ClickEvent, Context, ElementId, FocusHandle, FontWeight, IntoElement,
-    KeyDownEvent, Render, SharedString, TextRun, Window, div, px,
+    KeyDownEvent, Render, SharedString, TextRun, Window, div, px, Pixels,
 };
 
 use crate::{
-    config::{BrightnessPlacement, BrightnessPreset, ConfigStore, DisplayNameMode},
+    config::{BrightnessPlacement, Config, ConfigStore, DisplayNameMode},
     display::{DisplayCommand, DisplayEngine, DisplayInfo},
     i18n::Lang,
     ui::{Entrance, EntranceMotion, SliderDragState, VolumeSlider, anim, icon, theme, wheel_direction},
@@ -49,6 +49,14 @@ const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_GAP: f32 = 3.0;
 /// 每台显示器之间的间距。
 const BLOCK_GAP: f32 = 8.0;
+/// 拖放落点的吸附范围：落在块与块之间的缝里也算最近的那一块。
+const DRAG_SNAP: f32 = 10.0;
+/// 指针挪出去多远才算「拖」，以内都按点击处理。
+const DRAG_THRESHOLD: f32 = 4.0;
+/// 套用成功后目标块闪一下的时长（毫秒）。
+const FLASH_MS: u64 = 320;
+/// 闪光最亮那一下的不透明度（之后二次缓出淡掉）。
+const FLASH_PEAK: f32 = 0.45;
 
 /// 竖向排版的一列有多宽、节奏怎么走。
 ///
@@ -69,32 +77,57 @@ const V_STEP_ROW: f32 = 18.0;
 /// 音量面板要按这个给亮度窗让位（贴在它右 / 下侧时得挪开），所以做成自由函数，
 /// 两边用同一份算法，不会各算各的。两种排版宽高的来源完全不同：
 /// 横排的宽度由用户配（`brightness.width`），竖排的宽度由显示器台数决定。
-pub fn panel_size(cfg: &crate::config::Config, displays: usize) -> (f32, f32) {
+pub fn panel_size(cfg: &Config, displays: usize) -> (f32, f32) {
     if cfg.brightness.panel_layout.is_vertical() {
-        (vertical_width(displays), vertical_height(cfg))
+        (vertical_width(displays), vertical_height(cfg, displays, false))
     } else {
-        (cfg.brightness_width(), horizontal_height(cfg, displays))
+        (cfg.brightness_width(), horizontal_height(cfg, displays, false))
     }
 }
 
-/// 横排：标题 + 每台显示器一块（名称 / 亮度条 / 可选的一排预设）。
-fn horizontal_height(cfg: &crate::config::Config, displays: usize) -> f32 {
-    // 「保存预设」挪到名称行之后，没有预设就不再有第三行 —— 省下来的高度全还给面板。
-    let presets = preset_rows(
-        &cfg.brightness.presets,
-        cfg.language,
-        cfg.brightness.panel_width(cfg.flyout_width()) - H_PAD * 2.0,
-        false,
-    );
-    let block = NAME_ROW_HEIGHT
-        + ROW_GAP
-        + SLIDER_HEIGHT
-        + if presets > 0.0 { ROW_GAP + presets } else { 0.0 };
+/// 亮度块每一行的高度。
+///
+/// 全部按音量面板的「行高」等比伸缩：面板行高（`theme::ROW_HEIGHT`，44）算 1 倍，
+/// 用户把行高调高，亮度块跟着一起变高 —— 两块摆在一块儿才不会一个松一个挤。
+/// 只改尺寸不改字：和面板本身「字号只改字、行高只改行」的分工一致。
+#[derive(Clone, Copy, Debug)]
+struct Metrics {
+    name_row: f32,
+    slider_row: f32,
+    chip: f32,
+    label_row: f32,
+    step_row: f32,
+}
+
+/// 亮度块的 1 倍行高 = 默认配置下的面板行高（图标 32 + 20）。
+///
+/// 拿它当基准，默认配置下亮度块的行高（20）一个像素都不动；
+/// 用户调「面板行高」或应用图标大小，亮度块才跟着等比伸缩。
+const BASE_ROW_HEIGHT: f32 = 52.0;
+
+fn metrics(cfg: &Config) -> Metrics {
+    let scale = (crate::windows::flyout::panel_row_height(cfg) / BASE_ROW_HEIGHT).clamp(0.7, 2.5);
+    Metrics {
+        name_row: (NAME_ROW_HEIGHT * scale).round(),
+        slider_row: (SLIDER_HEIGHT * scale).round(),
+        chip: (CHIP_HEIGHT * scale).round(),
+        label_row: (V_LABEL_ROW * scale).round(),
+        step_row: (V_STEP_ROW * scale).round(),
+    }
+}
+
+/// 横排：每台显示器一块（名称行 + 亮度条），最底下一排共用的预设。
+fn horizontal_height(cfg: &Config, displays: usize, embedded: bool) -> f32 {
+    let m = metrics(cfg);
     let count = displays.max(1) as f32;
+    let block = m.name_row + ROW_GAP + m.slider_row;
     // 多台之间还夹一条 1px 分隔线，上下各 BLOCK_GAP。
     let separators = (count - 1.0).max(0.0);
-    (H_PAD * 2.0 + HEADER_HEIGHT + 1.0 + count * block + separators * (BLOCK_GAP * 2.0 + 1.0))
-        .max(80.0)
+    (chrome_height(embedded, false)
+        + count * block
+        + separators * (BLOCK_GAP * 2.0 + 1.0)
+        + preset_bar_extra(cfg, displays))
+    .max(80.0)
 }
 
 /// 竖排：一台显示器一列，宽 = 内边距 + 若干列。
@@ -103,12 +136,15 @@ fn vertical_width(displays: usize) -> f32 {
     PAD * 2.0 + count * V_COLUMN_WIDTH + (count - 1.0) * V_COLUMN_GAP
 }
 
-/// 竖排：标题 + 最高的一列。所有列高度一样（预设有几个是全局配置），取一列即可。
+/// 竖排：标题 + 最高的一列 + 底部预设排。
 ///
 /// `brightness.vertical_height` 写 0（默认）就跟着**音频面板竖向排版时的高度**走，
 /// 两个面板并排时上下齐平；写了数字就自己定。
-fn vertical_height(cfg: &crate::config::Config) -> f32 {
-    let at_least = min_embed_height(cfg);
+fn vertical_height(cfg: &Config, displays: usize, embedded: bool) -> f32 {
+    let at_least = chrome_height(embedded, true)
+        + column_fixed_height(cfg)
+        + V_FADER_MIN
+        + preset_bar_extra(cfg, displays);
     let target = match cfg.brightness.vertical_panel_height() {
         Some(height) => height,
         None => crate::windows::flyout::vertical_panel_height(cfg),
@@ -116,32 +152,27 @@ fn vertical_height(cfg: &crate::config::Config) -> f32 {
     target.max(at_least)
 }
 
-/// 面板上下那些不归列管的高度：外内边距 + 标题 + 分隔线。
-fn chrome_height() -> f32 {
-    PAD * 2.0 + HEADER_HEIGHT + 1.0
+/// 上下内边距 +（独立窗才有的）标题与分隔线。
+///
+/// 融合进音量面板时标题整个取消：那块地方本来就紧挨着音频，多一行「显示器亮度」
+/// 只是白占高度。
+fn chrome_height(embedded: bool, vertical: bool) -> f32 {
+    let pad = if vertical { PAD } else { H_PAD };
+    let head = if embedded { 0.0 } else { HEADER_HEIGHT + 1.0 };
+    pad * 2.0 + head
 }
 
-/// 一列里除推子之外的高度：名称 / 读数+步进 / 预设，以及它们之间的缝。
-fn column_fixed_height(cfg: &crate::config::Config) -> f32 {
-    V_LABEL_ROW
-        + ROW_GAP * 3.0
-        + V_STEP_ROW
-        + preset_rows(
-            &cfg.brightness.presets,
-            cfg.language,
-            V_COLUMN_WIDTH - V_COLUMN_PAD * 2.0,
-            true,
-        )
+/// 竖排时交给各列的高度：总高扣掉标题那一层、再扣掉底部那排预设。
+fn columns_height(cfg: &Config, displays: usize, embedded: bool) -> f32 {
+    vertical_height(cfg, displays, embedded)
+        - chrome_height(embedded, true)
+        - preset_bar_extra(cfg, displays)
 }
 
-/// 一列的总高度。
-fn column_height(cfg: &crate::config::Config) -> f32 {
-    vertical_height(cfg) - chrome_height()
-}
-
-/// 推子那一截：列高扣掉固定的几段，剩下的都给它（最少 V_FADER_MIN）。
-fn fader_height(cfg: &crate::config::Config) -> f32 {
-    (column_height(cfg) - column_fixed_height(cfg)).max(V_FADER_MIN)
+/// 一列里除推子之外的高度：名称 / 读数+步进 / 保存预设，以及它们之间的缝。
+fn column_fixed_height(cfg: &Config) -> f32 {
+    let m = metrics(cfg);
+    m.label_row + ROW_GAP * 3.0 + m.step_row + m.chip
 }
 
 /// 一个 chip 的宽度估算。
@@ -165,33 +196,20 @@ fn save_label(lang: Lang, vertical: bool) -> &'static str {
     }
 }
 
-/// 预设那一排折成几行、一共多高。
+/// 底部那排预设有多高（放不下就折行，折出来的行数也算进去）。
 ///
-/// `inner_width` 是这一排能用的宽度（横排是面板内宽，竖排是一列的净宽）；
-/// `with_save` 表示「保存预设」也在这排里（只有竖排这样，横排它长在名称行右端）。
-/// 横排没有预设时返回 0 —— 这一行整个不出现。
-fn preset_rows(
-    presets: &[BrightnessPreset],
-    lang: Lang,
-    inner_width: f32,
-    with_save: bool,
-) -> f32 {
-    if presets.is_empty() && !with_save {
+/// 没有预设就是 0 —— 这一排整个不出现。
+fn preset_bar_height(cfg: &Config, displays: usize) -> f32 {
+    let presets = &cfg.brightness.presets;
+    if presets.is_empty() {
         return 0.0;
     }
-    let mut widths: Vec<f32> = presets
-        .iter()
-        .map(|preset| chip_width(&preset.name))
-        .collect();
-    if with_save {
-        // 竖排那一格没有图标，左右内边距也从 14 收到 8。
-        widths.push(chip_width(save_label(lang, true)) - 14.0 + 8.0);
-    }
-
-    let inner = inner_width;
+    let m = metrics(cfg);
+    let inner = preset_bar_width(cfg, displays);
     let mut rows = 1.0;
     let mut used = 0.0;
-    for width in widths {
+    for preset in presets {
+        let width = chip_width(&preset.name);
         if used > 0.0 && used + CHIP_GAP + width > inner {
             rows += 1.0;
             used = width;
@@ -199,7 +217,23 @@ fn preset_rows(
             used += if used > 0.0 { CHIP_GAP } else { 0.0 } + width;
         }
     }
-    rows * CHIP_HEIGHT + (rows - 1.0) * CHIP_GAP
+    rows * m.chip + (rows - 1.0) * CHIP_GAP
+}
+
+/// 预设排连同上面那条缝一共占多高。
+fn preset_bar_extra(cfg: &Config, displays: usize) -> f32 {
+    let height = preset_bar_height(cfg, displays);
+    if height > 0.0 { BLOCK_GAP + height } else { 0.0 }
+}
+
+/// 预设那一排能用的宽度：横排是面板净宽，竖排是所有列加起来的净宽。
+fn preset_bar_width(cfg: &Config, displays: usize) -> f32 {
+    let full = if cfg.brightness.panel_layout.is_vertical() {
+        vertical_width(displays) - PAD * 2.0
+    } else {
+        cfg.brightness.panel_width(cfg.flyout_width()) - H_PAD * 2.0
+    };
+    full.max(40.0)
 }
 
 /// 融合模式下亮度块要占多大。
@@ -225,7 +259,7 @@ pub struct Embed {
 pub fn embed_height(cfg: &crate::config::Config, displays: usize) -> f32 {
     let mut cfg = cfg.clone();
     cfg.brightness.width = cfg.flyout_width().round().max(0.0) as u32;
-    horizontal_height(&cfg, displays)
+    horizontal_height(&cfg, displays, true)
 }
 
 /// 融合时亮度块要占多宽（竖排用；高度由父面板撑满）。
@@ -233,12 +267,16 @@ pub fn embed_width(displays: usize) -> f32 {
     vertical_width(displays)
 }
 
-/// 竖排融合时亮度列**至少**要这么高：标题 + 名称 + 读数 + 预设，推子再短也有 `V_FADER_MIN`。
+/// 竖排融合时亮度列**至少**要这么高：名称 + 读数 + 保存预设 + 底部那排预设，
+/// 推子再短也有 `V_FADER_MIN`。
 ///
-/// 父面板（音量面板）竖向排版时按自己的高度给亮度列让位，可预设攒多了这列会不够用 ——
+/// 父面板（音量面板）竖向排版时按自己的高度给亮度列让位，可预设攒多了这排会不够用 ——
 /// 那时面板整体得抬到这一份，不然最底下的预设格子会被面板底边裁掉一半。
-pub fn min_embed_height(cfg: &crate::config::Config) -> f32 {
-    chrome_height() + column_fixed_height(cfg) + V_FADER_MIN
+pub fn min_embed_height(cfg: &crate::config::Config, displays: usize) -> f32 {
+    chrome_height(true, true)
+        + column_fixed_height(cfg)
+        + V_FADER_MIN
+        + preset_bar_extra(cfg, displays)
 }
 
 pub struct Brightness {
@@ -272,6 +310,39 @@ pub struct Brightness {
     /// 上一次处理滚轮的时刻：`on_scroll_wheel` 在同一帧里可能被派发好几遍，
     /// 不节流的话一格滚轮会连跳好几档（音量面板里踩过同一个坑）。
     wheel_last_at: Option<Instant>,
+    /// 正按着某颗预设往显示器上拖（松手决定套给谁）。
+    drag_preset: Option<PresetDrag>,
+    /// 拖动中光标在哪（窗口坐标）：那颗跟着走的预设照它摆。
+    drag_at: Option<gpui::Point<Pixels>>,
+    /// 刚套用完、正在闪的那几块。
+    flash: Option<Flash>,
+    /// 闪光的序号：连着套用两次时，旧的那段收尾不许把新的清掉。
+    flash_seq: u64,
+    /// 每台显示器那一块的矩形（各块里的 canvas 每帧量一次），拖放时按坐标认落点。
+    block_rects: Rc<RefCell<HashMap<String, gpui::Bounds<Pixels>>>>,
+    /// 整块内容的矩形：松手时判断「还在面板里」还是拖出去了。
+    drag_area: Rc<std::cell::Cell<Option<gpui::Bounds<Pixels>>>>,
+    /// 右键点了哪颗预设、正等着确认删除。
+    confirm_delete: Option<usize>,
+}
+
+/// 正在拖的那颗预设。
+struct PresetDrag {
+    /// 预设序号（配置里的下标）。
+    index: usize,
+    /// 要套用的亮度值 —— 按下时就记下来，拖的过程中配置要是变了也不影响。
+    value: u32,
+    /// 此刻悬在哪台显示器上（那一块会提亮）。
+    over: Option<String>,
+    /// 按下时指针在哪：区分「点了一下」和「拖出去了」。
+    origin: gpui::Point<Pixels>,
+    /// 指针离开过按下点：这一趟算拖放，落在空处就什么也不做。
+    moved: bool,
+}
+
+/// 套用成功后的闪光：哪几块、从什么时候开始。
+struct Flash {
+    keys: Vec<String>,
 }
 
 impl Brightness {
@@ -301,6 +372,13 @@ impl Brightness {
             rest_offset: 0.0,
             anim: Entrance::new(),
             wheel_last_at: None,
+            drag_preset: None,
+            drag_at: None,
+            flash: None,
+            flash_seq: 0,
+            block_rects: Rc::new(RefCell::new(HashMap::new())),
+            drag_area: Rc::new(std::cell::Cell::new(None)),
+            confirm_delete: None,
         }
     }
 
@@ -478,6 +556,151 @@ impl Brightness {
             .iter()
             .find(|display| display.key == key)
             .and_then(|display| display.brightness)
+    }
+
+    /// 光标所在的那台显示器 —— 预设左键点击就套给它。
+    ///
+    /// 口径和亮度快捷键的「鼠标所在的那块」一致（`display::monitor_index_at_cursor`），
+    /// 面板摆在谁身上，左键点预设改的就是谁。
+    fn cursor_display_key(&self) -> Option<String> {
+        let displays = self.displays.borrow();
+        if displays.is_empty() {
+            return None;
+        }
+        let index = crate::display::monitor_index_at_cursor().min(displays.len() - 1);
+        let display = displays.get(index)?;
+        display.brightness?;
+        Some(display.key.clone())
+    }
+
+    /// 所有能读亮度的显示器（DDC/CI 不通的跳过）。
+    fn lit_display_keys(&self) -> Vec<String> {
+        self.displays
+            .borrow()
+            .iter()
+            .filter(|display| display.brightness.is_some())
+            .map(|display| display.key.clone())
+            .collect()
+    }
+
+    /// 把一组显示器都套成同一个亮度。
+    fn apply_preset(&mut self, keys: Vec<String>, value: u32, cx: &mut Context<Self>) {
+        if keys.is_empty() {
+            return;
+        }
+        // 手动输入框留着会让读数看起来没变，先收掉。
+        self.editing = None;
+        for key in &keys {
+            self.set_brightness(key, value);
+        }
+        // 落定那一下：被套用的块闪一下，眼睛能确认「套到的是这台」。
+        self.flash_blocks(keys, cx);
+        cx.notify();
+    }
+
+    /// 拖到哪台显示器上了（按各块自己量出来的矩形认，不是按行号猜）。
+    ///
+    /// 块与块之间隔着 17px 的分隔缝，光标落在缝里也算最近的那一块 ——
+    /// 落点判定和拖动时的高亮用的是同一个函数，看到亮哪块就是套给哪块。
+    fn drag_over_at(&self, position: gpui::Point<Pixels>) -> Option<String> {
+        let rects = self.block_rects.borrow();
+        // 正中某一块的距离就是 0；落在块与块之间的缝里，按最近的吸附（半个缝以内）。
+        rects
+            .iter()
+            .map(|(key, rect)| {
+                let dx = (rect.origin.x - position.x)
+                    .max(position.x - (rect.origin.x + rect.size.width))
+                    .max(Pixels::ZERO);
+                let dy = (rect.origin.y - position.y)
+                    .max(position.y - (rect.origin.y + rect.size.height))
+                    .max(Pixels::ZERO);
+                (key, dx.as_f32().max(dy.as_f32()))
+            })
+            .filter(|(_, distance)| *distance <= DRAG_SNAP)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(key, _)| key.clone())
+    }
+
+    /// 拖动中：记下光标在哪（画那颗跟着走的预设）、落点换了就把那一块提亮。
+    fn update_drag(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag_preset.as_ref() else {
+            return;
+        };
+        let origin = drag.origin;
+        let over = self.drag_over_at(position);
+        let moved = (position.x - origin.x).as_f32().abs() > DRAG_THRESHOLD
+            || (position.y - origin.y).as_f32().abs() > DRAG_THRESHOLD;
+        let position_changed = self.drag_at != Some(position);
+        self.drag_at = Some(position);
+        let changed = match self.drag_preset.as_mut() {
+            Some(drag) => {
+                let over_changed = drag.over != over;
+                drag.over = over;
+                let moved_now = moved && !drag.moved;
+                drag.moved |= moved;
+                over_changed || moved_now
+            }
+            None => false,
+        };
+        if position_changed || changed {
+            cx.notify();
+        }
+    }
+
+    /// 松手：落在某台显示器上就套给那台；压根没拖动（就是点了一下）才套给光标所在的那台；
+    /// 拖出去了却落在空处 = 取消，什么也不做。
+    fn finish_preset_drag(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        inside: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.drag_preset.take() else {
+            return;
+        };
+        self.drag_at = None;
+        let target = match self.drag_over_at(position) {
+            Some(key) => Some(key),
+            None if !drag.moved && inside => self.cursor_display_key(),
+            None => None,
+        };
+        if let Some(key) = target {
+            self.apply_preset(vec![key], drag.value, cx);
+        }
+        cx.notify();
+    }
+
+    /// 让这几块闪一下（套用成功的动画反馈）。
+    fn flash_blocks(&mut self, keys: Vec<String>, cx: &mut Context<Self>) {
+        self.flash = Some(Flash { keys });
+        self.flash_seq = self.flash_seq.wrapping_add(1);
+        let seq = self.flash_seq;
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FLASH_MS + 60))
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                // 又闪了一次就交给新的那一段收尾。
+                if this.flash_seq == seq {
+                    this.flash = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 删除一颗预设（确认之后才走到这儿）。少了一格，窗口 / 父面板要跟着重量。
+    fn delete_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
+        let _ = self.config.borrow_mut().update(|config| {
+            if index < config.brightness.presets.len() {
+                config.brightness.presets.remove(index);
+            }
+        });
+        self.update_frame(window, cx);
+        cx.notify();
     }
 
     /// 悬停在某台显示器上滚轮：按段数一格格调它的亮度。
@@ -903,23 +1126,35 @@ impl Brightness {
 
 impl Render for Brightness {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let lang = self.cfg().language;
+        let cfg = self.cfg();
+        let lang = cfg.language;
         let displays = self.displays.borrow().clone();
         let error = self.error.borrow().clone();
+        let embedded = self.embed.is_some();
 
         // 竖向：一台显示器一列，横着排开；横向：一台一行，块之间夹一条分隔线。
-        let vertical = self.cfg().brightness.panel_layout.is_vertical();
-        let mut blocks: Vec<gpui::AnyElement> = Vec::new();
+        let vertical = cfg.brightness.panel_layout.is_vertical();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
         if displays.is_empty() {
-            blocks.push(self.empty_hint(lang, error));
+            rows.push(self.empty_hint(lang, error));
         } else if vertical {
+            let mut columns: Vec<gpui::AnyElement> = Vec::new();
             for (index, display) in displays.iter().enumerate() {
-                blocks.push(self.monitor_column(display, index, lang, window, cx));
+                columns.push(self.monitor_column(display, index, lang, window, cx));
             }
+            rows.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(V_COLUMN_GAP))
+                    .children(columns)
+                    .into_any_element(),
+            );
         } else {
             for (index, display) in displays.iter().enumerate() {
                 if index > 0 {
-                    blocks.push(
+                    rows.push(
                         div()
                             .h(px(1.))
                             .flex_none()
@@ -928,14 +1163,14 @@ impl Render for Brightness {
                             .into_any_element(),
                     );
                 }
-                blocks.push(self.monitor_block(display, lang, cx));
+                rows.push(self.monitor_block(display, lang, cx));
             }
         }
 
-        let embedded = self.embed.is_some();
         // 横排左右留 14：和音量面板的行同一条边，两块并排 / 上下看着才是一条线。
         let pad = if vertical { PAD } else { H_PAD };
         let mut content = div()
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -946,8 +1181,11 @@ impl Render for Brightness {
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
-                    // 点别处 = 确认这次手动输入。
+                    // 点别处 = 确认这次手动输入、收起右键确认条。
                     this.commit_edit(cx);
+                    if this.confirm_delete.take().is_some() {
+                        cx.notify();
+                    }
                 }),
             );
         if embedded {
@@ -965,24 +1203,35 @@ impl Render for Brightness {
                 .bg(theme::surface_window())
                 .rounded(px(theme::RADIUS_WINDOW));
         }
-        let content = content
-            .child(self.header(lang, pad))
-            .child(div().h(px(1.)).flex_none().bg(theme::border()))
-            .child(
-                div()
-                    .flex()
-                    .when(vertical, |style| {
-                        style.flex_row().items_start().gap(px(V_COLUMN_GAP))
-                    })
-                    .when(!vertical, |style| style.flex_col().gap(px(BLOCK_GAP)))
-                    .px(px(pad))
-                    .py(px(pad))
-                    .children(blocks),
-            );
+        // 融合进音量面板时没有标题那一块：那块地方紧挨着音频，
+        // 多一行「显示器亮度」只是白占高度。
+        if !embedded {
+            content = content
+                .child(self.header(lang, pad))
+                .child(div().h(px(1.)).flex_none().bg(theme::border()));
+        }
+        let preset_bar = self.preset_bar(lang, cx);
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(BLOCK_GAP))
+            .px(px(pad))
+            .py(px(pad))
+            .children(rows);
+        if let Some(bar) = preset_bar {
+            body = body.child(bar);
+        }
+        let mut content = content.child(body).child(self.drag_sensors(cx));
+        if let Some(ghost) = self.drag_ghost() {
+            content = content.child(ghost);
+        }
 
         if embedded {
             // 融合：整块由父面板布局，不自带那一层「贴底对齐」的外壳。
-            return div().w_full().when(vertical, |style| style.h_full()).child(content);
+            return div()
+                .w_full()
+                .when(vertical, |style| style.h_full())
+                .child(content);
         }
 
         // 尺寸永远是完整那一份：三档动画都是整扇窗在滑（或原地淡），内容不裁不缩。
@@ -1234,11 +1483,14 @@ impl Brightness {
 
         // 名称行：名字 + 步进 + 保存预设。读数挪到下面跟亮度条同一排去了，
         // 这一行空出来的右端正好摆「保存预设」—— 从前它独占一行，白占 21px。
+        let m = metrics(&config);
+        let dragging = self.drag_preset.as_ref().and_then(|drag| drag.over.as_deref())
+            == Some(key.as_str());
         let label = div()
             .flex()
             .items_center()
             .gap(px(4.))
-            .h(px(NAME_ROW_HEIGHT))
+            .h(px(m.name_row))
             .child(icon("monitor", 12.0, theme::text_tertiary()))
             .child(
                 div()
@@ -1260,19 +1512,29 @@ impl Brightness {
         let slider_row = div()
             .flex()
             .items_center()
-            .h(px(SLIDER_HEIGHT))
+            .h(px(m.slider_row))
             .pl(px(H_BAR_INSET))
             .gap(px(H_READOUT_GAP))
             .child(div().flex_1().min_w_0().child(slider))
             .child(self.value_slot(&key, value, editable, H_READOUT_WIDTH, true, lang, cx));
 
+        // 这一块的矩形：拖预设过来时按它认落点（`drag_sensors` 里读）。
+        let rects = self.block_rects.clone();
+        let key_for_rect = key.clone();
         let key_for_wheel = key.clone();
-        let mut block = div()
+        div()
             .id(SharedString::from(format!("bright-block-{key}")))
+            .relative()
             .flex()
             .flex_col()
             .gap(px(ROW_GAP))
-            // 滚轮挂在整块上，不是只挂在滑条上：光标落在名称行或预设行也算「悬停在这台显示器」，
+            // 拖着预设悬在这台上：整块提亮一层，落点一眼看得出。
+            .when(dragging, |style| {
+                style
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(theme::accent_soft())
+            })
+            // 滚轮挂在整块上，不是只挂在滑条上：光标落在名称行也算「悬停在这台显示器」，
             // 和面板里「整行都能滚」是同一套手感。
             .on_scroll_wheel(cx.listener(
                 move |this, event: &gpui::ScrollWheelEvent, _window, cx| {
@@ -1280,12 +1542,21 @@ impl Brightness {
                 },
             ))
             .child(label)
-            .child(slider_row);
-        // 有预设才多一行；没有的话这一排连高度都不留。
-        if !config.brightness.presets.is_empty() {
-            block = block.child(self.preset_row(&key, value, editable, lang, false, false, cx));
-        }
-        block.into_any_element()
+            .child(slider_row)
+            .children(self.block_decor(&key, m.name_row + ROW_GAP + m.slider_row))
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        rects.borrow_mut().insert(key_for_rect.clone(), bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full(),
+            )
+            .into_any_element()
     }
 
     /// 竖向排版的一列：名称 / 立起来的亮度条 / 读数+步进 / 预设。
@@ -1314,12 +1585,19 @@ impl Brightness {
 
         let label = self.column_label(display, index, cfg.brightness.name_mode, window);
 
+        // 一列能用的高度：总高扣掉标题（独立窗才有）和底部的预设排，再扣掉固定的几段。
+        let m = metrics(&cfg);
+        let displays = self.displays.borrow().len();
+        let fader = (columns_height(&cfg, displays, self.embed.is_some())
+            - column_fixed_height(&cfg))
+        .max(V_FADER_MIN);
+
         // 推子：整列里最高的一块，宽度撑满列。长度由面板高度算，
         // 面板配高了推子就长（调音台那种手感）。
         let slider = self.brightness_slider(&key, slider_value, editable, true);
         let fader = div()
             .w_full()
-            .h(px(fader_height(&cfg)))
+            .h(px(fader))
             .flex_none()
             .px(px(V_COLUMN_PAD))
             .child(slider);
@@ -1330,34 +1608,66 @@ impl Brightness {
             .items_center()
             .justify_center()
             .gap(px(1.))
-            .h(px(V_STEP_ROW))
+            .h(px(m.step_row))
             .flex_none()
             .child(self.step_button(&key, editable, "−", -1, 16.0, cx))
             .child(self.value_slot(&key, value, editable, 30.0, false, lang, cx))
             .child(self.step_button(&key, editable, "+", 1, 16.0, cx));
 
-        let presets = self.preset_row(&key, value, editable, lang, true, true, cx);
+        // 列底只留「保存预设」：预设本体挪到整块底部那一排共用了。
+        let save = div()
+            .w_full()
+            .px(px(V_COLUMN_PAD))
+            .flex()
+            .justify_center()
+            .child(self.save_button(&key, editable, true, lang, cx));
 
+        let dragging = self.drag_preset.as_ref().and_then(|drag| drag.over.as_deref())
+            == Some(key.as_str());
+        let rects = self.block_rects.clone();
+        let key_for_rect = key.clone();
         let key_for_wheel = key.clone();
         div()
             .id(SharedString::from(format!("bright-col-{key}")))
+            .relative()
             .w(px(V_COLUMN_WIDTH))
-            .h(px(column_height(&cfg)))
+            .h(px(columns_height(&cfg, displays, self.embed.is_some())))
             .flex_none()
             .flex()
             .flex_col()
             .gap(px(ROW_GAP))
+            // 拖着预设悬在这台上：整列提亮一层。
+            .when(dragging, |style| {
+                style
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(theme::accent_soft())
+            })
             .on_scroll_wheel(cx.listener(
                 move |this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     this.on_block_wheel(&key_for_wheel, event, cx);
                 },
             ))
-            // 列里每一行都先按列宽收窄再摆：名称行和预设行必须和推子共用同一条中线，
+            // 列里每一行都先按列宽收窄再摆：名称行和保存格子必须和推子共用同一条中线，
             // 不然编号和保存格子会各自贴着左边，看着和推子差几像素（列宽 64 很窄，看得出）。
             .child(div().w_full().px(px(V_COLUMN_PAD)).child(label))
             .child(fader)
             .child(step_row)
-            .child(div().w_full().px(px(V_COLUMN_PAD)).child(presets))
+            .child(save)
+            .children(
+                self.block_decor(&key, columns_height(&cfg, displays, self.embed.is_some())),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        rects.borrow_mut().insert(key_for_rect.clone(), bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full(),
+            )
             .into_any_element()
     }
 
@@ -1427,87 +1737,356 @@ impl Brightness {
         .into_any_element()
     }
 
-    /// 预设 chips：点一下套用，右键删除；`save_here` 时末尾再跟一个「保存预设」。
+    /// 整块底部共用的那一排预设。
     ///
-    /// `center` = 竖向排版：列太窄，格子按列中线居中摆，和推子对齐。
-    /// 横排把「保存预设」摆在名称行最右端（见 `save_button`），这里就不再重复一个。
-    fn preset_row(
+    /// 从前每台显示器的拉条下面各挂一排（同一批预设重复好几遍），现在只留这一排：
+    /// 左键套给光标所在的那台、中键套给所有、拖到某台显示器的块上就套给那台、
+    /// 右键删（先出确认条）。
+    fn preset_bar(&self, lang: Lang, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let cfg = self.cfg();
+        let presets = cfg.brightness.presets.clone();
+        if presets.is_empty() && self.confirm_delete.is_none() {
+            return None;
+        }
+        let m = metrics(&cfg);
+        if let Some(index) = self.confirm_delete {
+            return Some(self.confirm_row(index, &presets, m.chip, lang, cx));
+        }
+
+        // 当前值取「光标所在那台」的读数：和左键点击的目标同一个口径，
+        // 于是亮着的那一颗就是「点一下会发生什么」。
+        let current = self
+            .cursor_display_key()
+            .and_then(|key| self.current_percent(&key));
+        let dragging = self
+            .drag_preset
+            .as_ref()
+            .filter(|drag| drag.moved)
+            .map(|drag| drag.index);
+        let mut chips: Vec<gpui::AnyElement> = Vec::new();
+        for (index, preset) in presets.iter().enumerate() {
+            chips.push(self.preset_chip(
+                index,
+                &preset.name,
+                preset.brightness,
+                current == Some(preset.brightness),
+                dragging == Some(index),
+                m.chip,
+                cx,
+            ));
+        }
+
+        Some(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(CHIP_GAP))
+                .children(chips)
+                .into_any_element(),
+        )
+    }
+
+    /// 一颗预设。
+    fn preset_chip(
         &self,
-        key: &str,
+        index: usize,
+        name: &str,
         value: u32,
-        editable: bool,
-        lang: Lang,
-        center: bool,
-        save_here: bool,
+        active: bool,
+        dragging: bool,
+        chip_height: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let presets = self.cfg().brightness.presets;
-        let mut chips: Vec<gpui::AnyElement> = Vec::new();
+        div()
+            .id(SharedString::from(format!("bright-preset-{index}")))
+            .h(px(chip_height))
+            .flex_none()
+            .px(px(7.))
+            .flex()
+            .items_center()
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(if active {
+                theme::accent()
+            } else {
+                theme::track()
+            })
+            .text_size(px(10.5))
+            .text_color(if active {
+                theme::text_primary()
+            } else {
+                theme::text_secondary()
+            })
+            .cursor_pointer()
+            .when(dragging, |style| style.opacity(0.4))
+            .hover(|style| style.bg(theme::surface_hover()))
+            // 左键按下就开始「可能要拖」：拖到哪台显示器上由 `drag_sensors` 定，
+            // 原地松手 = 套给光标所在那台。
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.confirm_delete = None;
+                    this.drag_preset = Some(PresetDrag {
+                        index,
+                        value,
+                        over: None,
+                        origin: event.position,
+                        moved: false,
+                    });
+                    this.drag_at = Some(event.position);
+                    cx.notify();
+                }),
+            )
+            // 中键：一次套给所有能调亮度的显示器。
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let keys = this.lit_display_keys();
+                    this.apply_preset(keys, value, cx);
+                }),
+            )
+            // 右键：删这颗预设，先问一句（确认条见 `confirm_row`）。
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.confirm_delete = Some(index);
+                    cx.notify();
+                }),
+            )
+            .child(name.to_string())
+            .into_any_element()
+    }
 
-        for (index, preset) in presets.iter().enumerate() {
-            let target = preset.brightness;
-            let key_for_click = key.to_string();
-            let active = editable && target == value;
-            chips.push(
+    /// 右键删除的确认条：原地顶掉整排预设，高度和原来一样，不跳。
+    fn confirm_row(
+        &self,
+        index: usize,
+        presets: &[crate::config::BrightnessPreset],
+        chip_height: f32,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let name = presets
+            .get(index)
+            .map(|preset| preset.name.clone())
+            .unwrap_or_default();
+        let question = if lang.is_en() {
+            format!("Delete preset \"{name}\"?")
+        } else {
+            format!("删除预设「{name}」？")
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(CHIP_GAP))
+            .h(px(chip_height))
+            .child(
                 div()
-                    .id(SharedString::from(format!("bright-preset-{key}-{index}")))
-                    .h(px(CHIP_HEIGHT))
-                    .px(px(7.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(theme::RADIUS_SMALL))
-                    .bg(if active {
-                        theme::accent()
-                    } else {
-                        theme::track()
-                    })
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
                     .text_size(px(10.5))
-                    .text_color(if active {
-                        theme::text_primary()
-                    } else {
-                        theme::text_secondary()
-                    })
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme::surface_hover()))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        // 手动输入框留着会让读数看起来没变，先收掉。
-                        this.editing = None;
-                        this.set_brightness(&key_for_click, target);
-                        cx.notify();
-                    }))
-                    // 右键删掉这个预设：面板里没有「悬浮提示」，右键是这里最省事的方式。
-                    .on_mouse_down(
-                        gpui::MouseButton::Right,
-                        cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            let _ = this.config.borrow_mut().update(|config| {
-                                if index < config.brightness.presets.len() {
-                                    config.brightness.presets.remove(index);
-                                }
-                            });
-                            // 少了一格，窗口跟着缩短。
-                            this.update_frame(window, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child(preset.name.clone())
+                    .text_color(theme::text_secondary())
+                    .child(question),
+            )
+            .child(self.confirm_button(
+                "bright-preset-delete",
+                lang.pick("删除", "Delete"),
+                true,
+                chip_height,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.delete_preset(index, window, cx);
+                }),
+            ))
+            .child(self.confirm_button(
+                "bright-preset-cancel",
+                lang.pick("取消", "Cancel"),
+                false,
+                chip_height,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.confirm_delete = None;
+                    cx.notify();
+                }),
+            ))
+            .into_any_element()
+    }
+
+    /// 确认条上的那颗按钮（`danger` = 删除）。
+    fn confirm_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        danger: bool,
+        height: f32,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> gpui::AnyElement {
+        div()
+            .id(SharedString::from(id))
+            .h(px(height))
+            .flex_none()
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::track())
+            .text_size(px(10.5))
+            .text_color(if danger {
+                theme::danger()
+            } else {
+                theme::text_secondary()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            // 按下就吃掉：整块的根节点会在左键按下时收起确认条，
+            // 不拦住的话按钮还没等到抬起就没了（点了等于没点）。
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| {
+                    cx.stop_propagation();
+                },
+            )
+            .on_click(on_click)
+            .child(label)
+            .into_any_element()
+    }
+
+    /// 套在显示器那一块上的两层装饰：拖放落点的高亮框、套用成功的闪光。
+    ///
+    /// 尺寸直接按块高写死：绝对定位的子元素在这里量不准（`size_full` / 四边贴零
+    /// 都拿不到父盒子的高度，画出来是 0 高），块高本来就是算出来的，传进来最稳。
+    fn block_decor(&self, key: &str, height: f32) -> Vec<gpui::AnyElement> {
+        let dragging = self.drag_preset.as_ref().and_then(|drag| drag.over.as_deref()) == Some(key);
+        let flashing = self
+            .flash
+            .as_ref()
+            .is_some_and(|flash| flash.keys.iter().any(|item| item == key));
+        let mut layers: Vec<gpui::AnyElement> = Vec::new();
+        if !dragging && !flashing {
+            return layers;
+        }
+        if dragging {
+            // 落点这一块描一圈强调色：配合整块的淡底，一眼看出会套给谁。
+            layers.push(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .w_full()
+                    .h(px(height))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .border_1()
+                    .border_color(theme::accent())
                     .into_any_element(),
             );
         }
-
-        if save_here {
-            chips.push(self.save_button(key, editable, center, lang, cx));
+        if flashing {
+            // 一亮就到位，然后一路淡出（二次缓出）：闪一下比慢慢涨起来更像「做完了」。
+            layers.push(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .w_full()
+                    .h(px(height))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(theme::accent())
+                    .with_animation(
+                        ElementId::Name(format!("bright-flash-{key}-{}", self.flash_seq).into()),
+                        Animation::new(Duration::from_millis(FLASH_MS)),
+                        |layer, delta| {
+                            let left = 1.0 - delta;
+                            layer.opacity(FLASH_PEAK * left * left)
+                        },
+                    )
+                    .into_any_element(),
+            );
         }
+        layers
+    }
 
-        div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(CHIP_GAP))
-            .when(center, |row| row.w_full().justify_center())
-            .children(chips)
-            .into_any_element()
+    /// 拖动时跟着光标走的那颗预设：拖的是什么、拖到哪儿，手上一直看得见。
+    fn drag_ghost(&self) -> Option<gpui::AnyElement> {
+        let drag = self.drag_preset.as_ref().filter(|drag| drag.moved)?;
+        let at = self.drag_at?;
+        let area = self.drag_area.get()?;
+        let cfg = self.cfg();
+        let name = cfg.brightness.presets.get(drag.index)?.name.clone();
+        let chip = metrics(&cfg).chip;
+        Some(
+            div()
+                .absolute()
+                .left(px(at.x.as_f32() - area.origin.x.as_f32() - 4.0))
+                .top(px(at.y.as_f32() - area.origin.y.as_f32() - chip / 2.0))
+                .h(px(chip))
+                .px(px(7.))
+                .flex()
+                .items_center()
+                .rounded(px(theme::RADIUS_SMALL))
+                .bg(theme::accent())
+                .text_size(px(10.5))
+                .text_color(theme::text_primary())
+                .child(name)
+                .into_any_element(),
+        )
+    }
+
+    /// 拖放用的窗口级监听：松手时按坐标认落点。
+    ///
+    /// 每帧重挂一次（和页脚预览同一套）：元素上的 `on_mouse_move` 只在悬停时触发，
+    /// 判不了「拖到了哪一块」；`window.on_mouse_event` 才是全局的。
+    fn drag_sensors(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let area = self.drag_area.clone();
+        let weak = cx.entity().downgrade();
+        gpui::canvas(
+            move |bounds, window, _cx| {
+                area.set(Some(bounds));
+
+                // 移动：拖着的时候记下光标、认落点（落点那台提亮）。
+                let weak_for_move = weak.clone();
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    // 在窗口外面松手收不到抬起事件：按钮都松了就把这一趟收掉。
+                    if event.pressed_button != Some(gpui::MouseButton::Left) {
+                        let position = event.position;
+                        let _ = weak_for_move
+                            .update(cx, |this, cx| this.finish_preset_drag(position, false, cx));
+                        return;
+                    }
+                    let position = event.position;
+                    let _ = weak_for_move.update(cx, |this, cx| this.update_drag(position, cx));
+                });
+
+                // 抬起：落点决定套给哪台；还在块里但没落到哪台就是「点了一下」。
+                let area_for_up = area.clone();
+                window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Bubble
+                        || event.button != gpui::MouseButton::Left
+                    {
+                        return;
+                    }
+                    let position = event.position;
+                    let inside = area_for_up
+                        .get()
+                        .is_some_and(|area| area.contains(&position));
+                    let _ = weak.update(cx, |this, cx| {
+                        this.finish_preset_drag(position, inside, cx);
+                    });
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .left_0()
+        .top_0()
+        .size_full()
+        .into_any_element()
     }
 
     /// 「保存预设」：把当前亮度存成一个预设。
@@ -1523,9 +2102,10 @@ impl Brightness {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let key_for_save = key.to_string();
+        let chip_height = metrics(&self.cfg()).chip;
         div()
             .id(SharedString::from(format!("bright-save-{key}")))
-            .h(px(CHIP_HEIGHT))
+            .h(px(chip_height))
             .flex_none()
             .px(px(if compact { 4. } else { 7. }))
             .flex()
@@ -1595,7 +2175,7 @@ fn measure_text(text: &str, size: f32, window: &mut Window) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHIP_HEIGHT, ROW_GAP, panel_size, strip_model};
+    use super::{BLOCK_GAP, CHIP_HEIGHT, HEADER_HEIGHT, panel_size, strip_model};
     use crate::config::{Config, PanelLayout};
 
     #[test]
@@ -1624,20 +2204,54 @@ mod tests {
         assert!(vw1 < w1);
     }
 
-    /// 横排没有预设时不该再留那一行：少掉的正好是「每台显示器各一个 chip + 一条缝」。
+    /// 预设只在整块底部占**一排**：加几颗预设都只多这一排，不按显示器台数重复。
     #[test]
-    fn horizontal_block_drops_the_preset_row_until_a_preset_exists() {
-        let mut config = Config::default();
-        let without = panel_size(&config, 2).1;
-        config.brightness.add_preset(80);
-        let with = panel_size(&config, 2).1;
+    fn the_preset_bar_is_one_row_for_the_whole_block() {
+        let mut one = Config::default();
+        one.brightness.add_preset(80);
+        let mut two = Config::default();
+        two.brightness.add_preset(80);
+
+        let bare = panel_size(&Config::default(), 2).1;
+        let with = panel_size(&two, 2).1;
+        // 少掉的只有这一排（连上面那条缝），不是每台显示器各来一遍。
         assert!(
-            (with - without - 2.0 * (CHIP_HEIGHT + ROW_GAP)).abs() < 0.01,
-            "{without} -> {with}"
+            (with - bare - (CHIP_HEIGHT + BLOCK_GAP)).abs() < 0.01,
+            "{bare} -> {with}"
+        );
+        // 同一颗预设，一台和两台面板的差 = 多出来那块显示器，不多一排预设。
+        let one_height = panel_size(&one, 1).1;
+        let two_height = panel_size(&one, 2).1;
+        assert!(two_height > one_height);
+    }
+
+    /// 融合进音量面板时不再有「显示器亮度」那一行标题。
+    #[test]
+    fn a_merged_block_drops_the_title() {
+        let mut config = Config::default();
+        config.flyout_width = 350;
+        config.brightness.width = 0;
+        let standalone = panel_size(&config, 2).1;
+        let merged = super::embed_height(&config, 2);
+        assert!(
+            (standalone - merged - (HEADER_HEIGHT + 1.0)).abs() < 0.01,
+            "{standalone} vs {merged}"
         );
     }
 
-    /// 竖排融合时亮度列的下限随预设长 —— 父面板要按它抬高度，否则最底那格被裁。
+    /// 亮度块每一行都跟着面板「行高」等比伸缩：行高调高，整块跟着长高。
+    #[test]
+    fn the_block_follows_the_panel_row_height() {
+        let mut config = Config::default();
+        let base = super::embed_height(&config, 2);
+        // 默认行高 52（图标 32 + 20）；写成 88 就是 1.7 倍。
+        config.panel_line_height = 88.0;
+        let tall = super::embed_height(&config, 2);
+        // 两台显示器各有名称行 + 亮度条，都得跟着变高。
+        assert!(tall - base > 40.0, "{base} -> {tall}");
+    }
+
+    /// 竖排融合时亮度列的下限随预设长 —— 父面板要按它抬高度，否则最底那排被裁。
     #[test]
     fn a_merged_vertical_column_grows_with_its_presets() {
         let mut config = Config::default();
@@ -1645,13 +2259,16 @@ mod tests {
         config.brightness.panel_layout = PanelLayout::Vertical;
         config.brightness.enabled = true;
         config.brightness.merged = true;
-        let bare = super::min_embed_height(&config);
+        let bare = super::min_embed_height(&config, 2);
         config.brightness.add_preset(30);
-        let one = super::min_embed_height(&config);
-        config.brightness.add_preset(60);
-        let two = super::min_embed_height(&config);
+        let one = super::min_embed_height(&config, 2);
         assert!(one > bare, "加了一个预设反而没变高：{bare} -> {one}");
-        assert!(two > one, "预设多一格就该再高一格：{one} -> {two}");
+        // 一列装不下就折行，折出来的那一行同样要占高度。
+        for value in [40, 50, 60, 70, 80, 90] {
+            config.brightness.add_preset(value);
+        }
+        let many = super::min_embed_height(&config, 2);
+        assert!(many > one, "预设多到折行就该再高一行：{one} -> {many}");
     }
 
     #[test]
@@ -1686,10 +2303,10 @@ mod tests {
         let mut config = Config::default();
         config.brightness.panel_layout = PanelLayout::Vertical;
         config.brightness.vertical_height = 200;
-        let short = super::fader_height(&config);
+        let short = super::columns_height(&config, 2, false) - super::column_fixed_height(&config);
 
         config.brightness.vertical_height = 400;
-        let tall = super::fader_height(&config);
+        let tall = super::columns_height(&config, 2, false) - super::column_fixed_height(&config);
         // 多出来的高度全部进推子，正好差 200。
         assert!((tall - short - 200.0).abs() < 0.01, "{short} -> {tall}");
     }
