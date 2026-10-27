@@ -4541,7 +4541,7 @@ impl Settings {
                         div()
                             .text_size(theme::fs(10.))
                             .text_color(theme::text_tertiary())
-                            .child(lang.pick("音量混合器", "Volume mixer")),
+                            .child(lang.pick("音量合成器", "Volume mixer")),
                     ),
             )
             .into_any_element()

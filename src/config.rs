@@ -768,7 +768,7 @@ impl TrayMenuConfig {
 /// 页脚按钮靠哪一边。
 ///
 /// 页脚本来就是两头对齐的（`justify_between`）：一边是系统状态（WiFi / 蓝牙），
-/// 一边是面板自己的动作（响度均衡 / 混音器 / 设置 / 置顶）。所以「位置」有两层意思 ——
+/// 一边是面板自己的动作（响度均衡 / 音量合成器 / 设置 / 置顶）。所以「位置」有两层意思 ——
 /// 摆在哪一头，以及那一头里的第几个。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FooterSide {
@@ -795,7 +795,7 @@ pub struct FooterItemSpec {
     pub en: &'static str,
     /// 面板上的图标（`assets/icons` 里的名字）。
     pub icon: &'static str,
-    /// 横排时带文字（响度均衡 / 混音器这种）。竖排列太窄，一律只画图标。
+    /// 横排时带文字（响度均衡 / 音量合成器这种）。竖排列太窄，一律只画图标。
     pub label: bool,
     /// 第一次进配置时摆在哪一边、默认显不显示。
     pub side: FooterSide,
@@ -829,8 +829,8 @@ pub const FOOTER_ITEMS: &[FooterItemSpec] = &[
     },
     FooterItemSpec {
         id: "mixer",
-        zh: "混音器",
-        en: "Mixer",
+        zh: "音量合成器",
+        en: "Volume mixer",
         icon: "adjustments",
         label: true,
         side: FooterSide::Right,
@@ -7088,7 +7088,7 @@ mod tests {
         assert_eq!(DisplayNameMode::from_index(99), DisplayNameMode::Number);
     }
 
-    /// 页脚默认就是老样子：左边 WiFi / 蓝牙、右边响度均衡 / 混音器 / 设置 / 置顶。
+    /// 页脚默认就是老样子：左边 WiFi / 蓝牙、右边响度均衡 / 音量合成器 / 设置 / 置顶。
     #[test]
     fn footer_default_matches_the_old_row() {
         let footer = FooterConfig::default();
@@ -7121,7 +7121,7 @@ mod tests {
                 .map(|item| item.id.clone())
                 .collect()
         };
-        // 混音器拖到响度均衡前面。
+        // 音量合成器拖到响度均衡前面。
         assert!(footer.place("mixer", FooterSide::Right, Some("loudness"), false));
         assert_eq!(right(&footer), ["mixer", "loudness", "settings", "pin"]);
         // 同一个落点再放一次：位置没变，就不算改动（不会为了空操作落一次盘）。

@@ -2766,7 +2766,7 @@ impl Flyout {
         let lang = self.cfg().language;
         let count = self.visible_apps().len();
 
-        // 设置按钮挪到页脚了（混音器 · 设置 · 置顶），标题行只留「应用 n」。
+        // 设置按钮挪到页脚了（音量合成器 · 设置 · 置顶），标题行只留「应用 n」。
         div()
             .h(self.su(theme::APPS_HEADER_HEIGHT))
             .px(px(14.))
@@ -2970,7 +2970,7 @@ impl Flyout {
         button.into_any_element()
     }
 
-    /// 底部带文字的按钮（图标 + 文字）：混音器和响度均衡共用一套尺寸。
+    /// 底部带文字的按钮（图标 + 文字）：音量合成器和响度均衡共用一套尺寸。
     ///
     /// `active` 时图标与文字都走强调色、垫一层淡底 —— 和置顶那个纯图标按钮
     /// 是同一套「亮着」的表示法。
@@ -3142,14 +3142,14 @@ impl Flyout {
                     }),
                 )
             }
+            // 走托盘菜单那一条（`sndvol.exe -a <光标位置>`），窗口落在鼠标旁；
+            // 不带参数直接起 sndvol 会固定弹在屏幕最左边（实测 x=0）。
             "mixer" => self.footer_label_button(
                 "footer-mixer",
                 "adjustments",
                 label,
                 false,
-                |_, _, _| {
-                    let _ = std::process::Command::new("sndvol.exe").spawn();
-                },
+                |_, _, _| crate::platform::shell::legacy_mixer(),
             ),
             // 没有「打开设置」的回调就不画（OSD 那种独立实例没有设置页）。
             "settings" => match self.on_open_settings.clone() {
