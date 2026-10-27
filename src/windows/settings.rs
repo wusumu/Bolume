@@ -12846,8 +12846,8 @@ impl Settings {
             "brightness-width",
             lang.pick("面板宽度", "Panel width"),
             lang.pick(
-                "0 / 跟随 = 和音量面板一样宽；写具体像素就自己说了算（152 时亮度条正好 100px）",
-                "0 / Match = same width as the volume panel; type a pixel value to override (152 makes the bar exactly 100px)",
+                "0 / 跟随 = 和音量面板一样宽；写具体像素就自己说了算",
+                "0 / Match = same width as the volume panel; type a pixel value to override",
             ),
             NumberField::BrightnessWidth,
             config,
@@ -13028,8 +13028,8 @@ impl Settings {
                     .text_size(theme::fs(10.5))
                     .text_color(theme::text_tertiary())
                     .child(lang.pick(
-                        "还没有预设：在亮度面板里点「保存」即存下当前亮度",
-                        "No presets yet — press Save in the brightness panel to store the current level",
+                        "还没有预设：在亮度面板里点「保存预设」即存下当前亮度",
+                        "No presets yet — press Save preset in the brightness panel to store the current level",
                     ))
                     .into_any_element(),
             );
@@ -13136,8 +13136,8 @@ impl Settings {
                 .text_size(theme::fs(10.5))
                 .text_color(theme::text_tertiary())
                 .child(lang.pick(
-                    "亮度通过 DDC/CI 直接写给显示器；笔记本内屏或走转接头的显示器通常不支持。\n亮度面板里点数值可以手动填写，点「保存」把当前亮度存成预设，右键预设可删除。\n在亮度条上滚动滚轮也能调：一格走多少个百分点可以自己填。",
-                    "Brightness is written to the display over DDC/CI; laptop panels and adapters often do not support it.\nClick the value in the brightness panel to type a level, press Save to store it as a preset, right-click a preset to remove it.\nScrolling on a brightness slider works too: one notch moves a fixed step you can set yourself.",
+                    "亮度通过 DDC/CI 直接写给显示器；笔记本内屏或走转接头的显示器通常不支持。\n亮度面板里点数值可以手动填写，点「保存预设」把当前亮度存成预设，右键预设可删除。\n在亮度条上滚动滚轮也能调：一格走多少个百分点可以自己填。",
+                    "Brightness is written to the display over DDC/CI; laptop panels and adapters often do not support it.\nClick the value in the brightness panel to type a level, press Save preset to store it, right-click a preset to remove it.\nScrolling on a brightness slider works too: one notch moves a fixed step you can set yourself.",
                 ))
                 .into_any_element(),
         ]

@@ -25,12 +25,18 @@ use crate::{
     ui::{Entrance, EntranceMotion, SliderDragState, VolumeSlider, anim, icon, theme, wheel_direction},
 };
 
-/// 面板宽度不再写死：用户可调（`config.brightness.width`），
-/// 这一排横向的固定开销 = 左右内边距 + 两个步进钮 + 缝。
+/// 步进钮宽度（横排挪到名称行里，竖排还在读数两侧）。
 const STEP_WIDTH: f32 = 16.0;
-const STEP_GAP: f32 = 3.0;
 
 const PAD: f32 = 7.0;
+/// 横排的左右内边距：和音量面板里的行对齐（那边是 `mx(6)` + `px(8)`）。
+const H_PAD: f32 = 14.0;
+/// 亮度条左边让出的宽度、条与读数之间的缝、读数栏宽度 —— 三个数照抄音量面板的
+/// 设备行（`device_row` 的 `pl(27)` / `gap(9)` / `readout_width`），
+/// 这样两张条一样长、左右也对齐，上下摆在一起看不出是两套控件。
+const H_BAR_INSET: f32 = 27.0;
+const H_READOUT_GAP: f32 = 9.0;
+const H_READOUT_WIDTH: f32 = 34.0;
 const HEADER_HEIGHT: f32 = 28.0;
 const NAME_ROW_HEIGHT: f32 = 20.0;
 /// 亮度条那一排的高度：条本身 6px，留够圆钮（13px）上下活动的余地，
@@ -43,13 +49,6 @@ const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_GAP: f32 = 3.0;
 /// 每台显示器之间的间距。
 const BLOCK_GAP: f32 = 8.0;
-
-/// 滑条长度：面板宽度扣掉两侧的步进钮和缝。
-///
-/// 默认宽度 152 时正好 100px —— 鼠标走 1 个像素就是 1 个百分点。
-pub fn slider_width(panel_width: f32) -> f32 {
-    (panel_width - PAD * 2.0 - STEP_WIDTH * 2.0 - STEP_GAP * 2.0).max(40.0)
-}
 
 /// 竖向排版的一列有多宽、节奏怎么走。
 ///
@@ -78,21 +77,23 @@ pub fn panel_size(cfg: &crate::config::Config, displays: usize) -> (f32, f32) {
     }
 }
 
-/// 横排：标题 + 每台显示器一块（名称 / 亮度条 / 预设）。
+/// 横排：标题 + 每台显示器一块（名称 / 亮度条 / 可选的一排预设）。
 fn horizontal_height(cfg: &crate::config::Config, displays: usize) -> f32 {
+    // 「保存预设」挪到名称行之后，没有预设就不再有第三行 —— 省下来的高度全还给面板。
+    let presets = preset_rows(
+        &cfg.brightness.presets,
+        cfg.language,
+        cfg.brightness.panel_width(cfg.flyout_width()) - H_PAD * 2.0,
+        false,
+    );
     let block = NAME_ROW_HEIGHT
         + ROW_GAP
         + SLIDER_HEIGHT
-        + ROW_GAP
-        + preset_rows(
-            &cfg.brightness.presets,
-            cfg.language,
-            cfg.brightness.panel_width(cfg.flyout_width()) - PAD * 2.0,
-        );
+        + if presets > 0.0 { ROW_GAP + presets } else { 0.0 };
     let count = displays.max(1) as f32;
     // 多台之间还夹一条 1px 分隔线，上下各 BLOCK_GAP。
     let separators = (count - 1.0).max(0.0);
-    (PAD * 2.0 + HEADER_HEIGHT + 1.0 + count * block + separators * (BLOCK_GAP * 2.0 + 1.0))
+    (H_PAD * 2.0 + HEADER_HEIGHT + 1.0 + count * block + separators * (BLOCK_GAP * 2.0 + 1.0))
         .max(80.0)
 }
 
@@ -107,7 +108,7 @@ fn vertical_width(displays: usize) -> f32 {
 /// `brightness.vertical_height` 写 0（默认）就跟着**音频面板竖向排版时的高度**走，
 /// 两个面板并排时上下齐平；写了数字就自己定。
 fn vertical_height(cfg: &crate::config::Config) -> f32 {
-    let at_least = chrome_height() + column_fixed_height(cfg) + V_FADER_MIN;
+    let at_least = min_embed_height(cfg);
     let target = match cfg.brightness.vertical_panel_height() {
         Some(height) => height,
         None => crate::windows::flyout::vertical_panel_height(cfg),
@@ -129,6 +130,7 @@ fn column_fixed_height(cfg: &crate::config::Config) -> f32 {
             &cfg.brightness.presets,
             cfg.language,
             V_COLUMN_WIDTH - V_COLUMN_PAD * 2.0,
+            true,
         )
 }
 
@@ -154,16 +156,37 @@ fn chip_width(name: &str) -> f32 {
         .sum::<f32>()
 }
 
-/// 预设那一排折成几行、一共多高（含最后那个「保存」格子）。
+/// 「保存预设」这四个字：横排有大把宽度就写全，竖排一列只有 58px，英文缩成 Save。
+fn save_label(lang: Lang, vertical: bool) -> &'static str {
+    if vertical {
+        lang.pick("保存预设", "Save")
+    } else {
+        lang.pick("保存预设", "Save preset")
+    }
+}
+
+/// 预设那一排折成几行、一共多高。
 ///
-/// `inner_width` 是这一排能用的宽度（横排是面板内宽，竖排是一列的净宽）。
-fn preset_rows(presets: &[BrightnessPreset], lang: Lang, inner_width: f32) -> f32 {
+/// `inner_width` 是这一排能用的宽度（横排是面板内宽，竖排是一列的净宽）；
+/// `with_save` 表示「保存预设」也在这排里（只有竖排这样，横排它长在名称行右端）。
+/// 横排没有预设时返回 0 —— 这一行整个不出现。
+fn preset_rows(
+    presets: &[BrightnessPreset],
+    lang: Lang,
+    inner_width: f32,
+    with_save: bool,
+) -> f32 {
+    if presets.is_empty() && !with_save {
+        return 0.0;
+    }
     let mut widths: Vec<f32> = presets
         .iter()
         .map(|preset| chip_width(&preset.name))
         .collect();
-    // 「保存」：内边距 + 10px 图标 + 3px 间距 + 文字。
-    widths.push(14.0 + 10.0 + 3.0 + chip_width(lang.pick("保存", "Save")) - 14.0);
+    if with_save {
+        // 竖排那一格没有图标，左右内边距也从 14 收到 8。
+        widths.push(chip_width(save_label(lang, true)) - 14.0 + 8.0);
+    }
 
     let inner = inner_width;
     let mut rows = 1.0;
@@ -208,6 +231,14 @@ pub fn embed_height(cfg: &crate::config::Config, displays: usize) -> f32 {
 /// 融合时亮度块要占多宽（竖排用；高度由父面板撑满）。
 pub fn embed_width(displays: usize) -> f32 {
     vertical_width(displays)
+}
+
+/// 竖排融合时亮度列**至少**要这么高：标题 + 名称 + 读数 + 预设，推子再短也有 `V_FADER_MIN`。
+///
+/// 父面板（音量面板）竖向排版时按自己的高度给亮度列让位，可预设攒多了这列会不够用 ——
+/// 那时面板整体得抬到这一份，不然最底下的预设格子会被面板底边裁掉一半。
+pub fn min_embed_height(cfg: &crate::config::Config) -> f32 {
+    chrome_height() + column_fixed_height(cfg) + V_FADER_MIN
 }
 
 pub struct Brightness {
@@ -773,6 +804,13 @@ impl Brightness {
         cx: &mut Context<Self>,
         parked: bool,
     ) {
+        // 融合：窗口是父面板那一扇，位置和高度都归它管 —— 这里只让父面板重新量一遍
+        // （预设多了一格、高度要跟着长）。以前没这道闸，点「保存预设」会把整扇面板
+        // 挪到独立亮度窗该待的位置、还按亮度那块自己的高度缩一截。
+        if self.embed.is_some() {
+            cx.defer(|cx| crate::gui::refresh_flyout_size(cx));
+            return;
+        }
         let cfg = self.cfg();
         let displays = self.displays.borrow().len();
         let (width, height) = panel_size(&cfg, displays);
@@ -895,6 +933,8 @@ impl Render for Brightness {
         }
 
         let embedded = self.embed.is_some();
+        // 横排左右留 14：和音量面板的行同一条边，两块并排 / 上下看着才是一条线。
+        let pad = if vertical { PAD } else { H_PAD };
         let mut content = div()
             .flex()
             .flex_col()
@@ -926,7 +966,7 @@ impl Render for Brightness {
                 .rounded(px(theme::RADIUS_WINDOW));
         }
         let content = content
-            .child(self.header(lang))
+            .child(self.header(lang, pad))
             .child(div().h(px(1.)).flex_none().bg(theme::border()))
             .child(
                 div()
@@ -935,8 +975,8 @@ impl Render for Brightness {
                         style.flex_row().items_start().gap(px(V_COLUMN_GAP))
                     })
                     .when(!vertical, |style| style.flex_col().gap(px(BLOCK_GAP)))
-                    .px(px(PAD))
-                    .py(px(PAD))
+                    .px(px(pad))
+                    .py(px(pad))
                     .children(blocks),
             );
 
@@ -961,11 +1001,11 @@ impl Render for Brightness {
 }
 
 impl Brightness {
-    fn header(&self, lang: Lang) -> gpui::AnyElement {
+    fn header(&self, lang: Lang, pad: f32) -> gpui::AnyElement {
         div()
             .h(px(HEADER_HEIGHT))
             .flex_none()
-            .px(px(PAD + 2.0))
+            .px(px(pad))
             .flex()
             .items_center()
             .gap(px(6.))
@@ -1025,7 +1065,8 @@ impl Brightness {
         key: &str,
         value: u32,
         editable: bool,
-        min_width: f32,
+        width: f32,
+        align_end: bool,
         lang: Lang,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -1038,12 +1079,15 @@ impl Brightness {
         div()
             .id(SharedString::from(format!("bright-value-{key}")))
             .flex_none()
-            .min_w(px(min_width))
+            .w(px(width))
             .h(px(18.))
-            .px(px(4.))
+            // 横排的读数要像音量面板那样靠右钉住（右边那一列是同一段宽度），
+            // 竖排是夹在两个步进钮中间，居中。
+            .px(px(if align_end { 2. } else { 4. }))
             .flex()
             .items_center()
-            .justify_center()
+            .when(align_end, |style| style.justify_end())
+            .when(!align_end, |style| style.justify_center())
             .rounded(px(theme::RADIUS_SMALL))
             .text_size(px(11.5))
             .when(editing, |style| style.bg(theme::accent()))
@@ -1179,7 +1223,6 @@ impl Brightness {
         let config = self.cfg();
         let name = config.display_label(&key, &display.name);
         let percent = self.current_percent(&key);
-        let slider_width = slider_width(config.brightness_width());
         let editable = percent.is_some();
         let value = percent.unwrap_or(0);
         let slider_value = self
@@ -1189,10 +1232,8 @@ impl Brightness {
             .copied()
             .unwrap_or(value as f32 / 100.0);
 
-        let value_slot = self.value_slot(&key, value, editable, 46.0, lang, cx);
-
-        // 名称行：名字 + 读数。步进钮挪到下面的亮度条两侧 ——
-        // 面板窄了之后，「名字 + − 100% +」挤在一行会把显示器名截得只剩几个字母。
+        // 名称行：名字 + 步进 + 保存预设。读数挪到下面跟亮度条同一排去了，
+        // 这一行空出来的右端正好摆「保存预设」—— 从前它独占一行，白占 21px。
         let label = div()
             .flex()
             .items_center()
@@ -1208,25 +1249,25 @@ impl Brightness {
                     .text_color(theme::text_secondary())
                     .child(name.clone()),
             )
-            .child(value_slot);
+            .child(self.step_button(&key, editable, "−", -1, STEP_WIDTH, cx))
+            .child(self.step_button(&key, editable, "+", 1, STEP_WIDTH, cx))
+            .child(self.save_button(&key, editable, false, lang, cx));
 
         let slider = self.brightness_slider(&key, slider_value, editable, false);
 
-        // 「− 亮度条 +」：滑条长度由面板宽度换算，这一排正好铺满。
+        // 亮度条 + 读数：左边缩进、右边读数栏、中间那条缝，全部照音量面板的设备行来，
+        // 于是两张条一样长、左右也对齐（上下摆着看是一条线）。
         let slider_row = div()
             .flex()
             .items_center()
-            .justify_center()
-            .gap(px(STEP_GAP))
             .h(px(SLIDER_HEIGHT))
-            .child(self.step_button(&key, editable, "−", -1, STEP_WIDTH, cx))
-            .child(div().flex_none().w(px(slider_width)).child(slider))
-            .child(self.step_button(&key, editable, "+", 1, STEP_WIDTH, cx));
-
-        let presets = self.preset_row(&key, value, editable, lang, false, cx);
+            .pl(px(H_BAR_INSET))
+            .gap(px(H_READOUT_GAP))
+            .child(div().flex_1().min_w_0().child(slider))
+            .child(self.value_slot(&key, value, editable, H_READOUT_WIDTH, true, lang, cx));
 
         let key_for_wheel = key.clone();
-        div()
+        let mut block = div()
             .id(SharedString::from(format!("bright-block-{key}")))
             .flex()
             .flex_col()
@@ -1239,9 +1280,12 @@ impl Brightness {
                 },
             ))
             .child(label)
-            .child(slider_row)
-            .child(presets)
-            .into_any_element()
+            .child(slider_row);
+        // 有预设才多一行；没有的话这一排连高度都不留。
+        if !config.brightness.presets.is_empty() {
+            block = block.child(self.preset_row(&key, value, editable, lang, false, false, cx));
+        }
+        block.into_any_element()
     }
 
     /// 竖向排版的一列：名称 / 立起来的亮度条 / 读数+步进 / 预设。
@@ -1289,10 +1333,10 @@ impl Brightness {
             .h(px(V_STEP_ROW))
             .flex_none()
             .child(self.step_button(&key, editable, "−", -1, 16.0, cx))
-            .child(self.value_slot(&key, value, editable, 30.0, lang, cx))
+            .child(self.value_slot(&key, value, editable, 30.0, false, lang, cx))
             .child(self.step_button(&key, editable, "+", 1, 16.0, cx));
 
-        let presets = self.preset_row(&key, value, editable, lang, true, cx);
+        let presets = self.preset_row(&key, value, editable, lang, true, true, cx);
 
         let key_for_wheel = key.clone();
         div()
@@ -1383,9 +1427,10 @@ impl Brightness {
         .into_any_element()
     }
 
-    /// 预设 chips：点一下套用，右键删除；最后一个是「保存」。
+    /// 预设 chips：点一下套用，右键删除；`save_here` 时末尾再跟一个「保存预设」。
     ///
     /// `center` = 竖向排版：列太窄，格子按列中线居中摆，和推子对齐。
+    /// 横排把「保存预设」摆在名称行最右端（见 `save_button`），这里就不再重复一个。
     fn preset_row(
         &self,
         key: &str,
@@ -1393,6 +1438,7 @@ impl Brightness {
         editable: bool,
         lang: Lang,
         center: bool,
+        save_here: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let presets = self.cfg().brightness.presets;
@@ -1450,35 +1496,9 @@ impl Brightness {
             );
         }
 
-        let key_for_save = key.to_string();
-        chips.push(
-            div()
-                .id(SharedString::from(format!("bright-save-{key}")))
-                .h(px(CHIP_HEIGHT))
-                .px(px(7.))
-                .flex()
-                .items_center()
-                .gap(px(3.))
-                .rounded(px(theme::RADIUS_SMALL))
-                .bg(theme::surface_sunken())
-                .text_size(px(10.5))
-                .text_color(theme::text_tertiary())
-                .when(editable, |style| {
-                    style
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme::surface_hover()))
-                })
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    if !editable {
-                        return;
-                    }
-                    this.save_preset(&key_for_save, window, cx);
-                }))
-                .child(icon("check", 10.0, theme::text_tertiary()))
-                .child(lang.pick("保存", "Save"))
-                .into_any_element(),
-        );
+        if save_here {
+            chips.push(self.save_button(key, editable, center, lang, cx));
+        }
 
         div()
             .flex()
@@ -1487,6 +1507,51 @@ impl Brightness {
             .gap(px(CHIP_GAP))
             .when(center, |row| row.w_full().justify_center())
             .children(chips)
+            .into_any_element()
+    }
+
+    /// 「保存预设」：把当前亮度存成一个预设。
+    ///
+    /// 横排长在名称行最右端（`compact = false`，带勾图标、写全四个字）；
+    /// 竖排那一列只有 58px 净宽，缩成一格不带图标的「保存预设 / Save」。
+    fn save_button(
+        &self,
+        key: &str,
+        editable: bool,
+        compact: bool,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let key_for_save = key.to_string();
+        div()
+            .id(SharedString::from(format!("bright-save-{key}")))
+            .h(px(CHIP_HEIGHT))
+            .flex_none()
+            .px(px(if compact { 4. } else { 7. }))
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::surface_sunken())
+            .text_size(px(10.5))
+            .text_color(theme::text_tertiary())
+            .whitespace_nowrap()
+            .when(editable, |style| {
+                style
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+            })
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                if !editable {
+                    return;
+                }
+                this.save_preset(&key_for_save, window, cx);
+            }))
+            .when(!compact, |style| {
+                style.child(icon("check", 10.0, theme::text_tertiary()))
+            })
+            .child(save_label(lang, compact))
             .into_any_element()
     }
 }
@@ -1530,7 +1595,7 @@ fn measure_text(text: &str, size: f32, window: &mut Window) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{panel_size, strip_model};
+    use super::{CHIP_HEIGHT, ROW_GAP, panel_size, strip_model};
     use crate::config::{Config, PanelLayout};
 
     #[test]
@@ -1557,6 +1622,36 @@ mod tests {
         assert!((vw3 - vw2) - (vw2 - vw1) < 0.01);
         // 竖排比横排窄得多（否则就没必要竖起来了）。
         assert!(vw1 < w1);
+    }
+
+    /// 横排没有预设时不该再留那一行：少掉的正好是「每台显示器各一个 chip + 一条缝」。
+    #[test]
+    fn horizontal_block_drops_the_preset_row_until_a_preset_exists() {
+        let mut config = Config::default();
+        let without = panel_size(&config, 2).1;
+        config.brightness.add_preset(80);
+        let with = panel_size(&config, 2).1;
+        assert!(
+            (with - without - 2.0 * (CHIP_HEIGHT + ROW_GAP)).abs() < 0.01,
+            "{without} -> {with}"
+        );
+    }
+
+    /// 竖排融合时亮度列的下限随预设长 —— 父面板要按它抬高度，否则最底那格被裁。
+    #[test]
+    fn a_merged_vertical_column_grows_with_its_presets() {
+        let mut config = Config::default();
+        config.panel_layout = PanelLayout::Vertical;
+        config.brightness.panel_layout = PanelLayout::Vertical;
+        config.brightness.enabled = true;
+        config.brightness.merged = true;
+        let bare = super::min_embed_height(&config);
+        config.brightness.add_preset(30);
+        let one = super::min_embed_height(&config);
+        config.brightness.add_preset(60);
+        let two = super::min_embed_height(&config);
+        assert!(one > bare, "加了一个预设反而没变高：{bare} -> {one}");
+        assert!(two > one, "预设多一格就该再高一格：{one} -> {two}");
     }
 
     #[test]

@@ -637,8 +637,9 @@ impl Flyout {
             vertical,
             width: cfg.flyout_width(),
             // 竖排要跟音频那一排**同样高**：面板总高扣掉页脚，正好是内容的可用高度。
+            // 高度从 `column_height` 取，和面板自己算的是同一个数（含「亮度列要更高」的那笔）。
             height: if vertical {
-                (vertical_panel_height(&cfg) - theme::FOOTER_HEIGHT).max(60.0)
+                (self.column_height() - theme::FOOTER_HEIGHT).max(60.0)
             } else {
                 0.0
             },
@@ -1341,8 +1342,19 @@ impl Flyout {
     }
 
     /// 竖排的一列有多高：图标 / 推子 / 读数（可选名字）+ 页脚。
+    ///
+    /// 融合时亮度那一列也在里面：它自己有一份下限（标题 + 名称 + 读数 + 预设 +
+    /// 最短一截推子），音频这列矮了就一起抬上去，两列同高、预设也不会被底边裁掉。
     fn column_height(&self) -> f32 {
-        vertical_panel_height(&self.cfg())
+        let cfg = self.cfg();
+        let base = vertical_panel_height(&cfg);
+        if cfg.brightness.merged_with_audio() && cfg.panel_layout.is_vertical() {
+            base.max(
+                crate::windows::brightness::min_embed_height(&cfg) + theme::FOOTER_HEIGHT,
+            )
+        } else {
+            base
+        }
     }
 
     /// 窗口尺寸：(宽, 高)。
