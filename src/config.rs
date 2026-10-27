@@ -1708,6 +1708,13 @@ pub struct BrightnessConfig {
     ///
     /// 超出实际台数时按最后一台算 —— 换了个少一台的环境不至于按了没反应。
     pub hotkey_monitor: u32,
+    /// 亮度面板与音量面板**融合**成一个窗口。
+    ///
+    /// 融合时亮度块不再是一扇独立的小窗，而是长在音量面板里，排版跟着音频走：
+    /// 音频横排就整条铺在它上 / 下方，音频竖排就整列贴在它左 / 右侧。
+    pub merged: bool,
+    /// 融合时亮度块贴在音频的哪一侧（横排只看上 / 下，竖排只看左 / 右）。
+    pub merge_side: BrightnessMergeSide,
 }
 
 /// 面板排版。
@@ -1827,6 +1834,58 @@ impl BrightnessPlacement {
     }
 }
 
+/// 融合时亮度块摆在音频的哪一侧。
+///
+/// 横排的音量面板只有上下两条边可以长，竖排的只有左右两条 —— 所以同一个值
+/// 只在对应那一轴上有效，换到另一轴时按该轴的默认（横排下方 / 竖排右侧）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrightnessMergeSide {
+    /// 音频上方。
+    Above,
+    /// 音频下方（默认）。
+    #[default]
+    Below,
+    /// 音频左侧。
+    Left,
+    /// 音频右侧。
+    Right,
+}
+
+impl BrightnessMergeSide {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Above => 0,
+            Self::Below => 1,
+            Self::Left => 2,
+            Self::Right => 3,
+        }
+    }
+
+    pub fn from_index(value: u32) -> Self {
+        match value {
+            0 => Self::Above,
+            2 => Self::Left,
+            3 => Self::Right,
+            _ => Self::Below,
+        }
+    }
+
+    pub fn label(self, lang: Lang) -> &'static str {
+        match self {
+            Self::Above => lang.pick("上方", "Above"),
+            Self::Below => lang.pick("下方", "Below"),
+            Self::Left => lang.pick("左侧", "Left"),
+            Self::Right => lang.pick("右侧", "Right"),
+        }
+    }
+
+    /// 是不是横排那一轴的取值（上 / 下）。
+    pub fn is_horizontal_axis(self) -> bool {
+        matches!(self, Self::Above | Self::Below)
+    }
+}
+
 impl Default for BrightnessConfig {
     fn default() -> Self {
         Self {
@@ -1842,6 +1901,8 @@ impl Default for BrightnessConfig {
             vertical_height: 0,
             hotkey_step: 0,
             hotkey_monitor: 1,
+            merged: false,
+            merge_side: BrightnessMergeSide::default(),
         }
     }
 }
@@ -1860,6 +1921,26 @@ impl BrightnessConfig {
     /// 竖向排版时的高度。`None` = 跟随音频面板。
     pub fn vertical_panel_height(&self) -> Option<f32> {
         vertical_height_value(self.vertical_height)
+    }
+
+    /// 融合模式生效了没有：两个开关都开着才算。
+    pub fn merged_with_audio(&self) -> bool {
+        self.enabled && self.merged
+    }
+
+    /// 融合时亮度块在音频的哪一侧，已按当前排版归一到对应那一轴：
+    /// 横排只认上 / 下，竖排只认左 / 右；存的值属于另一轴时用该轴的默认。
+    pub fn merge_side_of(&self, vertical: bool) -> BrightnessMergeSide {
+        if vertical == self.merge_side.is_horizontal_axis() {
+            // 轴不匹配（横排配了左 / 右，或竖排配了上 / 下）：用该轴默认。
+            if vertical {
+                BrightnessMergeSide::Right
+            } else {
+                BrightnessMergeSide::Below
+            }
+        } else {
+            self.merge_side
+        }
     }
 
     /// 记一个预设（同名同值的不重复记；超过上限就丢掉最老的一个）。
@@ -6946,6 +7027,45 @@ mod tests {
     }
 
     /// 亮度面板宽度默认跟随音量面板；写了具体像素才自己说了算。
+    /// 融合默认是关的，且位置落在横排那一轴（下方）。
+    #[test]
+    fn brightness_merge_defaults_to_off() {
+        let config = Config::default();
+        assert!(!config.brightness.merged);
+        assert_eq!(config.brightness.merge_side, BrightnessMergeSide::Below);
+        // 光开融合不够：亮度总开关没开就什么都不长。
+        let mut config = config;
+        config.brightness.merged = true;
+        assert!(!config.brightness.merged_with_audio());
+        config.brightness.enabled = true;
+        assert!(config.brightness.merged_with_audio());
+    }
+
+    /// 位置选项和排版对不上时退回该轴默认：横排下方、竖排右侧。
+    #[test]
+    fn merge_side_falls_back_to_the_axis_default() {
+        let mut config = Config::default();
+        config.brightness.merge_side = BrightnessMergeSide::Left;
+        assert_eq!(
+            config.brightness.merge_side_of(false),
+            BrightnessMergeSide::Below
+        );
+        assert_eq!(
+            config.brightness.merge_side_of(true),
+            BrightnessMergeSide::Left
+        );
+
+        config.brightness.merge_side = BrightnessMergeSide::Above;
+        assert_eq!(
+            config.brightness.merge_side_of(false),
+            BrightnessMergeSide::Above
+        );
+        assert_eq!(
+            config.brightness.merge_side_of(true),
+            BrightnessMergeSide::Right
+        );
+    }
+
     #[test]
     fn brightness_width_follows_the_panel_unless_set() {
         let mut config = Config::default();

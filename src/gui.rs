@@ -109,6 +109,27 @@ pub fn displays_snapshot(cx: &App) -> Vec<DisplayInfo> {
     cx.global::<AppState>().displays.borrow().clone()
 }
 
+/// 融合模式那块亮度块（音量面板里的子视图）要用的几样东西。
+///
+/// 它读的显示器列表、DDC 线程和错误信息都和独立亮度窗口是同一份 —— 放在面板里
+/// 只是换了个容器，数据一点没分家。
+pub fn brightness_embed_deps(
+    cx: &App,
+) -> (
+    Rc<RefCell<ConfigStore>>,
+    Rc<DisplayEngine>,
+    Rc<RefCell<Vec<DisplayInfo>>>,
+    Rc<RefCell<Option<String>>>,
+) {
+    let state = cx.global::<AppState>();
+    (
+        state.config.clone(),
+        state.display_engine.clone(),
+        state.displays.clone(),
+        state.display_error.clone(),
+    )
+}
+
 impl gpui::Global for AppState {}
 
 impl AppState {
@@ -457,12 +478,14 @@ pub fn run(
                     window.refresh();
                     let view = cx.new(|cx| {
                         let mute_override = cx.global::<AppState>().mute_override.clone();
+                        let displays = cx.global::<AppState>().displays.clone();
                         let mut flyout = Flyout::new(
                             initial_snapshot.clone(),
                             config.clone(),
                             engine.clone(),
                             mute_override,
                             cx.focus_handle(),
+                            displays,
                         );
                         flyout.on_open_settings =
                             Some(Rc::new(|_window: &mut gpui::Window, cx: &mut App| {
@@ -492,6 +515,16 @@ pub fn run(
                 let warm = flyout_entity.clone();
                 cx.defer(move |cx| {
                     let _ = warm.update(cx, |flyout, window, cx| flyout.warm_up(window, cx));
+                });
+            }
+
+            // 融合模式下亮度块是面板里的子视图：早点挂上，第一次弹出就是完整的。
+            {
+                let flyout = flyout_entity.clone();
+                cx.defer(move |cx| {
+                    let _ = flyout.update(cx, |flyout, _window, cx| {
+                        flyout.sync_brightness_embed(cx);
+                    });
                 });
             }
 
@@ -1081,10 +1114,13 @@ pub fn ensure_brightness_window(cx: &mut App) {
 }
 
 pub fn sync_brightness(cx: &mut App) {
-    let (enabled, flyout) = {
+    let (enabled, merged, flyout) = {
         let state = cx.global::<AppState>();
+        let config = state.config.borrow();
+        let config = config.get();
         (
-            state.config.borrow().get().brightness.enabled,
+            config.brightness.enabled,
+            config.brightness.merged_with_audio(),
             state.flyout.borrow().clone(),
         )
     };
@@ -1095,11 +1131,28 @@ pub fn sync_brightness(cx: &mut App) {
                 .unwrap_or(false)
         })
         .unwrap_or(false);
-    if enabled && visible {
+    // 融合模式：亮度块长在音量面板里，独立那扇窗一直收着（建出来也浪费一份合成表面）。
+    if enabled && visible && !merged {
         show_brightness(cx);
     } else {
         hide_brightness(cx);
     }
+}
+
+/// 亮度的两个开关（启用 / 融合）或面板排版变了之后调一次：
+/// 让音量面板把融合块挂上 / 摘下，尺寸跟着重排。
+pub fn refresh_merged_brightness(cx: &mut App) {
+    let handle = cx.global::<AppState>().flyout.borrow().clone();
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |flyout, window, cx| {
+            flyout.sync_brightness_embed(cx);
+            if flyout.is_visible() {
+                flyout.update_frame(window, cx);
+            }
+            window.refresh();
+        });
+    }
+    sync_brightness(cx);
 }
 
 fn show_brightness(cx: &mut App) {
@@ -1278,7 +1331,11 @@ pub fn repaint_windows(cx: &mut App) {
 pub fn refresh_flyout_size(cx: &mut App) {
     let handle = cx.global::<AppState>().flyout.borrow().clone();
     if let Some(handle) = handle {
-        let _ = handle.update(cx, |flyout, window, cx| flyout.refresh_layout(window, cx));
+        let _ = handle.update(cx, |flyout, window, cx| {
+            // 排版一换，融合块的方向和尺寸都跟着变（横排 → 竖排是长高换成占宽）。
+            flyout.sync_brightness_embed(cx);
+            flyout.refresh_layout(window, cx);
+        });
     }
     refresh_brightness_window(cx);
 }
@@ -1336,7 +1393,7 @@ pub fn refresh_brightness(cx: &mut App) {
             .display_engine
             .send(crate::display::DisplayCommand::Refresh);
     }
-    sync_brightness(cx);
+    refresh_merged_brightness(cx);
 }
 
 /// 把 OSD 窗口建出来（这块屏已经有了就直接返回）。

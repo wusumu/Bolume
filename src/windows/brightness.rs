@@ -179,11 +179,44 @@ fn preset_rows(presets: &[BrightnessPreset], lang: Lang, inner_width: f32) -> f3
     rows * CHIP_HEIGHT + (rows - 1.0) * CHIP_GAP
 }
 
+/// 融合模式下亮度块要占多大。
+///
+/// 尺寸由父面板决定（横排铺满宽度、竖排撑满高度），这里只记下来给度量用：
+/// `cfg()` 会把这两个数写进 `brightness.width` / `brightness.vertical_height`，
+/// 于是滑条长度、推子长度、预设折行全都照常按「面板多宽 / 多高」算，
+/// 一行渲染代码都不用为融合另写一份。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Embed {
+    /// 竖向排版（一台显示器一列），否则一行一台。
+    pub vertical: bool,
+    /// 横排时这一块的宽度（= 音量面板宽度）。
+    pub width: f32,
+    /// 竖排时这一块的高度（= 音量面板高度）。
+    pub height: f32,
+}
+
+/// 融合时亮度块要占多高（横排用；宽度就是音量面板宽度）。
+///
+/// 与独立窗口那份算法是同一条（`horizontal_height`），只是宽度换成面板宽度 ——
+/// 预设 chips 的折行也跟着换，父面板按这个数加高就行。
+pub fn embed_height(cfg: &crate::config::Config, displays: usize) -> f32 {
+    let mut cfg = cfg.clone();
+    cfg.brightness.width = cfg.flyout_width().round().max(0.0) as u32;
+    horizontal_height(&cfg, displays)
+}
+
+/// 融合时亮度块要占多宽（竖排用；高度由父面板撑满）。
+pub fn embed_width(displays: usize) -> f32 {
+    vertical_width(displays)
+}
+
 pub struct Brightness {
     pub config: Rc<RefCell<ConfigStore>>,
     pub engine: Rc<DisplayEngine>,
     /// 工作线程报上来的显示器列表（与 `AppState` 共用同一份）。
     pub displays: Rc<RefCell<Vec<DisplayInfo>>>,
+    /// 融合模式：`Some` 表示这块内容长在音量面板里，自己不建窗口、不跑动画。
+    embed: Option<Embed>,
     focus: FocusHandle,
     drag: SliderDragState,
     /// 拖动滑条期间的本地值（key → 0..1）。DDC 写入慢，等回读再动会拖手。
@@ -223,6 +256,7 @@ impl Brightness {
             config,
             engine,
             displays,
+            embed: None,
             focus,
             drag: SliderDragState::new(),
             drag_values: Rc::new(RefCell::new(HashMap::new())),
@@ -243,8 +277,52 @@ impl Brightness {
         self.visible
     }
 
+    /// 建一份「长在音量面板里」的亮度块：同一套渲染与交互，只是不建窗口、
+    /// 不跑入场动画，尺寸由父面板给。
+    pub fn new_embedded(
+        config: Rc<RefCell<ConfigStore>>,
+        engine: Rc<DisplayEngine>,
+        displays: Rc<RefCell<Vec<DisplayInfo>>>,
+        error: Rc<RefCell<Option<String>>>,
+        embed: Embed,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::new(config, engine, displays, error, cx);
+        view.embed = Some(embed);
+        view
+    }
+
+
     fn cfg(&self) -> crate::config::Config {
-        self.config.borrow().get().clone()
+        let mut config = self.config.borrow().get().clone();
+        // 融合模式：尺寸跟着父面板走，直接把数写进配置副本，后面的度量、滑条、
+        // 预设折行全都按这一份算，不必为每种容器各写一套。
+        if let Some(embed) = self.embed {
+            config.brightness.panel_layout = if embed.vertical {
+                crate::config::PanelLayout::Vertical
+            } else {
+                crate::config::PanelLayout::Horizontal
+            };
+            if embed.vertical {
+                config.brightness.vertical_height = embed.height.round().max(0.0) as u32;
+            } else {
+                config.brightness.width = embed.width.round().max(0.0) as u32;
+            }
+        }
+        config
+    }
+
+    /// 融合模式下的这一块；`None` = 独立窗口。
+    pub fn embed(&self) -> Option<Embed> {
+        self.embed
+    }
+
+    /// 换一个尺寸（父面板宽度 / 高度变了）。
+    pub fn set_embed(&mut self, embed: Embed, cx: &mut Context<Self>) {
+        if self.embed != Some(embed) {
+            self.embed = Some(embed);
+            cx.notify();
+        }
     }
 
     /// 窗口高度：横排是标题 + 每台一行；竖排是标题 + 一列。
@@ -816,14 +894,10 @@ impl Render for Brightness {
             }
         }
 
-        let content = div()
-            .size_full()
+        let embedded = self.embed.is_some();
+        let mut content = div()
             .flex()
             .flex_col()
-            // 根底色用不透明版：主题的 `surface` 留了 3% 透光，不透明度给到 100%
-            // 时还会隐隐透出桌面。要透多少由 `ui_opacity` 一个人说了算。
-            .bg(theme::surface_window())
-            .rounded(px(theme::RADIUS_WINDOW))
             .overflow_hidden()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -835,7 +909,23 @@ impl Render for Brightness {
                     // 点别处 = 确认这次手动输入。
                     this.commit_edit(cx);
                 }),
-            )
+            );
+        if embedded {
+            // 长在音量面板里：不铺自己的底色、不切圆角（那是父面板的事），
+            // 横排按内容撑高，竖排撑满父给的高度（推子长度就是照它算的）。
+            content = content.w_full();
+            if vertical {
+                content = content.h_full();
+            }
+        } else {
+            // 根底色用不透明版：主题的 `surface` 留了 3% 透光，不透明度给到 100%
+            // 时还会隐隐透出桌面。要透多少由 `ui_opacity` 一个人说了算。
+            content = content
+                .size_full()
+                .bg(theme::surface_window())
+                .rounded(px(theme::RADIUS_WINDOW));
+        }
+        let content = content
             .child(self.header(lang))
             .child(div().h(px(1.)).flex_none().bg(theme::border()))
             .child(
@@ -849,6 +939,11 @@ impl Render for Brightness {
                     .py(px(PAD))
                     .children(blocks),
             );
+
+        if embedded {
+            // 融合：整块由父面板布局，不自带那一层「贴底对齐」的外壳。
+            return div().w_full().when(vertical, |style| style.h_full()).child(content);
+        }
 
         // 尺寸永远是完整那一份：三档动画都是整扇窗在滑（或原地淡），内容不裁不缩。
         let full_height = self.last_height.max(1.0);

@@ -16,7 +16,8 @@ use gpui::{
 use crate::{
     audio::{AudioCommand, AudioEngine, DeviceInfo, Snapshot},
     config::{
-        ActivityEffect, AppBlockEntry, AppBlockKind, BrightnessPlacement, Config, ConfigStore,
+        ActivityEffect, AppBlockEntry, AppBlockKind, BrightnessMergeSide, BrightnessPlacement,
+        Config, ConfigStore,
         DisplayNameMode, FooterSide, Hotkey, HotkeySlots, MAX_TOOLTIP_LINE_CHARS, MAX_TOOLTIP_LINES,
         OsdAnchor, OsdAnimStyle, OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout,
         PopupAnimStyle, TrayIconStyle, TrayMotion,
@@ -12782,13 +12783,21 @@ impl Settings {
             display_rows.push(self.display_row(display, index, lang, cx));
         }
 
+        let merged = config.brightness.merged;
         let toggle = self.toggle_row(
             "display-brightness",
-            lang.pick("启用显示器亮度", "Enable display brightness"),
-            lang.pick(
-                "开启后，音量面板旁边会多出一个亮度窗口（DDC/CI）",
-                "Adds a brightness window beside the volume panel (DDC/CI)",
-            ),
+            lang.pick("启用显示器亮度面板", "Enable display brightness panel"),
+            if merged {
+                lang.pick(
+                    "亮度块长在音量面板里（DDC/CI）",
+                    "The brightness block lives inside the volume panel (DDC/CI)",
+                )
+            } else {
+                lang.pick(
+                    "开启后，音量面板旁边会多出一个亮度面板（DDC/CI）",
+                    "Adds a brightness panel beside the volume panel (DDC/CI)",
+                )
+            },
             enabled,
             move |window, cx| {
                 let _ = store.borrow_mut().update(|config| {
@@ -12796,6 +12805,25 @@ impl Settings {
                 });
                 // 立刻生效：面板正开着的话亮度窗口马上出现 / 消失。
                 crate::gui::refresh_brightness(cx);
+                refresh_ui(window, cx);
+            },
+        );
+
+        // 融合：亮度块不再是旁边一扇小窗，而是长进音量面板里，排版跟着音频走。
+        let merge_store = self.config.clone();
+        let merge_toggle = self.toggle_row(
+            "display-brightness-merge",
+            lang.pick("与音量面板融合", "Merge with the volume panel"),
+            lang.pick(
+                "亮度块长在音量面板里，排版跟随音频：横排铺在上下，竖排贴在左右",
+                "The brightness block lives inside the volume panel and follows its layout: a strip above or below when horizontal, a column beside it when vertical",
+            ),
+            merged,
+            move |window, cx| {
+                let _ = merge_store.borrow_mut().update(|config| {
+                    config.brightness.merged = !config.brightness.merged;
+                });
+                crate::gui::refresh_merged_brightness(cx);
                 refresh_ui(window, cx);
             },
         );
@@ -12865,6 +12893,42 @@ impl Settings {
                         .update(|config| config.brightness.placement = placement);
                     // 位置改了立刻重摆：面板可能得往里去让地方，亮度窗再跟着贴过来。
                     crate::gui::refresh_flyout_size(cx);
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        // 融合时的位置：横排只认上方 / 下方，竖排只认左侧 / 右侧 ——
+        // 选项直接按音频面板的朝向出，另一轴那两档根本不出来。
+        let audio_vertical = config.panel_layout.is_vertical();
+        let merge_options: &'static [(u32, &'static str)] = if audio_vertical {
+            if lang.is_en() {
+                &[(2, "Left"), (3, "Right")]
+            } else {
+                &[(2, "左侧"), (3, "右侧")]
+            }
+        } else if lang.is_en() {
+            &[(0, "Above"), (1, "Below")]
+        } else {
+            &[(0, "上方"), (1, "下方")]
+        };
+        let merge_side_row = {
+            let store = self.config.clone();
+            self.choice_row(
+                "brightness-merge-side",
+                lang.pick("融合位置", "Merged position"),
+                lang.pick(
+                    "亮度块摆在音频的上侧还是下侧；音频竖向排版时换成左侧还是右侧",
+                    "Whether the brightness block sits above or below the audio; when the audio panel is vertical, left or right instead",
+                ),
+                merge_options,
+                config.brightness.merge_side_of(audio_vertical).index(),
+                move |value, window, cx| {
+                    let side = BrightnessMergeSide::from_index(value);
+                    let _ = store
+                        .borrow_mut()
+                        .update(|config| config.brightness.merge_side = side);
+                    crate::gui::refresh_merged_brightness(cx);
                     refresh_ui(window, cx);
                 },
             )
@@ -12964,8 +13028,8 @@ impl Settings {
                     .text_size(theme::fs(10.5))
                     .text_color(theme::text_tertiary())
                     .child(lang.pick(
-                        "还没有预设：在亮度窗口里点「保存」就会存下当前亮度",
-                        "No presets yet — press Save in the brightness window to store the current level",
+                        "还没有预设：在亮度面板里点「保存」即存下当前亮度",
+                        "No presets yet — press Save in the brightness panel to store the current level",
                     ))
                     .into_any_element(),
             );
@@ -13024,16 +13088,26 @@ impl Settings {
         // 步进和滚轮都跟着总开关走：没开亮度时调它们没有意义。
         let mut brightness_rows = vec![toggle];
         if enabled {
-            // 宽度只对横排有意义（竖排的宽度由显示器台数决定），
-            // 显示器名只对竖排有意义 —— 各显示各的那一条，别摆一个改不动的选项在这儿。
-            let mut rows = vec![layout_row];
-            if config.brightness.panel_layout.is_vertical() {
-                rows.push(vertical_height_row);
-                rows.push(name_row);
+            let mut rows = vec![merge_toggle];
+            if merged {
+                // 融合时亮度块排在音量面板里：朝向由音频面板定，宽度 / 高度也跟着音频走，
+                // 只剩「贴哪一侧」还要自己选（竖排时顺带还能挑显示器名列头怎么写）。
+                rows.push(merge_side_row);
+                if audio_vertical {
+                    rows.push(name_row);
+                }
             } else {
-                rows.push(width_row);
+                // 宽度只对横排有意义（竖排的宽度由显示器台数决定），
+                // 显示器名只对竖排有意义 —— 各显示各的那一条，别摆一个改不动的选项在这儿。
+                rows.push(layout_row);
+                if config.brightness.panel_layout.is_vertical() {
+                    rows.push(vertical_height_row);
+                    rows.push(name_row);
+                } else {
+                    rows.push(width_row);
+                }
+                rows.push(placement_row);
             }
-            rows.push(placement_row);
             // 亮度窗口里 + / − 按一下走多少：热键页的「跟随」就是跟它。
             rows.push(step);
             rows.push(scroll_toggle);
@@ -13062,8 +13136,8 @@ impl Settings {
                 .text_size(theme::fs(10.5))
                 .text_color(theme::text_tertiary())
                 .child(lang.pick(
-                    "亮度通过 DDC/CI 直接写给显示器；笔记本内屏或走转接头的显示器通常不支持。\n亮度窗口里点数值可以手动填写，点「保存」把当前亮度存成预设，右键预设可删除。\n在亮度条上滚动滚轮也能调：一格走多少个百分点可以自己填。",
-                    "Brightness is written to the display over DDC/CI; laptop panels and adapters often do not support it.\nClick the value in the brightness window to type a level, press Save to store it as a preset, right-click a preset to remove it.\nScrolling on a brightness slider works too: one notch moves a fixed step you can set yourself.",
+                    "亮度通过 DDC/CI 直接写给显示器；笔记本内屏或走转接头的显示器通常不支持。\n亮度面板里点数值可以手动填写，点「保存」把当前亮度存成预设，右键预设可删除。\n在亮度条上滚动滚轮也能调：一格走多少个百分点可以自己填。",
+                    "Brightness is written to the display over DDC/CI; laptop panels and adapters often do not support it.\nClick the value in the brightness panel to type a level, press Save to store it as a preset, right-click a preset to remove it.\nScrolling on a brightness slider works too: one notch moves a fixed step you can set yourself.",
                 ))
                 .into_any_element(),
         ]

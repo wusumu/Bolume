@@ -399,6 +399,17 @@ pub struct Flyout {
     /// 正在等 `SetStateAsync` 落地的操作数。非零时轮询先别插手，
     /// 免得把用户刚点的那一下覆盖回旧值。
     radio_busy: Rc<Cell<u32>>,
+    /// 融合模式下长在面板里的亮度块（`None` = 没开融合，亮度用自己的窗口）。
+    ///
+    /// 这是一个**子视图**：它自己那份渲染与交互（滑条、预设、手动输入、滚轮）
+    /// 原样复用，只是不建窗口、不跑入场动画，尺寸由本面板给。
+    brightness: Option<gpui::Entity<crate::windows::brightness::Brightness>>,
+    /// 枚举到的显示器（和亮度窗、设置页共用同一份）。
+    ///
+    /// 面板尺寸要靠台数算（融合块多高、竖排列多宽），所以视图自己也拿一份。
+    displays: Rc<RefCell<Vec<crate::display::DisplayInfo>>>,
+    /// 融合块给面板额外占的地方：(高, 宽)。没开融合就是 (0, 0)。
+    brightness_room: (f32, f32),
 }
 
 /// 设备名点开的「更换播放设备」菜单（浮层，不占布局）。
@@ -548,6 +559,7 @@ impl Flyout {
         engine: Rc<crate::audio::AudioEngine>,
         muted_override: Rc<RefCell<HashMap<String, MuteNote>>>,
         focus: gpui::FocusHandle,
+        displays: Rc<RefCell<Vec<crate::display::DisplayInfo>>>,
     ) -> Self {
         Self {
             snapshot,
@@ -587,6 +599,9 @@ impl Flyout {
             bt_on: Rc::new(Cell::new(None)),
             radio_watch_token: Rc::new(Cell::new(0)),
             radio_busy: Rc::new(Cell::new(0)),
+            brightness: None,
+            displays,
+            brightness_room: (0.0, 0.0),
         }
     }
 
@@ -609,6 +624,86 @@ impl Flyout {
 
     fn cfg(&self) -> Config {
         self.config.borrow().get().clone()
+    }
+
+    /// 融合模式下这块内容该多大：横排铺满宽度、竖排撑满高度。
+    fn brightness_embed(&self) -> Option<crate::windows::brightness::Embed> {
+        let cfg = self.cfg();
+        if !cfg.brightness.merged_with_audio() {
+            return None;
+        }
+        let vertical = cfg.panel_layout.is_vertical();
+        Some(crate::windows::brightness::Embed {
+            vertical,
+            width: cfg.flyout_width(),
+            // 竖排要跟音频那一排**同样高**：面板总高扣掉页脚，正好是内容的可用高度。
+            height: if vertical {
+                (vertical_panel_height(&cfg) - theme::FOOTER_HEIGHT).max(60.0)
+            } else {
+                0.0
+            },
+        })
+    }
+
+    /// 按当前配置把融合的亮度块挂上 / 摘下、换了尺寸就更新。
+    ///
+    /// 配置里两个开关（启用亮度、融合）任何一个变了都要调一次；面板尺寸
+    /// 跟着变，调用方负责再刷一帧窗口。
+    pub fn sync_brightness_embed(&mut self, cx: &mut Context<Self>) {
+        let want = self.brightness_embed();
+        match (want, &self.brightness) {
+            (None, None) => {
+                self.set_brightness_room(0.0, 0.0);
+            }
+            (None, Some(_)) => {
+                self.brightness = None;
+                self.set_brightness_room(0.0, 0.0);
+                cx.notify();
+            }
+            (Some(embed), Some(view)) => {
+                let view = view.clone();
+                let _ = view.update(cx, |view, cx| view.set_embed(embed, cx));
+                self.measure_brightness_room();
+            }
+            (Some(embed), None) => {
+                let (config, engine, displays, error) =
+                    crate::gui::brightness_embed_deps(cx);
+                let view = cx.new(|cx| {
+                    crate::windows::brightness::Brightness::new_embedded(
+                        config, engine, displays, error, embed, cx,
+                    )
+                });
+                self.brightness = Some(view);
+                self.measure_brightness_room();
+                cx.notify();
+            }
+        }
+    }
+
+    /// 量一下融合块要占多少地方（横排占高、竖排占宽），多算 1px 分隔线。
+    fn measure_brightness_room(&mut self) {
+        let cfg = self.cfg();
+        if !cfg.brightness.merged_with_audio() {
+            self.set_brightness_room(0.0, 0.0);
+            return;
+        }
+        let count = self.display_count();
+        if cfg.panel_layout.is_vertical() {
+            self.set_brightness_room(0.0, crate::windows::brightness::embed_width(count) + 1.0);
+        } else {
+            self.set_brightness_room(
+                crate::windows::brightness::embed_height(&cfg, count) + 1.0,
+                0.0,
+            );
+        }
+    }
+
+    fn set_brightness_room(&mut self, height: f32, width: f32) {
+        self.brightness_room = (height, width);
+    }
+
+    fn display_count(&self) -> usize {
+        self.displays.borrow().len()
     }
 
     fn display_volume(&self, raw: f32) -> f32 {
@@ -1195,6 +1290,8 @@ impl Flyout {
     ///
     /// 面板只显示当前默认设备一行；切换设备在设置页里做，所以高度恒定。
     pub fn desired_height(&self) -> f32 {
+        // 融合的亮度块横排时整条铺在音频上 / 下，占的是高度（竖排时这一项是 0）。
+        let merge_extra = self.brightness_room.0;
         if self.cfg().panel_layout.is_vertical() {
             return self.column_height();
         }
@@ -1212,6 +1309,7 @@ impl Flyout {
         (theme::DEVICE_ROW_HEIGHT + theme::APPS_HEADER_HEIGHT + theme::FOOTER_HEIGHT)
             + 1.0
             + apps * self.row_height()
+            + merge_extra
     }
 
     /// 竖向排版一共几列：设备占一列，其余每路应用一列。
@@ -1232,7 +1330,11 @@ impl Flyout {
         if self.cfg().panel_layout.is_vertical() {
             let columns = self.channel_count() as f32;
             // 和渲染那边对齐：左右内边距、列宽都是固定值，列间距也是。
-            V_PAD * 2.0 + columns * self.column_width() + (columns - 1.0) * V_COLUMN_GAP
+            // 融合的亮度块竖排时再往旁边加一列（宽度 + 那条 1px 分隔线）。
+            V_PAD * 2.0
+                + columns * self.column_width()
+                + (columns - 1.0) * V_COLUMN_GAP
+                + self.brightness_room.1
         } else {
             self.cfg().flyout_width()
         }
@@ -3513,6 +3615,9 @@ impl Flyout {
 
     fn show_inner(&mut self, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
+        // 融合的亮度块：每次弹出都对一次（开关、排版、显示器台数都可能变过），
+        // 尺寸算在 `brightness_room` 里，后面 `enter` 用的就是这一份。
+        self.sync_brightness_embed(cx);
         self.activity.reset();
         // WiFi / 蓝牙开关状态：弹出时先读一次，之后由 `watch_radios` 在可见期间盯着。
         // 这里不是 render 上下文，`refresh_radios` 里的 spawn 不会把 App 重入借用。
@@ -3841,7 +3946,8 @@ impl Flyout {
         // 反过来的情况（任务栏在上、亮度窗放下面）一格都不用挪：挪了反而会把它
         // 顶到工作区外面去（上半截被任务栏挡住）。
         let cfg = self.cfg();
-        if cfg.brightness.enabled {
+        // 融合模式下亮度块就长在本面板里，外面没有别的窗要占地方 —— 不用让位。
+        if cfg.brightness.enabled && !cfg.brightness.merged_with_audio() {
             const GAP: f32 = 8.0;
             let displays = crate::gui::display_count(cx);
             // 亮度面板多大由它自己那套排版算，这里只负责让出这块地方。
@@ -4036,26 +4142,103 @@ impl Render for Flyout {
             // 字间距也是文本样式，挂根节点整棵树继承（子节点只覆盖字号，不会盖掉它）。
             .when(spacing != px(0.), |style| style.letter_spacing(spacing));
 
+        // 融合的亮度块：横排是整条（上 / 下），竖排是一列（左 / 右）。
+        // 尺寸必须和 `desired_height` / `panel_width` 里加的那一笔对得上，
+        // 差 1px 就会被圆角裁掉一截，所以这里统一从一个来源 `brightness_room` 取。
+        let merge_side = self.cfg().brightness.merge_side_of(vertical);
+        let mut brightness_pane: Option<AnyElement> = self.brightness.clone().map(|view| {
+            if vertical {
+                let width = (self.brightness_room.1 - 1.0).max(1.0);
+                div()
+                    .w(px(width))
+                    .h_full()
+                    .flex_none()
+                    .child(view)
+                    .into_any_element()
+            } else {
+                let height = (self.brightness_room.0 - 1.0).max(1.0);
+                div()
+                    .h(px(height))
+                    .w_full()
+                    .flex_none()
+                    .child(view)
+                    .into_any_element()
+            }
+        });
+        let merge_rule = |vertical_rule: bool| {
+            if vertical_rule {
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .flex_none()
+                    .bg(theme::border())
+                    .into_any_element()
+            } else {
+                div()
+                    .h(px(1.))
+                    .w_full()
+                    .flex_none()
+                    .bg(theme::border())
+                    .into_any_element()
+            }
+        };
+        let merge_above = brightness_pane.is_some()
+            && !vertical
+            && merge_side == crate::config::BrightnessMergeSide::Above;
+        let merge_below = brightness_pane.is_some()
+            && !vertical
+            && merge_side == crate::config::BrightnessMergeSide::Below;
+        let merge_left = brightness_pane.is_some()
+            && vertical
+            && merge_side == crate::config::BrightnessMergeSide::Left;
+        let merge_right = brightness_pane.is_some()
+            && vertical
+            && merge_side == crate::config::BrightnessMergeSide::Right;
+
         let content = if vertical {
+            let mut row = div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(0.));
+            if merge_left {
+                row = row
+                    .child(brightness_pane.take().expect("亮度块"))
+                    .child(merge_rule(true));
+            }
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(V_COLUMN_GAP))
+                    .px(self.su(V_PAD))
+                    .py(self.su(V_PAD))
+                    .children(columns),
+            );
+            if merge_right {
+                row = row
+                    .child(merge_rule(true))
+                    .child(brightness_pane.take().expect("亮度块"));
+            }
             content
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_row()
-                        .items_start()
-                        .gap(px(V_COLUMN_GAP))
-                        .px(self.su(V_PAD))
-                        .py(self.su(V_PAD))
-                        .children(columns),
-                )
+                .child(row)
                 .child(self.footer(cx))
                 .children(device_overlay)
                 .children(tip_overlay)
                 .children(rename_overlay)
         } else {
-            content
+            let mut content = content;
+            if merge_above {
+                content = content
+                    .child(brightness_pane.take().expect("亮度块"))
+                    .child(merge_rule(false));
+            }
+            content = content
                 .child(device_row)
                 .child(div().h(px(1.)).flex_none().bg(theme::border()))
                 .child(self.apps_header())
@@ -4071,7 +4254,13 @@ impl Render for Flyout {
                         .on_scroll_wheel(cx.listener(Self::on_apps_wheel))
                         .children(rows),
                 )
-                .child(self.footer(cx))
+                .child(self.footer(cx));
+            if merge_below {
+                content = content
+                    .child(merge_rule(false))
+                    .child(brightness_pane.take().expect("亮度块"));
+            }
+            content
                 .children(device_overlay)
                 .children(tip_overlay)
         };

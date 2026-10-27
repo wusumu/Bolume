@@ -4,7 +4,7 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写 · 单文件 exe · 绿色免安装 · 配置就在 exe 旁边 · 中英双语界面**
 
-目前版本 **0.83** · [下载](../../releases) · [English](#english)
+目前版本 **0.84** · [下载](../../releases) · [English](#english)
 
 ---
 
@@ -46,6 +46,7 @@ Bolume 把这些收进一个右下角弹出的面板里：一台默认设备 + �
 
 - 走 DDC/CI，直接调显示器硬件亮度，不靠 gamma 蒙
 - 当前屏 / 全部屏 / 指定第 N 台三种目标，快捷键可以分开绑
+- 亮度面板可以和音量面板融合成一块：横排时铺在音频上方 / 下方，竖排时贴在左侧 / 右侧，排版跟着音量面板走
 
 **屏幕提示（OSD）**
 
@@ -194,7 +195,7 @@ vendor/
 
 - Per-app volume (percentage / logarithmic / fixed dB), per-app mute, volume caps
 - Switch playback & recording devices, rename them, restore a saved device state at startup
-- Monitor brightness over DDC/CI (current / all / a specific display)
+- Monitor brightness over DDC/CI (current / all / a specific display), optionally merged into the volume panel itself — above/below when it is horizontal, left/right when vertical
 - Its own on-screen display for volume, mute, track changes and brightness, with a layout editor
 - Global hotkeys for everything, including media keys taken over through a low-level keyboard hook, hold-to-repeat, and an app blocklist that gets out of the way in fullscreen games
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
