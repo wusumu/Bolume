@@ -104,6 +104,30 @@ pub fn display_count(cx: &App) -> usize {
     cx.global::<AppState>().displays.borrow().len()
 }
 
+/// 光标所在的那台显示器 —— 面板就弹在这台上。
+///
+/// 「在哪台屏上点开的就出现在哪台」：托盘图标只长在任务栏所在的那台（工作区被
+/// 任务栏吃掉的那台），点它时光标必然停在那台上；快捷键没有点击点，就按光标位置算
+/// （人在哪台屏上干活，面板就出在哪台）。万一认不出光标在哪台（刚拔掉、远程会话），
+/// 退回主屏 —— 面板不能因为认不出屏幕就不出来。
+pub fn display_at_cursor(cx: &App) -> Option<Rc<dyn gpui::PlatformDisplay>> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut position = POINT::default();
+    let target = unsafe {
+        if GetCursorPos(&mut position).is_err() {
+            return cx.primary_display();
+        }
+        MonitorFromPoint(position, MONITOR_DEFAULTTONEAREST)
+    };
+    // gpui 的 `DisplayId` 存的就是 HMONITOR 的值（`display_id_for_monitor` 一行直转），
+    // 所以这里能拿 Win32 句柄直接当 id 查 —— 不用比 DPI，也不用比设备名。
+    cx.find_display(gpui::DisplayId::new(target.0 as u64))
+        .or_else(|| cx.primary_display())
+}
+
 /// 当前枚举到的显示器（设置页要用它列出显示器、就地改名字）。
 pub fn displays_snapshot(cx: &App) -> Vec<DisplayInfo> {
     cx.global::<AppState>().displays.borrow().clone()
@@ -428,10 +452,13 @@ pub fn run(
             sync_tray_motion(cx);
 
             // 面板窗口：先隐藏创建，之后由托盘/快捷键显示。
-            // 显式绑定主屏：否则 gpui 会按鼠标位置挑显示器，窗口跨屏移动时会触发
-            // gpui 内部的借用冲突（WindowsDisplay 重建）。
+            // 创建时显式绑主屏：不给 `display_id` 的话 gpui 会自己按鼠标位置挑一台，
+            // 那一步会在开窗流程里重查显示器列表，容易撞上借用冲突。
+            // 「弹在哪台屏」不靠这个 —— 每次显示都由 `Flyout::update_frame_parked`
+            // 按光标所在的显示器摆位（见 `gui::display_at_cursor`），跨屏移动只是
+            // 一次 `SetWindowPos`，gpui 在 WM_MOVE 里自己会把 display 换成新的那台。
             let primary_id = cx.primary_display().map(|display| display.id());
-            // 初始位置就直接放在主屏右下角，避免首次移动跨越屏幕触发显示器重建。
+            // 初始位置就放在主屏右下角（窗口是隐藏的，用户看不到）。
             let area = cx
                 .primary_display()
                 .map(|display| display.visible_bounds())

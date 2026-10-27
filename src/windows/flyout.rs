@@ -368,6 +368,9 @@ pub struct Flyout {
     /// 窗口该停的位置（逻辑像素，左上角 + 宽高）：`update_frame` 算好存这儿，
     /// 系统风格的滑入每帧在它上面加位移。
     base_frame: (f32, f32, f32, f32),
+    /// 这次弹在哪台显示器的**整块**矩形（逻辑像素）：滑入的起点按它的边算，
+    /// 必须和 `base_frame` 是同一次、同一台 —— 中途重新问光标会问到别的屏上去。
+    screen: (f32, f32, f32, f32),
     /// 正在跑的那段滑动（独立线程按合成帧推进）；None = 没动画在跑。
     slide: Option<crate::windows::platform::SlideHandle>,
     /// 静止时窗口停在哪：0 = 在位，`slide_distance` = 整个在屏幕外。
@@ -597,6 +600,7 @@ impl Flyout {
             last_hidden: None,
             anim: Entrance::new(),
             base_frame: (0.0, 0.0, 0.0, 0.0),
+            screen: (0.0, 0.0, 0.0, 0.0),
             slide: None,
             rest_offset: 0.0,
             blur_hidden_at: None,
@@ -3469,14 +3473,22 @@ impl Flyout {
         if width <= 0.0 || height <= 0.0 {
             return 0.0;
         }
-        let area = cx
-            .primary_display()
-            .map(|display| display.bounds())
-            .unwrap_or_else(|| {
-                gpui::Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.)))
-            });
-        let (ax, ay) = (area.origin.x.as_f32(), area.origin.y.as_f32());
-        let (aw, ah) = (area.size.width.as_f32(), area.size.height.as_f32());
+        // 用摆位时记下的那台屏（不是现问光标）：面板弹在哪台，就从那台的边滑进来。
+        let (ax, ay, aw, ah) = if self.screen.2 > 0.0 && self.screen.3 > 0.0 {
+            self.screen
+        } else {
+            let screen = crate::gui::display_at_cursor(cx)
+                .map(|display| display.bounds())
+                .unwrap_or_else(|| {
+                    gpui::Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.)))
+                });
+            (
+                screen.origin.x.as_f32(),
+                screen.origin.y.as_f32(),
+                screen.size.width.as_f32(),
+                screen.size.height.as_f32(),
+            )
+        };
         match self.edge {
             TaskbarEdge::Bottom => (ay + ah - y).max(0.0),
             TaskbarEdge::Top => (y + height - ay).max(0.0),
@@ -3931,12 +3943,27 @@ impl Flyout {
     ) {
         let (width, height) = self.panel_size();
         self.last_height = height;
-        let area = cx
-            .primary_display()
+        // 弹在**光标所在那台**显示器上：托盘图标在哪台任务栏上点的、快捷键时鼠标
+        // 停在哪台，面板就从哪台的角落出来（多屏时不用再跑去主屏找它）。
+        // 这两份几何一次认全：`area` 是工作区（摆面板用），`screen` 是整块屏
+        // （滑入起点用），同一次查询保证它们一定是同一台。
+        let display = crate::gui::display_at_cursor(cx);
+        let area = display
+            .as_ref()
             .map(|display| display.visible_bounds())
             .unwrap_or_else(|| {
                 gpui::Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.)))
             });
+        let screen = display
+            .as_ref()
+            .map(|display| display.bounds())
+            .unwrap_or(area);
+        self.screen = (
+            screen.origin.x.as_f32(),
+            screen.origin.y.as_f32(),
+            screen.size.width.as_f32(),
+            screen.size.height.as_f32(),
+        );
         // 面板贴任务栏所在的边，并沿垂直/水平方向对齐到屏幕右下角，
         // 与 EarTrumpet 在各任务栏位置下的表现一致。
         self.edge = crate::windows::platform::taskbar_edge();
@@ -4002,12 +4029,7 @@ impl Flyout {
         );
         // 起点：整扇窗刚好在屏幕外（底/顶任务栏按高度，左右按宽度）。
         let placed = if parked {
-            let screen = cx
-                .primary_display()
-                .map(|display| display.bounds())
-                .unwrap_or(area);
-            let (sx, sy) = (screen.origin.x.as_f32(), screen.origin.y.as_f32());
-            let (sw, sh) = (screen.size.width.as_f32(), screen.size.height.as_f32());
+            let (sx, sy, sw, sh) = self.screen;
             match self.edge {
                 TaskbarEdge::Bottom => point(origin.x, px(sy + sh)),
                 TaskbarEdge::Top => point(origin.x, px(sy - height)),
