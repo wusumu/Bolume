@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use itertools::Itertools;
+use std::sync::{Mutex, OnceLock};
 use windows::Win32::{
     Foundation::HMODULE,
     Graphics::{
@@ -15,11 +16,41 @@ use windows::Win32::{
         },
         Dxgi::{
             CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            IDXGIAdapter1, IDXGIDevice3, IDXGIFactory6,
         },
     },
 };
 use windows::core::Interface;
+
+/// 进程里那一个 D3D11 设备对应的 DXGI 设备（只有 `IDXGIDevice3` 带 `Trim`）。
+///
+/// 常驻托盘的应用空闲时要把内存还回去：驱动在设备里缓存了一大块提交
+/// （实测一个跑过几张窗口尺寸纹理的进程能退回 ~27MB），`Trim` 之后驱动下次
+/// 绘制时再按需提交，设备本身不用重建。
+static DXGI_DEVICE: OnceLock<Mutex<(Option<ID3D11DeviceContext>, Option<IDXGIDevice3>)>> =
+    OnceLock::new();
+
+fn remember_device(device: &ID3D11Device, context: &ID3D11DeviceContext) {
+    let slot = DXGI_DEVICE.get_or_init(|| Mutex::new((None, None)));
+    let Ok(mut slot) = slot.lock() else { return };
+    if slot.1.is_some() {
+        return;
+    }
+    slot.0 = Some(context.clone());
+    slot.1 = device.cast::<IDXGIDevice3>().ok();
+}
+
+/// 把驱动缓存的那部分提交还给系统。空闲时调（有窗口在画的时候别调，白折腾）。
+pub fn trim_graphics() {
+    let Some(slot) = DXGI_DEVICE.get() else { return };
+    let Ok(slot) = slot.lock() else { return };
+    if let Some(context) = slot.0.as_ref() {
+        unsafe { context.Flush() };
+    }
+    if let Some(device) = slot.1.as_ref() {
+        unsafe { device.Trim() };
+    }
+}
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     (0..5)
@@ -69,6 +100,7 @@ impl DirectXDevices {
             device,
             device_context,
         })
+        .inspect(|devices| remember_device(&devices.device, &devices.device_context))
     }
 }
 

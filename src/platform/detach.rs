@@ -24,10 +24,12 @@ pub const DETACHED_FLAG: &str = "--detached";
 ///
 /// - `explorer.exe`：桌面 / 开始菜单 / 任务栏 / 快捷方式；
 /// - `svchost.exe`：任务计划（用户登录时启动那一档走这里）；
+/// - `taskhostw.exe`：任务计划的宿主（Win10 上「用户登录时启动」跑的是它）；
 /// - 其余三个是登录流程里的，`boot-handoff` 送进来的实例父进程一般就是它们。
 const SHELLS: &[&str] = &[
     "explorer.exe",
     "svchost.exe",
+    "taskhostw.exe",
     "services.exe",
     "winlogon.exe",
     "userinit.exe",

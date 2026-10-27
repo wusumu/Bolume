@@ -96,17 +96,38 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
-    // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
-    path_intermediate_msaa_texture: ID3D11Texture2D,
-    path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    // 路径中间纹理（含 MSAA）：**第一次真的画路径时才建**。
+    // 只有 SVG / 矢量路径走这条路，大部分窗口一辈子用不上；按窗口尺寸建一张
+    // 4x MSAA 纹理 + 一张同尺寸副本，对一个 1500×1000 的窗口就是三十多 MB。
+    path: Option<PathIntermediate>,
 
-    // Offscreen targets for blur filters (each is render-target + shader-resource).
-    blur: BlurResources,
+    // 模糊滤镜的离屏目标：同样懒建，`backdrop-filter` / `filter` 出现时才需要。
+    blur: Option<BlurResources>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+}
+
+/// 路径先画到这张离屏纹理，再按 bounds 拷回目标（透明路径不能重复叠加）。
+struct PathIntermediate {
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    msaa_texture: ID3D11Texture2D,
+    msaa_view: Option<ID3D11RenderTargetView>,
+}
+
+impl PathIntermediate {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+        let (msaa_texture, msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        Ok(Self {
+            texture,
+            srv,
+            msaa_texture,
+            msaa_view,
+        })
+    }
 }
 
 /// Offscreen render targets used by the blur filters. The scene is rendered into `scene_color`
@@ -251,6 +272,9 @@ impl DirectXRenderer {
         hwnd: HWND,
         directx_devices: &DirectXDevices,
         disable_direct_composition: bool,
+        // 全局共用的字形 / 图片图集：每个窗口各建一套等于把同一批字形重复上传
+        // 好几遍（每套 1MB 起），共用一套既不占内存也不用重复光栅化。
+        atlas: Arc<DirectXAtlas>,
     ) -> Result<Self> {
         if disable_direct_composition {
             log::info!("Direct Composition is disabled.");
@@ -258,7 +282,6 @@ impl DirectXRenderer {
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Creating DirectX devices")?;
-        let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
         let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
             .context("Creating DirectX resources")?;
@@ -443,14 +466,21 @@ impl DirectXRenderer {
         // Clone the views we need (AddRef) so the loop can rebind render targets without holding a
         // borrow of `self` across the `&mut self` draw_* calls.
         let (scene_rtv, scene_srv, group_rtvs, group_srvs, swapchain_rtv) = {
-            let r = self.resources.as_ref().context("resources missing")?;
-            (
-                r.blur.scene_color_rtv.clone(),
-                r.blur.scene_color_srv.clone(),
-                r.blur.group_rtvs.clone(),
-                r.blur.group_srvs.clone(),
-                r.render_target_view.clone(),
-            )
+            // 只有真的要走离屏（有模糊滤镜）时才建那套目标。
+            let device = self.devices.as_ref().context("devices missing")?.device.clone();
+            let r = self.resources.as_mut().context("resources missing")?;
+            if use_offscreen {
+                let b = r.ensure_blur(&device)?;
+                (
+                    b.scene_color_rtv.clone(),
+                    b.scene_color_srv.clone(),
+                    b.group_rtvs.clone(),
+                    b.group_srvs.clone(),
+                    r.render_target_view.clone(),
+                )
+            } else {
+                (None, None, Vec::new(), Vec::new(), r.render_target_view.clone())
+            }
         };
         let ctx = self
             .devices
@@ -756,19 +786,30 @@ impl DirectXRenderer {
             return Ok(());
         }
 
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
+        let (device, device_context) = {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            (devices.device.clone(), devices.device_context.clone())
+        };
+        // 先把要用的指针抄出来（COM 指针 clone 只是 AddRef），
+        // 免得跟 `resources` 那次可变借用来回打架。
+        let (viewport, base_target, msaa_view, msaa_texture, texture) = {
+            let resources = self.resources.as_mut().context("resources missing")?;
+            let viewport = resources.viewport;
+            let base_target = resources.render_target_view.clone();
+            let path = resources.ensure_path(&device)?;
+            (
+                viewport,
+                base_target,
+                path.msaa_view.clone(),
+                path.msaa_texture.clone(),
+                path.texture.clone(),
+            )
+        };
         // Clear intermediate MSAA texture
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            device_context.ClearRenderTargetView(msaa_view.as_ref().unwrap(), &[0.0; 4]);
             // Set intermediate MSAA texture as render target
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
-                None,
-            );
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&msaa_view)), None);
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -784,14 +825,14 @@ impl DirectXRenderer {
         }
 
         self.pipelines.path_rasterization_pipeline.update_buffer(
-            &devices.device,
-            &devices.device_context,
+            &device,
+            &device_context,
             &vertices,
         )?;
 
         self.pipelines.path_rasterization_pipeline.draw(
-            &devices.device_context,
-            slice::from_ref(&resources.viewport),
+            &device_context,
+            slice::from_ref(&viewport),
             slice::from_ref(&self.globals.global_params_buffer),
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             vertices.len() as u32,
@@ -800,10 +841,10 @@ impl DirectXRenderer {
 
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
-            devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
+            device_context.ResolveSubresource(
+                &texture,
                 0,
-                &resources.path_intermediate_msaa_texture,
+                &msaa_texture,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -812,11 +853,9 @@ impl DirectXRenderer {
             let restore_target = if self.active_render_target.is_some() {
                 &self.active_render_target
             } else {
-                &resources.render_target_view
+                &base_target
             };
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(restore_target)), None);
+            device_context.OMSetRenderTargets(Some(slice::from_ref(restore_target)), None);
         }
 
         Ok(())
@@ -849,19 +888,27 @@ impl DirectXRenderer {
             vec![PathSprite { bounds }]
         };
 
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
+        let (device, device_context) = {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            (devices.device.clone(), devices.device_context.clone())
+        };
+        let (viewport, srv) = {
+            let resources = self.resources.as_mut().context("resources missing")?;
+            let viewport = resources.viewport;
+            let srv = resources.ensure_path(&device)?.srv.clone();
+            (viewport, srv)
+        };
         self.pipelines.path_sprite_pipeline.update_buffer(
-            &devices.device,
-            &devices.device_context,
+            &device,
+            &device_context,
             &sprites,
         )?;
 
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
-            &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
-            slice::from_ref(&resources.viewport),
+            &device_context,
+            slice::from_ref(&srv),
+            slice::from_ref(&viewport),
             slice::from_ref(&self.globals.global_params_buffer),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
@@ -1018,7 +1065,7 @@ impl DirectXRenderer {
     /// by `opacity`. Shared by the backdrop and content-filter paths.
     #[allow(clippy::too_many_arguments)]
     fn dx_blur_and_composite(
-        &self,
+        &mut self,
         source_srv: &Option<ID3D11ShaderResourceView>,
         target_rtv: &Option<ID3D11RenderTargetView>,
         bounds: Bounds<ScaledPixels>,
@@ -1056,13 +1103,16 @@ impl DirectXRenderer {
             MaxDepth: 1.0,
         };
         let (full_vp, ping_rtv, ping_srv, pong_rtv, pong_srv) = {
-            let r = self.resources.as_ref().context("resources missing")?;
+            let device = self.devices.as_ref().context("devices missing")?.device.clone();
+            let r = self.resources.as_mut().context("resources missing")?;
+            let full_vp = r.viewport;
+            let b = r.ensure_blur(&device)?;
             (
-                r.viewport,
-                r.blur.ping_rtv.clone(),
-                r.blur.ping_srv.clone(),
-                r.blur.pong_rtv.clone(),
-                r.blur.pong_srv.clone(),
+                full_vp,
+                b.ping_rtv.clone(),
+                b.ping_srv.clone(),
+                b.pong_rtv.clone(),
+                b.pong_srv.clone(),
             )
         };
 
@@ -1235,29 +1285,42 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
-        let blur = BlurResources::new(&devices.device, width, height)?;
 
         Ok(Self {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
-            blur,
+            path: None,
+            blur: None,
             viewport,
         })
+    }
+
+    /// 路径中间纹理：第一次画路径才建（按当前视口尺寸）。
+    fn ensure_path(&mut self, device: &ID3D11Device) -> Result<&PathIntermediate> {
+        if self.path.is_none() {
+            self.path = Some(PathIntermediate::new(
+                device,
+                self.viewport.Width as u32,
+                self.viewport.Height as u32,
+            )?);
+        }
+        Ok(self.path.as_ref().expect("just created"))
+    }
+
+    /// 模糊离屏目标：第一次出现模糊滤镜才建（按当前视口尺寸）。
+    fn ensure_blur(&mut self, device: &ID3D11Device) -> Result<&BlurResources> {
+        if self.blur.is_none() {
+            self.blur = Some(BlurResources::new(
+                device,
+                self.viewport.Width as u32,
+                self.viewport.Height as u32,
+            )?);
+        }
+        Ok(self.blur.as_ref().expect("just created"))
     }
 
     #[inline]
@@ -1267,23 +1330,14 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
-        self.blur = BlurResources::new(&devices.device, width, height)?;
         self.viewport = viewport;
+        // 尺寸变了：离屏纹理整张按新尺寸重来，用得到再建。
+        self.path = None;
+        self.blur = None;
         Ok(())
     }
 }
@@ -1784,31 +1838,11 @@ fn create_resources(
     swap_chain: &IDXGISwapChain1,
     width: u32,
     height: u32,
-) -> Result<(
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
-    D3D11_VIEWPORT,
-)> {
+) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>, D3D11_VIEWPORT)> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
-    Ok((
-        render_target,
-        render_target_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
-        viewport,
-    ))
+    Ok((render_target, render_target_view, viewport))
 }
 
 #[inline]
@@ -2202,7 +2236,9 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
     Ok(())
 }
 
-const BUFFER_COUNT: usize = 3;
+/// 双缓冲就够：flip 模型的最小值是 2，第三张只是多一张窗口大小的纹理
+/// （设置窗那种 1500×1000 就是一张 6MB），常驻托盘的应用换来的是白白多占内存。
+const BUFFER_COUNT: usize = 2;
 
 pub(crate) mod shader_resources {
     use anyhow::Result;

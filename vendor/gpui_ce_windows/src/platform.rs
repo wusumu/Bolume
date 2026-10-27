@@ -77,6 +77,9 @@ pub(crate) struct WindowsPlatformState {
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     #[cfg(not(feature = "wgpu"))]
     directx_devices: RefCell<Option<DirectXDevices>>,
+    /// 所有窗口共用的图集：字形 / 图片只光栅化、上传一次。
+    #[cfg(not(feature = "wgpu"))]
+    pub(crate) atlas: Option<Arc<DirectXAtlas>>,
 }
 
 #[derive(Default)]
@@ -103,6 +106,10 @@ impl WindowsPlatformState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible: Arc::new(AtomicBool::new(true)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
+            #[cfg(not(feature = "wgpu"))]
+            atlas: directx_devices
+                .as_ref()
+                .map(|devices| Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context))),
             #[cfg(not(feature = "wgpu"))]
             directx_devices: RefCell::new(directx_devices),
             menus: RefCell::new(Vec::new()),
@@ -257,6 +264,8 @@ impl WindowsPlatform {
             disable_direct_composition: self.disable_direct_composition,
             #[cfg(not(feature = "wgpu"))]
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
+            #[cfg(not(feature = "wgpu"))]
+            atlas: self.inner.state.atlas.clone().unwrap(),
             invalidate_devices: self.invalidate_devices.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
         }
@@ -1177,6 +1186,8 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) disable_direct_composition: bool,
     #[cfg(not(feature = "wgpu"))]
     pub(crate) directx_devices: DirectXDevices,
+    #[cfg(not(feature = "wgpu"))]
+    pub(crate) atlas: Arc<DirectXAtlas>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,

@@ -9,12 +9,14 @@ description = "Next-generation Windows audio mixer"
 [features]
 default = ["gui"]
 # 界面层：GPUI（自绘，不带组件库）。音频层与界面层解耦，可用 --no-default-features 单独验证音频。
-gui = ["dep:gpui", "dep:gpui_platform", "dep:tray-icon"]
+gui = ["dep:gpui", "dep:gpui_platform", "dep:tray-icon", "dep:gpui_ce_windows"]
 
 [dependencies]
 gpui = { package = "gpui-ce", version = "0.2.2", optional = true }
 gpui_platform = { package = "gpui_ce_platform", version = "0.1.0", optional = true }
 tray-icon = { version = "=0.24.1", optional = true }
+# 只为了 `trim_graphics()`：空闲时让 D3D 驱动把缓存的提交还回去（见 memory.rs）。
+gpui_ce_windows = { version = "0.1.0", optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -78,11 +80,18 @@ opt-level = 1
 opt-level = 2
 
 # 体积优先：单文件分发、常驻托盘，不要为了让跑分好看多塞几 MB 代码。
-# `opt-level = "s"` 只影响极少数热点以外的内联决策，面板的绘制开销感知不到；
+# `opt-level = "z"` 比 "s" 再小 1.4MB（10.8 → 9.4）；绘制量很小，
+# 内联少一点感知不到；
 # fat LTO + 单 codegen unit 让跨 crate 的死代码真正被删掉。
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# 本地 crate 里跑的是音频 DSP（响度均衡逐样本）和界面场景构建，留在 "s"
+# （跟以前一样，音质/延迟验证过）；"z" 只套在依赖上 —— 体积大头是 gpui、
+# resvg、windows 这些，单给它们降到 "z" 就能省下 mb 级，DSP 不受影响。
+[profile.release.package.Bolume]
+opt-level = "s"

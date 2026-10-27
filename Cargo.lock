@@ -12,6 +12,7 @@ dependencies = [
  "directories",
  "gpui-ce",
  "gpui_ce_platform",
+ "gpui_ce_windows",
  "image",
  "log",
  "raw-window-handle",

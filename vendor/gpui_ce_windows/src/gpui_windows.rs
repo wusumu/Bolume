@@ -46,5 +46,7 @@ pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
+#[cfg(not(feature = "wgpu"))]
+pub use directx_devices::trim_graphics;
 
 pub(crate) use windows::Win32::Foundation::HWND;

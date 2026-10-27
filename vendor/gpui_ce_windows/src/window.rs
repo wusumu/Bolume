@@ -119,6 +119,7 @@ impl WindowsWindowState {
     fn new(
         hwnd: HWND,
         #[cfg(not(feature = "wgpu"))] directx_devices: &DirectXDevices,
+        #[cfg(not(feature = "wgpu"))] atlas: &Arc<DirectXAtlas>,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         cursor_visible: Arc<AtomicBool>,
@@ -159,8 +160,13 @@ impl WindowsWindowState {
         )
         .context("Creating Wgpu renderer")?;
         #[cfg(not(feature = "wgpu"))]
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let renderer = DirectXRenderer::new(
+            hwnd,
+            directx_devices,
+            disable_direct_composition,
+            atlas.clone(),
+        )
+        .context("Creating DirectX renderer")?;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -276,6 +282,8 @@ impl WindowsWindowInner {
             hwnd,
             #[cfg(not(feature = "wgpu"))]
             &context.directx_devices,
+            #[cfg(not(feature = "wgpu"))]
+            &context.atlas,
             cs,
             context.current_cursor,
             context.cursor_visible.clone(),
@@ -436,6 +444,8 @@ struct WindowCreateContext {
     #[cfg(not(feature = "wgpu"))]
     directx_devices: DirectXDevices,
     #[cfg(not(feature = "wgpu"))]
+    atlas: Arc<DirectXAtlas>,
+    #[cfg(not(feature = "wgpu"))]
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
@@ -465,6 +475,8 @@ impl WindowsWindow {
             disable_direct_composition,
             #[cfg(not(feature = "wgpu"))]
             directx_devices,
+            #[cfg(not(feature = "wgpu"))]
+            atlas,
             invalidate_devices,
             draw_coordinator,
         } = creation_info;
@@ -556,6 +568,8 @@ impl WindowsWindow {
             disable_direct_composition,
             #[cfg(not(feature = "wgpu"))]
             directx_devices,
+            #[cfg(not(feature = "wgpu"))]
+            atlas,
             #[cfg(not(feature = "wgpu"))]
             invalidate_devices,
             draw_coordinator,

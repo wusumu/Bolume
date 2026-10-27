@@ -1,4 +1,4 @@
-//! 空闲时把工作集还给系统。
+//! 空闲时把工作集还给系统，顺便让 D3D 驱动把缓存的提交还回去。
 //!
 //! # 为什么需要
 //!
@@ -10,6 +10,13 @@
 //! 实测（0.83）：刚启动 21MB，跑 7 小时 126MB，两分钟采样零增长、句柄数还在下降 ——
 //! 是驻留，不是泄漏。真正的修法不是找泄漏，而是**不活跃的页主动换出去**。
 //!
+//! # 两笔账
+//!
+//! * **工作集**（任务管理器「内存」列）：`SetProcessWorkingSetSize(-1, -1)` 换出去；
+//! * **提交量**（「提交大小」列）：D3D11 设备本身约 50MB（驱动自己的账，动不了），
+//!   另有一部分是驱动替我们缓存的纹理 / 命令缓冲，用 `IDXGIDevice3::Trim` 还回去
+//!   （实测一次能退二十多 MB，下次绘制按需重新提交）。
+//!
 //! # 什么时候才动
 //!
 //! 三条同时满足才修剪：
@@ -17,7 +24,7 @@
 //! * 本进程**没有可见窗口**（面板、亮度卡片、屏幕提示、设置窗全收着）—— 有窗口在
 //!   眼前时修剪，下一帧就是一片缺页，掉帧；
 //! * 已经这样安静了 [`IDLE_AFTER`] 以上；
-//! * 距上次修剪超过 [`TRIM_EVERY`]，且工作集还在 [`TRIM_FLOOR`] 以上。
+//! * 距上次修剪超过 [`TRIM_EVERY`]，且工作集 / 提交量还有一个在门槛以上。
 //!
 //! 修剪之后重新打开面板要重新触页，几十毫秒的事，用户看不出区别。
 
@@ -29,6 +36,8 @@ const IDLE_AFTER: Duration = Duration::from_secs(20);
 const TRIM_EVERY: Duration = Duration::from_secs(180);
 /// 工作集低于这个量就不值得动（空闲基座本来就在 20MB 上下）。
 const TRIM_FLOOR: u64 = 20 * 1024 * 1024;
+/// 提交量低于这个量就没什么可还了（D3D11 设备本身约占 50MB，是底线）。
+const PRIVATE_FLOOR: u64 = 60 * 1024 * 1024;
 
 /// 空闲修剪的节拍器。放在 gui 的驱动循环里，`tick()` 自己判条件。
 pub struct IdleTrim {
@@ -57,17 +66,23 @@ impl IdleTrim {
         if self.last_visible.elapsed() < IDLE_AFTER || self.last_trim.elapsed() < TRIM_EVERY {
             return false;
         }
-        let before = working_set();
-        if before < TRIM_FLOOR {
+        let (ws_before, private_before) = (working_set(), private_bytes());
+        // 工作集刚修剪过一次之后只剩几 MB，只按它判就再也进不来了；
+        // 提交量（驱动那边）是另一笔账，两者任一超过下限都算「还有东西可还」。
+        if ws_before < TRIM_FLOOR && private_before < PRIVATE_FLOOR {
             return false;
         }
+        #[cfg(feature = "gui")]
+        trim_graphics();
         let trimmed = trim();
         self.last_trim = Instant::now();
         if trimmed {
             crate::platform::hotkey::trace(&format!(
-                "memory trim working_set {:.1}MB -> {:.1}MB",
-                before as f64 / 1048576.0,
-                working_set() as f64 / 1048576.0
+                "memory trim working_set {:.1}MB -> {:.1}MB private {:.1}MB -> {:.1}MB",
+                ws_before as f64 / 1048576.0,
+                working_set() as f64 / 1048576.0,
+                private_before as f64 / 1048576.0,
+                private_bytes() as f64 / 1048576.0,
             ));
         }
         trimmed
@@ -160,6 +175,32 @@ pub fn working_set() -> u64 {
         return 0;
     }
     counters.WorkingSetSize as u64
+}
+
+/// 本进程当前提交量（任务管理器「提交大小」那一列，= 私有字节）。
+pub fn private_bytes() -> u64 {
+    use windows::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if ok.is_err() {
+        return 0;
+    }
+    counters.PagefileUsage as u64
+}
+
+/// 让 D3D 驱动把它内部缓存的那部分提交还回去（`IDXGIDevice3::Trim`）。
+///
+/// 跟工作集是两笔账：设备里那些缓存由驱动替我们记着（纹理、命令缓冲、采样器…），
+/// 进程自己释放了也还在驱动那边挂着。实测开过设置窗的进程能退回二十多 MB，
+/// 下次绘制按需重新提交，设备不用重建。
+#[cfg(feature = "gui")]
+fn trim_graphics() {
+    gpui_ce_windows::trim_graphics();
 }
 
 /// 立刻修剪工作集（`(-1, -1)` = 把不活跃的页换出去）。
