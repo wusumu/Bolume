@@ -8,6 +8,7 @@ pub mod fullscreen;
 pub mod hotkey;
 pub mod legacy_osd;
 pub mod media;
+pub mod memory;
 pub mod monitors;
 pub mod mouse_wheel;
 pub mod radio;

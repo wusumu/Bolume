@@ -338,6 +338,22 @@ pub fn run(
             };
             cx.set_global(state);
 
+            // 空闲时把工作集还给系统（见 `platform::memory`）。
+            //
+            // 面板、亮度卡片、提示条、设置窗全收着就修剪一次：Windows 不会主动回收
+            // 工作集，gpui 应用每个窗口一套图集，跑一天之后任务管理器上能到一百多 MB，
+            // 其中绝大多数是访问过就不再读的页。30 秒看一次，节流与判据都在模块里。
+            cx.spawn(async move |cx| {
+                let mut trimmer = crate::platform::memory::IdleTrim::default();
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(30))
+                        .await;
+                    trimmer.tick();
+                }
+            })
+            .detach();
+
             // 动态托盘的驱动循环。
             //
             // 60fps 推一帧（16ms）；关掉动态模式时退到 400ms 一轮只做个判断 —— 为一个
