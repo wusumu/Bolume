@@ -74,28 +74,31 @@ const DEVICE_MENU_WIDTH: f32 = 300.0;
 const DEVICE_MENU_HEIGHT: f32 = 280.0;
 
 /// 设置页：每个大功能单独一页，左栏切换。
+///
+/// 顺序就是左栏从上到下的顺序，也是「用得多的在上面」这个顺序：
+/// 常规（含开机自启与启动时套用的状态）→ 设备（页签里还有显示器）
+/// → 外观 / 音量 / 面板 / 托盘 → 快捷键 / 屏幕提示 / 黑名单 / 关于。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Page {
     #[default]
     General,
+    /// 设备：播放 / 录制设备列表；「显示器」（亮度）放在这一页的第二个页签里。
     Devices,
-    Display,
+    Appearance,
+    /// 音量：页签里还有「响度均衡」。
     Volume,
-    /// 响度均衡：全局开关 + 两个参数 + 已单独设置的应用。
-    ///
-    /// 单独一页是因为它下面能挂一长串应用（每个单独设置过的应用一行），
-    /// 塞在「音量」页尾部会把那页本来就多的内容顶得没底。
-    Loudness,
-    Startup,
+    /// 面板：音量面板的布局 / 尺寸 / 动画 / 页脚，以及自动隐藏和列表行为。
+    Panel,
+    /// 托盘：图标样式、右键菜单、悬浮提示。
+    Tray,
     Shortcuts,
     Osd,
     /// 黑名单：哪些应用在前台时整个 Bolume 让路。
     Blocklist,
-    Appearance,
     About,
 }
 
-const PAGE_COUNT: usize = 11;
+const PAGE_COUNT: usize = 10;
 
 /// 解除静音矩阵里的一格：开关 id、当前值、点一下怎么改。
 type UnmuteCell = (&'static str, bool, fn(&mut Config));
@@ -104,14 +107,13 @@ impl Page {
     const ALL: [Page; PAGE_COUNT] = [
         Page::General,
         Page::Devices,
-        Page::Display,
+        Page::Appearance,
         Page::Volume,
-        Page::Loudness,
-        Page::Startup,
+        Page::Panel,
+        Page::Tray,
         Page::Shortcuts,
         Page::Osd,
         Page::Blocklist,
-        Page::Appearance,
         Page::About,
     ];
 
@@ -123,14 +125,13 @@ impl Page {
         match self {
             Self::General => "general",
             Self::Devices => "devices",
-            Self::Display => "display",
+            Self::Appearance => "appearance",
             Self::Volume => "volume",
-            Self::Loudness => "loudness",
-            Self::Startup => "startup",
+            Self::Panel => "panel",
+            Self::Tray => "tray",
             Self::Shortcuts => "shortcuts",
             Self::Osd => "osd",
             Self::Blocklist => "blocklist",
-            Self::Appearance => "appearance",
             Self::About => "about",
         }
     }
@@ -139,14 +140,14 @@ impl Page {
         match self {
             Self::General => "settings",
             Self::Devices => "headphones",
-            Self::Display => "sun",
+            Self::Appearance => "palette",
             Self::Volume => "volume-high",
-            Self::Loudness => "levels",
-            Self::Startup => "power",
+            // 面板 = 那条音量面板本身，用条状图标；托盘用喇叭。
+            Self::Panel => "volume-bar-high",
+            Self::Tray => "speaker",
             Self::Shortcuts => "keyboard",
             Self::Osd => "monitor",
             Self::Blocklist => "ban",
-            Self::Appearance => "palette",
             Self::About => "info",
         }
     }
@@ -155,14 +156,13 @@ impl Page {
         match self {
             Self::General => lang.pick("常规", "General"),
             Self::Devices => lang.pick("设备", "Devices"),
-            Self::Display => lang.pick("显示器", "Display"),
+            Self::Appearance => lang.pick("外观", "Appearance"),
             Self::Volume => lang.pick("音量", "Volume"),
-            Self::Loudness => lang.pick("响度均衡", "Loudness"),
-            Self::Startup => lang.pick("启动", "Startup"),
+            Self::Panel => lang.pick("面板", "Panel"),
+            Self::Tray => lang.pick("托盘", "Tray"),
             Self::Shortcuts => lang.pick("快捷键", "Shortcuts"),
             Self::Osd => lang.pick("屏幕提示", "On-screen"),
             Self::Blocklist => lang.pick("黑名单", "Blocklist"),
-            Self::Appearance => lang.pick("外观", "Appearance"),
             Self::About => lang.pick("关于", "About"),
         }
     }
@@ -202,8 +202,12 @@ pub struct Settings {
     ///
     /// 只是界面状态，不落盘：下次打开回到第一页，免得一进来就是空的第二页。
     shortcut_tab: usize,
-    /// 外观页当前在哪一页签：0 = 界面，1 = 面板，2 = 托盘。
-    appearance_tab: usize,
+    /// 设备页当前在哪一页签：0 = 设备，1 = 显示器（亮度）。
+    ///
+    /// 和快捷键页同一套：只是界面状态，不落盘。
+    device_tab: usize,
+    /// 音量页当前在哪一页签：0 = 音量，1 = 响度均衡。
+    volume_tab: usize,
     /// 页面切换的序号：**每次换页 / 换页签都 +1**。
     ///
     /// 它被拼进内容的动画 id 里，于是每次切换都是一个「全新的元素」，
@@ -1679,7 +1683,8 @@ impl ColorWheel {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TabTarget {
     Shortcuts,
-    Appearance,
+    Devices,
+    Volume,
 }
 
 /// 可自定义的全局快捷键，对应配置里的十七个字段（每个字段三组）。
@@ -1788,7 +1793,8 @@ impl Settings {
             repeat_tip: None,
             just_cleared: None,
             shortcut_tab: 0,
-            appearance_tab: 0,
+            device_tab: 0,
+            volume_tab: 0,
             page_anim: 0,
             editing: None,
             font_menu: None,
@@ -4465,9 +4471,18 @@ impl Settings {
                                 this.shortcut_tab = index;
                                 Page::Shortcuts
                             }
-                            TabTarget::Appearance => {
-                                this.appearance_tab = index;
-                                Page::Appearance
+                            TabTarget::Devices => {
+                                this.device_tab = index;
+                                // 显示器那个页签先把亮度重读一遍：别把开机时的那次
+                                // 失败一直挂在页面上。
+                                if index == 1 {
+                                    crate::gui::refresh_displays(cx);
+                                }
+                                Page::Devices
+                            }
+                            TabTarget::Volume => {
+                                this.volume_tab = index;
+                                Page::Volume
                             }
                         };
                         // 换页签等于换一整页内容：滚动位置跟着回到顶部，
@@ -4663,8 +4678,8 @@ impl Settings {
                 }
                 this.page = page;
                 this.page_anim = this.page_anim.wrapping_add(1);
-                // 显示器那一页先把亮度重读一遍：别把开机时的那次失败一直挂在页面上。
-                if page == Page::Display {
+                // 显示器那一签先把亮度重读一遍：别把开机时的那次失败一直挂在页面上。
+                if page == Page::Devices && this.device_tab == 1 {
                     crate::gui::refresh_displays(cx);
                 }
                 refresh_ui(window, cx);
@@ -4767,7 +4782,13 @@ impl Settings {
         (active, disabled)
     }
 
-    fn general_page(&self, config: &Config, lang: Lang) -> Vec<AnyElement> {
+    fn general_page(
+        &self,
+        config: &Config,
+        lang: Lang,
+        snapshot: &Snapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         // 开机自启显示的是系统里的**实际**状态，不是配置里那个布尔值：
         // 任务管理器「启动」页里改过、或者在任务计划程序里删过任务之后，
         // 配置并不知道 —— 用户关掉再打开，这里显示的还是老样子就成了谎话。
@@ -4886,16 +4907,8 @@ impl Settings {
                 .into_any_element()
         });
 
-        let hide_focus = self.toggle_row(
-            "toggle-focus",
-            lang.pick("失去焦点时收起面板", "Close panel when focus is lost"),
-            lang.pick(
-                "点击面板以外区域时自动隐藏",
-                "Hide automatically when you click outside the panel",
-            ),
-            config.hide_on_focus_lost,
-            self.bind(|config| config.hide_on_focus_lost = !config.hide_on_focus_lost),
-        );
+        // 「失去焦点时收起面板」和「应用列表」那两个开关都属于面板，
+        // 摆在「面板」页里（是「这块面板怎么表现」，不是「软件怎么表现」）。
 
         let language = {
             let store = self.config.clone();
@@ -4914,60 +4927,46 @@ impl Settings {
             )
         };
 
-        let system = self.toggle_row(
-            "toggle-system",
-            lang.pick("显示系统声音", "Show system sounds"),
-            lang.pick(
-                "在列表中保留 Windows 的系统提示音会话",
-                "Keep the Windows system sounds session in the list",
-            ),
-            config.show_system_sounds,
-            self.bind(|config| config.show_system_sounds = !config.show_system_sounds),
-        );
-
-        // 正在发声的应用浮到最前面：只影响面板里的排列，不动音量、不动设备。
-        let sounding_first = {
-            let store = self.config.clone();
-            self.toggle_row(
-                "toggle-sounding-first",
-                lang.pick("正在播放的应用排最前", "Playing apps first"),
-                lang.pick(
-                    "打开面板时，正在发声的应用移至列表顶部，之后不再回落",
-                    "When the panel opens, apps that are playing move to the top of the list and stay there",
-                ),
-                config.sounding_apps_first,
-                move |window, cx| {
-                    let _ = store.borrow_mut().update(|config| {
-                        config.sounding_apps_first = !config.sounding_apps_first
-                    });
-                    // 面板要是正开着，立刻按新规则重排一次。
-                    cx.refresh_windows();
-                    refresh_ui(window, cx);
-                },
-            )
-        };
-
         let mut general_rows = vec![autostart, launch_method, run_as_admin];
         if let Some(hint) = admin_hint {
             general_rows.push(hint);
         }
-        general_rows.extend([hide_focus, language]);
-        vec![
-            self.section(lang.pick("常规", "General"), "settings", general_rows),
-            self.section(
-                lang.pick("应用列表", "App list"),
-                "apps",
-                vec![system, sounding_first],
-            ),
-        ]
+        general_rows.push(language);
+
+        // 「启动时套用」和「应用音量」两张卡并进常规页：开机那一套本来就是一回事，
+        // 单占一页反而不值当（内容也就两张卡）。
+        let mut sections = vec![self.section(
+            lang.pick("常规", "General"),
+            "settings",
+            general_rows,
+        )];
+        sections.extend(self.startup_page(config, lang, snapshot, cx));
+        sections
     }
 
+    /// 设备页：页签一是音频设备，页签二是显示器（亮度）。
+    ///
+    /// 两块都是「这台机器上有什么硬件、各自怎么用」，并成一页省一个导航项。
     fn devices_page(
         &self,
+        config: &Config,
         lang: Lang,
         snapshot: &Snapshot,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let tabs = self.tab_bar(
+            "device-tabs",
+            &[("设备", "Devices"), ("显示器", "Displays")],
+            self.device_tab,
+            TabTarget::Devices,
+            lang,
+            cx,
+        );
+        let mut out = vec![tabs];
+        if self.device_tab == 1 {
+            out.extend(self.display_page(config, lang, cx));
+            return out;
+        }
         let (active, disabled) = self.device_list(snapshot, lang, cx);
         let mut sections = vec![self.section(
             lang.pick("播放设备", "Playback devices"),
@@ -4981,7 +4980,8 @@ impl Settings {
                 disabled,
             ));
         }
-        sections
+        out.extend(sections);
+        out
     }
 
     /// 启动页：这些开关只影响「下次启动那一次」，之后怎么调都不会被改回去。
@@ -7356,6 +7356,21 @@ impl Settings {
         snapshot: &Snapshot,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        // 第二个页签整页换成响度均衡：两边内容差得远（这边一串开关、那边一长串
+        // 应用），拼成一张长页面反而两边都难找。
+        if self.volume_tab == 1 {
+            let mut out = vec![self.tab_bar(
+                "volume-tabs",
+                &[("音量", "Volume"), ("响度均衡", "Loudness")],
+                self.volume_tab,
+                TabTarget::Volume,
+                lang,
+                cx,
+            )];
+            out.extend(self.loudness_page(config, lang, snapshot, cx));
+            return out;
+        }
+
         let logarithmic = self.toggle_row(
             "toggle-log",
             lang.pick("使用对数音量刻度", "Use logarithmic volume scale"),
@@ -7731,6 +7746,15 @@ impl Settings {
 
         let sound = self.sound_rows(config, lang, cx);
         vec![
+            // 页签永远排在第一行，滚出视野也看得见自己在哪一签。
+            self.tab_bar(
+                "volume-tabs",
+                &[("音量", "Volume"), ("响度均衡", "Loudness")],
+                self.volume_tab,
+                TabTarget::Volume,
+                lang,
+                cx,
+            ),
             self.section(lang.pick("音量", "Volume"), "volume-high", {
                 let mut rows = vec![logarithmic, min_db, release_sound];
                 if let Some(row) = release_sound_osd {
@@ -10979,13 +11003,15 @@ impl Settings {
         self.section(lang.pick("页脚按钮", "Footer buttons"), "pin", rows)
     }
 
-    fn appearance_page(
+    /// 外观 / 面板 / 托盘三页共用的一次性构建：一页的行交错写在一起（共用一份
+    /// `config` 与 `cx`），拆开要搬几百行，所以照旧一起建、返回给三页各取一组。
+    fn appearance_groups(
         &self,
         config: &Config,
         lang: Lang,
         snapshot: &Snapshot,
         cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    ) -> (Vec<AnyElement>, Vec<AnyElement>, Vec<AnyElement>) {
         let mut palette_rows = self.theme_rows(config, cx);
         // 跟随系统时，自选色是「每档各一套」，已经跟着上面两档槽位一起摆出来了；
         // 这两行全局色只在「固定主题」下才有意义（跟随时它们不参与配色）。
@@ -11898,21 +11924,102 @@ impl Settings {
             self.tooltip_rows(config, lang, snapshot, cx),
         ));
 
-        let tabs = self.tab_bar(
-            "appearance-tabs",
-            &[("界面", "Interface"), ("面板", "Panel"), ("托盘", "Tray")],
-            self.appearance_tab,
-            TabTarget::Appearance,
-            lang,
-            cx,
+        // 这一页原本是「界面 / 面板 / 托盘」三个页签；后两组已经从外观里拆成
+        // 独立大类，这里只把三组一起交出去，由三个页各取所需（见下面三个薄函数）。
+        (interface_sections, panel_sections, sections)
+    }
+
+    /// 外观页：只留「界面」那一组（主题 + 界面）。面板、托盘各自是独立大类了。
+    fn appearance_page(
+        &self,
+        config: &Config,
+        lang: Lang,
+        snapshot: &Snapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        self.appearance_groups(config, lang, snapshot, cx).0
+    }
+
+    /// 面板页：面板怎么自动收起、长什么样、页脚放什么、列表里放什么。
+    ///
+    /// 「失去焦点时收起面板」和「应用列表」那两个开关原在常规页 —— 它们说的是
+    /// 这块面板自己的行为，跟着面板走更顺。
+    fn panel_page(
+        &self,
+        config: &Config,
+        lang: Lang,
+        snapshot: &Snapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let (_, panel_sections, _) = self.appearance_groups(config, lang, snapshot, cx);
+
+        let hide_focus = self.toggle_row(
+            "toggle-focus",
+            lang.pick("失去焦点时收起面板", "Close panel when focus is lost"),
+            lang.pick(
+                "点击面板以外区域时自动隐藏",
+                "Hide automatically when you click outside the panel",
+            ),
+            config.hide_on_focus_lost,
+            self.bind(|config| config.hide_on_focus_lost = !config.hide_on_focus_lost),
         );
-        let mut out = vec![tabs];
-        out.extend(match self.appearance_tab {
-            0 => interface_sections,
-            1 => panel_sections,
-            _ => sections,
-        });
+
+        let system = self.toggle_row(
+            "toggle-system",
+            lang.pick("显示系统声音", "Show system sounds"),
+            lang.pick(
+                "在列表中保留 Windows 的系统提示音会话",
+                "Keep the Windows system sounds session in the list",
+            ),
+            config.show_system_sounds,
+            self.bind(|config| config.show_system_sounds = !config.show_system_sounds),
+        );
+
+        // 正在发声的应用浮到最前面：只影响面板里的排列，不动音量、不动设备。
+        let sounding_first = {
+            let store = self.config.clone();
+            self.toggle_row(
+                "toggle-sounding-first",
+                lang.pick("正在播放的应用排最前", "Playing apps first"),
+                lang.pick(
+                    "打开面板时，正在发声的应用移至列表顶部，之后不再回落",
+                    "When the panel opens, apps that are playing move to the top of the list and stay there",
+                ),
+                config.sounding_apps_first,
+                move |window, cx| {
+                    let _ = store.borrow_mut().update(|config| {
+                        config.sounding_apps_first = !config.sounding_apps_first
+                    });
+                    // 面板要是正开着，立刻按新规则重排一次。
+                    cx.refresh_windows();
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        let mut out = vec![self.section(
+            lang.pick("行为", "Behaviour"),
+            "settings",
+            vec![hide_focus],
+        )];
+        out.extend(panel_sections);
+        out.push(self.section(
+            lang.pick("应用列表", "App list"),
+            "apps",
+            vec![system, sounding_first],
+        ));
         out
+    }
+
+    /// 托盘页：图标长什么样、右键菜单、悬浮提示。
+    fn tray_page(
+        &self,
+        config: &Config,
+        lang: Lang,
+        snapshot: &Snapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        self.appearance_groups(config, lang, snapshot, cx).2
     }
 
     /// 字体弹层里当前选中的那一行在第几行（0 = 「默认」行，1.. = 字体族）。
@@ -14191,16 +14298,15 @@ impl Settings {
         let motion = self.config.borrow().get().ui_motion && !cx.reduce_motion();
         let anim_id = format!("settings-page-in-{}", self.page_anim);
         let sections = match self.page {
-            Page::General => self.general_page(config, lang),
-            Page::Devices => self.devices_page(lang, snapshot, cx),
-            Page::Display => self.display_page(config, lang, cx),
+            Page::General => self.general_page(config, lang, snapshot, cx),
+            Page::Devices => self.devices_page(config, lang, snapshot, cx),
+            Page::Appearance => self.appearance_page(config, lang, snapshot, cx),
             Page::Volume => self.volume_page(config, lang, snapshot, cx),
-            Page::Loudness => self.loudness_page(config, lang, snapshot, cx),
-            Page::Startup => self.startup_page(config, lang, snapshot, cx),
+            Page::Panel => self.panel_page(config, lang, snapshot, cx),
+            Page::Tray => self.tray_page(config, lang, snapshot, cx),
             Page::Shortcuts => self.shortcuts_page(config, lang, cx),
             Page::Osd => self.osd_page(config, lang, cx),
             Page::Blocklist => self.blocklist_page(config, lang, cx),
-            Page::Appearance => self.appearance_page(config, lang, snapshot, cx),
             Page::About => self.about_page(lang, cx),
         };
         let body = div()
