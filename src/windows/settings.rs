@@ -1524,6 +1524,10 @@ enum ColorTarget {
     DarkSurface,
     /// 跟随系统 → 深色档的自选强调色。
     DarkAccent,
+    /// 托盘图标的墨色。跟主题无关，是任务栏上那个小图标的颜色。
+    ///
+    /// 空 = 跟随任务栏深浅（深色任务栏画浅墨、浅色画深墨），和系统图标一致。
+    Tray,
 }
 
 impl ColorTarget {
@@ -1541,6 +1545,7 @@ impl ColorTarget {
             Self::LightAccent => &config.theme_light_accent,
             Self::DarkSurface => &config.theme_dark_surface,
             Self::DarkAccent => &config.theme_dark_accent,
+            Self::Tray => &config.tray_icon_color,
         }
     }
 
@@ -1552,15 +1557,16 @@ impl ColorTarget {
             Self::LightAccent => config.theme_light_accent = value,
             Self::DarkSurface => config.theme_dark_surface = value,
             Self::DarkAccent => config.theme_dark_accent = value,
+            Self::Tray => config.tray_icon_color = value,
         }
     }
 
     /// 取色器面板 / 行首的标签。
     fn label(self, lang: Lang) -> &'static str {
-        if self.is_surface() {
-            lang.pick("背景色", "Background")
-        } else {
-            lang.pick("强调色", "Accent")
+        match self {
+            Self::Tray => lang.pick("图标颜色", "Icon color"),
+            _ if self.is_surface() => lang.pick("背景色", "Background"),
+            _ => lang.pick("强调色", "Accent"),
         }
     }
 
@@ -1568,18 +1574,33 @@ impl ColorTarget {
     ///
     /// 底色给的是「深色几档 + 浅色几档 + 几个低饱和色相」：这几档换上去之后
     /// 文字和描边的对比度都还够。强调色给的是饱和度足够高、当高亮不刺眼的一批。
+    /// 托盘图标是 16px 的单色小图标，先给四个中性档（深色任务栏用白、浅色用黑），
+    /// 再给一批中等明度的彩色 —— 太暗的在深色任务栏上会糊成一团。
     fn presets(self) -> &'static [&'static str] {
-        if self.is_surface() {
-            &[
+        match self {
+            Self::Tray => &[
+                "#ffffff", "#c8c8c8", "#8a8a8a", "#101010", "#7c9cff", "#22d3ee", "#34d399",
+                "#fbbf24", "#fb923c", "#f87171", "#c084fc", "#f472b6",
+            ],
+            _ if self.is_surface() => &[
                 "#151519", "#1b1f24", "#20252c", "#262b33", "#2d2a36", "#22303f", "#2b3a2f",
                 "#3a2b2b", "#f6f6fa", "#ececf2", "#e8eef6", "#f4efe6",
-            ]
-        } else {
-            &[
+            ],
+            _ => &[
                 "#7c9cff", "#5b8def", "#6ea8fe", "#a78bfa", "#c084fc", "#34d399", "#22d3ee",
                 "#fbbf24", "#fb923c", "#f87171", "#f472b6", "#94a3b8",
-            ]
+            ],
         }
+    }
+}
+
+/// 改完颜色后让托盘重画一张 —— 只对「图标颜色」那一项有必要。
+///
+/// 主题那几项改完，窗口和面板跟着重画就完事；托盘图标是系统托盘里的一张位图，
+/// 不跟着任何窗口重绘，换了色号必须显式推一次新图，否则要等到下次调音量才变。
+fn refresh_tray_for(target: ColorTarget, cx: &mut gpui::App) {
+    if matches!(target, ColorTarget::Tray) {
+        crate::gui::refresh_tray_icon(cx);
     }
 }
 
@@ -9632,7 +9653,8 @@ impl Settings {
                             .child(if current.is_empty() {
                                 // 强调色空着 = 跟随 Windows 的强调色：把真正生效的那个色号
                                 // 显示出来，用户能对上系统设置里的颜色（"—" 看不出跟到了什么）。
-                                if target.is_surface() {
+                                // 图标颜色空着是「跟随任务栏深浅」，没有色号可给。
+                                if target.is_surface() || matches!(target, ColorTarget::Tray) {
                                     "—".to_string()
                                 } else {
                                     theme::accent_hex().to_uppercase()
@@ -9675,6 +9697,9 @@ impl Settings {
                         .update(|config| target.apply(config, String::new()));
                     let cfg = store.borrow().get().clone();
                     crate::gui::apply_theme_extras(&cfg);
+                    // 图标颜色改的是任务栏上那张位图，得让托盘单独重画一张；
+                    // 主题那几项由 `repaint_theme` 管。
+                    refresh_tray_for(target, cx);
                     repaint_theme(window, cx);
                 }))
                 .into_any_element()
@@ -9727,6 +9752,7 @@ impl Settings {
                             .update(|config| target.apply(config, next));
                         let cfg = store.borrow().get().clone();
                         crate::gui::apply_theme_extras(&cfg);
+                        refresh_tray_for(target, cx);
                         repaint_theme(window, cx);
                     }))
                     .into_any_element(),
@@ -9834,10 +9860,12 @@ impl Settings {
             let value = if let Some(hex) = remembered {
                 hex
             } else if stored.is_empty() {
-                if target.is_surface() {
-                    theme::surface_hex()
-                } else {
-                    theme::accent_hex()
+                // 空串（跟随）时色轮的起点：底色 / 强调色取当前生效的那一档；
+                // 图标颜色没有「当前生效」的色号（跟着任务栏深浅走），从默认亮墨起步。
+                match target {
+                    ColorTarget::Tray => "#f8f8f8".to_string(),
+                    _ if target.is_surface() => theme::surface_hex(),
+                    _ => theme::accent_hex(),
                 }
             } else {
                 stored
@@ -9865,6 +9893,7 @@ impl Settings {
             .update(|config| target.apply(config, hex));
         let cfg = self.config.borrow().get().clone();
         crate::gui::apply_theme_extras(&cfg);
+        refresh_tray_for(target, cx);
         // 换了配色是整窗（还有音量面板 / OSD）一起换，只 notify 自己不够。
         repaint_theme(window, cx);
     }
@@ -10472,9 +10501,16 @@ impl Settings {
                 (1, "Number"),
                 (2, "App icon"),
                 (3, "Dynamic"),
+                (4, "Custom .ico"),
             ]
         } else {
-            &[(0, "喇叭"), (1, "数字"), (2, "软件图标"), (3, "动态")]
+            &[
+                (0, "喇叭"),
+                (1, "数字"),
+                (2, "软件图标"),
+                (3, "动态"),
+                (4, "自定义图标"),
+            ]
         };
         let icon_style = {
             let store = self.config.clone();
@@ -10491,12 +10527,14 @@ impl Settings {
                     TrayIconStyle::Number => 1,
                     TrayIconStyle::App => 2,
                     TrayIconStyle::Dynamic => 3,
+                    TrayIconStyle::Custom => 4,
                 },
                 move |value, window, cx| {
                     let style = match value {
                         1 => TrayIconStyle::Number,
                         2 => TrayIconStyle::App,
                         3 => TrayIconStyle::Dynamic,
+                        4 => TrayIconStyle::Custom,
                         _ => TrayIconStyle::Arcs,
                     };
                     let _ = store
@@ -10509,6 +10547,111 @@ impl Settings {
                 },
             )
         };
+
+        // 图标颜色：单色墨迹（喇叭 / 数字 / 动态图案）换个色就是换墨色。
+        // 软件图标和自定义 ico 是彩色原图，染色会毁掉它 —— 选它们时这一行不出现。
+        let icon_color = config.tray_icon_style.is_monochrome().then(|| {
+            self.color_row(
+                "tray-icon-color",
+                lang.pick("图标颜色", "Icon color"),
+                lang.pick(
+                    "留空跟随任务栏深浅；喇叭、数字、动态三种样式都会换色",
+                    "Empty follows the taskbar shade; applies to the speaker, number and motion icons",
+                ),
+                ColorTarget::Tray,
+                config,
+                cx,
+            )
+        });
+
+        // 自定义图标：选「自定义图标」才出现，选完立刻换掉托盘上那张图。
+        let custom_icon = matches!(config.tray_icon_style, TrayIconStyle::Custom).then(|| {
+            let store = self.config.clone();
+            let path = config.tray_icon_custom.trim().to_string();
+            let label = if path.is_empty() {
+                lang.pick("还没选文件", "No file chosen").to_string()
+            } else {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.clone())
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(9.))
+                .py(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(theme::fs(13.))
+                                .text_color(theme::text_primary())
+                                .child(lang.pick("图标文件", "Icon file")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(10.5))
+                                .text_color(theme::text_tertiary())
+                                .child(label),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("tray-icon-custom-pick")
+                        .flex_none()
+                        .px(px(10.))
+                        .py(px(4.))
+                        .rounded(px(theme::RADIUS_SMALL))
+                        .bg(theme::track())
+                        .text_size(theme::fs(11.))
+                        .text_color(theme::text_primary())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        // 用 mouse_down：根节点那条「点别处」会先把别的编辑提交掉，
+                        // 这里要先拦住，不然对话框刚开就被关。
+                        //
+                        // 对话框必须在**别的线程**上开：模态框会在调用线程里跑消息
+                        // 循环，把消息灌进 gpui 的 WndProc，而这里状态还借着 ——
+                        // 见 `app_pick::pick_icon_async`。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_, _: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                let store = store.clone();
+                                // 认主：对话框锁在设置窗前面（模态），不会被叠出第二个。
+                                let owner = crate::windows::platform::hwnd_of(window)
+                                    .map(|hwnd| hwnd.0 as isize)
+                                    .unwrap_or(0);
+                                let receiver = crate::platform::app_pick::pick_icon_async(owner);
+                                cx.spawn(async move |this, cx| {
+                                    let Ok(path) = receiver.recv().await else {
+                                        return;
+                                    };
+                                    let Some(path) = path else {
+                                        return;
+                                    };
+                                    let _ = store
+                                        .borrow_mut()
+                                        .update(|config| config.tray_icon_custom = path);
+                                    let _ = this.update_in(cx, |_, window, cx| {
+                                        crate::gui::refresh_tray_icon(cx);
+                                        refresh_ui(window, cx);
+                                    });
+                                })
+                                .detach();
+                            }),
+                        )
+                        .child(lang.pick("选择…", "Choose…")),
+                )
+                .into_any_element()
+        });
 
         // 律动效果 + 灵敏度：只在「动态」图标下才有意义。
         let motion_effect = {
@@ -10550,6 +10693,50 @@ impl Settings {
             lang,
             cx,
         );
+
+        // 律动 + 彩色：这两项不挑样式，喇叭 / 数字 / 自定义 ico 都能叠。
+        let icon_pulse = {
+            let store = self.config.clone();
+            self.toggle_row(
+                "tray-icon-pulse",
+                lang.pick("律动", "Pulse"),
+                lang.pick(
+                    "图标跟着响度胀缩、明暗起伏；和图案那种律动不一样，这个能叠在任何图标上",
+                    "The icon swells and brightens with the level; stacks on any icon style",
+                ),
+                config.tray_pulse,
+                move |window, cx| {
+                    let _ = store
+                        .borrow_mut()
+                        .update(|config| config.tray_pulse = !config.tray_pulse);
+                    // 开了要把音频线程提频（每秒 60 帧推包络），关了就退回去。
+                    crate::gui::sync_tray_motion(cx);
+                    crate::gui::refresh_tray_icon(cx);
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        let icon_color_by_level = {
+            let store = self.config.clone();
+            self.toggle_row(
+                "tray-icon-color-level",
+                lang.pick("彩色", "Colour by level"),
+                lang.pick(
+                    "颜色跟着响度走：安静偏蓝、越响越红；只对单色图标生效，软件图标和自定义 ico 保持原样",
+                    "Hue follows the level: cool when quiet, red when loud; monochrome icons only",
+                ),
+                config.tray_color_by_level,
+                move |window, cx| {
+                    let _ = store
+                        .borrow_mut()
+                        .update(|config| config.tray_color_by_level = !config.tray_color_by_level);
+                    crate::gui::sync_tray_motion(cx);
+                    crate::gui::refresh_tray_icon(cx);
+                    refresh_ui(window, cx);
+                },
+            )
+        };
 
         // 音量条上的发声特效：画在填充之上，满音量也看得见谁在响。
         let activity_effect = {
@@ -10989,10 +11176,20 @@ impl Settings {
             ),
         ];
         let panel_sections = vec![panel_section, footer_section];
+        let mut tray_rows = vec![icon_style];
+        if let Some(row) = custom_icon {
+            tray_rows.push(row);
+        }
+        if let Some(color) = icon_color {
+            tray_rows.push(color);
+        }
+        tray_rows.push(icon_pulse);
+        tray_rows.push(icon_color_by_level);
+        tray_rows.push(tray_menu_devices);
         let mut sections = vec![self.section(
             lang.pick("托盘图标", "Tray icon"),
             "speaker",
-            vec![icon_style, tray_menu_devices],
+            tray_rows,
         )];
         // 字体 / 抗锯齿 / 三档字号宽高只对「数字」图标有意义：选喇叭时整段收起来，
         // 免得摆一堆改了也看不出变化的选项。

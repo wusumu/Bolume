@@ -26,6 +26,20 @@ pub enum TrayIconStyle {
     /// 动态律动：跟着正在播放的声音实时重绘（效果见 `TrayMotion`）。
     #[serde(rename = "dynamic")]
     Dynamic,
+    /// 用户自己选的本地 `.ico`（路径在 `tray_icon_custom`）。
+    ///
+    /// 读不到文件时退回数字图标 —— 托盘上不能出现一个空白格子。
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+impl TrayIconStyle {
+    /// 是不是单色墨迹画的（字母、喇叭、律动图案）。
+    ///
+    /// 「彩色」只染得动这一类；软件图标和自定义 ico 是彩色原图，染色会毁掉原样。
+    pub fn is_monochrome(self) -> bool {
+        !matches!(self, Self::App | Self::Custom)
+    }
 }
 
 /// 动态模式画哪一种律动。
@@ -3825,6 +3839,25 @@ pub struct Config {
     /// 托盘图标样式（后续「更换托盘图标」功能的入口）。
     pub tray_icon_style: TrayIconStyle,
 
+    /// 托盘图标的颜色（`#rrggbb`）。
+    ///
+    /// 空 = 跟随任务栏深浅：深色任务栏画浅墨、浅色任务栏画深墨（系统图标一贯的样子）。
+    /// 填了就用这个色，深浅任务栏都不改 —— 单色图标才染得动，软件图标 / 自定义 ico 不受影响。
+    #[serde(default)]
+    pub tray_icon_color: String,
+    /// 自定义托盘图标的路径（`.ico`）。样式选「自定义」时读它。
+    #[serde(default)]
+    pub tray_icon_custom: String,
+    /// 图标律动：整张图跟着响度轻微胀缩、明暗起伏。任何样式都能开。
+    #[serde(default)]
+    pub tray_pulse: bool,
+    /// 彩色：图标颜色跟着响度走（安静偏冷、越响越红）。
+    ///
+    /// 和上面那个固定色是上下位关系：开着彩色时固定色不生效。
+    /// 只作用于单色样式；软件图标 / 自定义 ico 是彩色原图，不染。
+    #[serde(default)]
+    pub tray_color_by_level: bool,
+
     /// 动态模式（`TrayIconStyle::Dynamic`）画哪种律动。
     pub tray_motion: TrayMotion,
     /// 律动的灵敏度：把峰值电平放大多少（百分比，50..=300）。
@@ -4185,6 +4218,10 @@ impl Default for Config {
             // 默认 2 就是「一格 2 dB」。老配置没有这个字段，读进来也落在这里。
             log_scroll_wheel_step: DEFAULT_LOG_SCROLL_STEP_DB,
             tray_icon_style: TrayIconStyle::Arcs,
+            tray_icon_color: String::new(),
+            tray_icon_custom: String::new(),
+            tray_pulse: false,
+            tray_color_by_level: false,
             tray_motion: TrayMotion::default(),
             tray_motion_gain: DEFAULT_TRAY_MOTION_GAIN,
             tray_number_font: DEFAULT_NUMBER_FONT.to_string(),

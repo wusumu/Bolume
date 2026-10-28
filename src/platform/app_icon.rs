@@ -20,8 +20,7 @@ struct Entry {
 }
 
 /// 列出 ico 里的所有档位（宽高按目录里的字节读，0 表示 256）。
-fn entries() -> Vec<Entry> {
-    let bytes = ICO_BYTES;
+fn entries(bytes: &[u8]) -> Vec<Entry> {
     if bytes.len() < 6 {
         return Vec::new();
     }
@@ -72,7 +71,14 @@ fn entries() -> Vec<Entry> {
 /// 取档顺序：正好有这一档就用它；否则用比它大的最小一档；再没有就用最大一档。
 /// 只有「没有正好的档」时才会缩一次，这时候才可能出现一点点软边。
 pub fn rgba_at(size: u32) -> Option<Vec<u8>> {
-    let list = entries();
+    rgba_from(ICO_BYTES, size)
+}
+
+/// 从任意一份 ico 字节里取托盘尺寸那一档（用户自己选的本地图标走这里）。
+///
+/// 解析规则和内置图标完全一致：正好有这一档就用它，没有再往大里找一档缩下来。
+pub fn rgba_from(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
+    let list = entries(bytes);
     let exact = list
         .iter()
         .find(|entry| entry.width == size && entry.height == size);
@@ -83,7 +89,7 @@ pub fn rgba_at(size: u32) -> Option<Vec<u8>> {
     });
     let chosen = chosen.or_else(|| list.iter().max_by_key(|entry| entry.width))?;
 
-    let (width, height, pixels) = decode(chosen)?;
+    let (width, height, pixels) = decode(bytes, chosen)?;
     if width == size && height == size {
         return Some(pixels);
     }
@@ -91,8 +97,8 @@ pub fn rgba_at(size: u32) -> Option<Vec<u8>> {
 }
 
 /// 解一档：PNG 走 image，其余按 32 位 BMP 读。
-fn decode(entry: &Entry) -> Option<(u32, u32, Vec<u8>)> {
-    let payload = ICO_BYTES.get(entry.offset..entry.offset + entry.length)?;
+fn decode(bytes: &[u8], entry: &Entry) -> Option<(u32, u32, Vec<u8>)> {
+    let payload = bytes.get(entry.offset..entry.offset + entry.length)?;
     if payload.starts_with(b"\x89PNG\r\n\x1a\n") {
         let image = image::load_from_memory(payload).ok()?.into_rgba8();
         let (width, height) = image.dimensions();
@@ -162,7 +168,7 @@ fn decode_bmp(payload: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// 面积采样缩放（只在「ico 里没有正好这一档」时才走这里）。
-fn scale(src: &[u8], width: u32, height: u32, size: u32) -> Option<Vec<u8>> {
+pub fn scale(src: &[u8], width: u32, height: u32, size: u32) -> Option<Vec<u8>> {
     if size == 0 {
         return None;
     }
@@ -212,7 +218,7 @@ mod tests {
     /// 文件里必须带正好的 16 / 20 / 24 / 32 / 48 / 64 这几档：托盘直接用它们。
     #[test]
     fn has_common_sizes() {
-        let sizes: Vec<u32> = entries().iter().map(|entry| entry.width).collect();
+        let sizes: Vec<u32> = entries(ICO_BYTES).iter().map(|entry| entry.width).collect();
         for size in [16, 20, 24, 32, 48, 64, 256] {
             assert!(sizes.contains(&size), "ico 里缺 {size} 这一档：{sizes:?}");
         }

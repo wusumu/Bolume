@@ -79,6 +79,55 @@ pub(crate) fn canvas_size() -> f32 {
     canvas()
 }
 
+/// 配置里的图标颜色（`#rrggbb` / `rrggbb`）。
+///
+/// 空串、长度不对、夹了非十六进制字符 —— 一律当「没设」，回跟随任务栏。
+/// 托盘图标不能因为用户手改配置文件填错一个字符就整个不画。
+pub fn parse_ink(value: &str) -> Option<[u8; 3]> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |from: usize| u8::from_str_radix(&hex[from..from + 2], 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
+}
+
+/// 这一帧实际用的墨色：用户选了就用他的，没选照任务栏深浅取黑 / 白。
+///
+/// 深浅由 `dark_taskbar` 给（浅色任务栏要深墨），数值取系统图标惯用的
+/// 20 / 248 —— 纯黑纯白在任务栏上比系统的图标更扎眼。
+fn resolve_ink(dark_taskbar: bool, ink: Option<[u8; 3]>) -> [u8; 3] {
+    ink.unwrap_or(if dark_taskbar {
+        [20, 20, 20]
+    } else {
+        [248, 248, 248]
+    })
+}
+
+/// 彩色律动的色温：响度越高越红。
+///
+/// 低响度偏冷（天蓝），中段过一档琥珀，满响落到红。分三段而不是蓝红直连：
+/// RGB 直接插值会在中间经过一段发灰的脏色，加一档暖黄再落到红才像「在升温」。
+fn heat_color(level: f32) -> [u8; 3] {
+    // (位置, RGB)：天蓝 → 琥珀 → 红。
+    const STOPS: [(f32, [f32; 3]); 3] = [
+        (0.0, [56.0, 189.0, 248.0]),
+        (0.5, [250.0, 204.0, 21.0]),
+        (1.0, [239.0, 68.0, 68.0]),
+    ];
+    let level = level.clamp(0.0, 1.0);
+    let mut index = 0;
+    while index + 2 < STOPS.len() && level > STOPS[index + 1].0 {
+        index += 1;
+    }
+    let (from_at, from) = STOPS[index];
+    let (to_at, to) = STOPS[index + 1];
+    let span = (to_at - from_at).max(1e-4);
+    let k = ((level - from_at) / span).clamp(0.0, 1.0);
+    let mix = |a: f32, b: f32| (a + (b - a) * k).round() as u8;
+    [mix(from[0], to[0]), mix(from[1], to[1]), mix(from[2], to[2])]
+}
+
 /// 系统 DPI（96 / 120 / 144 …）。字号按「点」存，换算成像素要用它。
 pub(crate) fn system_dpi() -> u32 {
     use std::sync::OnceLock;
@@ -93,11 +142,21 @@ pub(crate) fn system_dpi() -> u32 {
 
 pub struct Tray {
     icon: TrayIcon,
-    last: Cell<Option<(u32, i32, bool, u8, bool, u32, u64)>>,
+    last: Cell<Option<(u32, i32, bool, u8, bool, u32, u64, u32)>>,
     /// 上一次写进系统的提示文字：内容没变就别再调 `Shell_NotifyIcon`。
     last_tip: RefCell<String>,
     /// 动态模式的画面状态（包络 / 节拍）。
     motion: RefCell<Motion>,
+    /// 当前的墨色（用户挑的颜色；`None` = 跟随任务栏深浅）。
+    ///
+    /// 动态图案的每一帧由 `animate` 推，那条路上拿不到配置，所以这几项存在这里。
+    ink: Cell<Option<[u8; 3]>>,
+    /// 彩色：颜色按包络插值（越小越冷、越响越红），压过上面那个固定色。
+    rainbow: Cell<bool>,
+    /// 律动：整张图随响度胀缩 + 明暗。
+    pulse: Cell<bool>,
+    /// 自定义 ico 的路径。
+    custom: RefCell<String>,
 }
 
 /// 渲染提示文字要用的实时值（都已经是格式化好、本地化好的字符串）。
@@ -128,15 +187,37 @@ pub struct TooltipFacts {
     pub logarithmic: bool,
 }
 
+/// 一张托盘图标的外观参数。
+///
+/// 单独拎出来是因为「样式 / 颜色 / 律动 / 自定义图标」这几项现在互相叠着：
+/// 彩色可以配喇叭也可以配数字，律动可以叠在任何图标上，自定义 ico 又是另一档。
+#[derive(Clone, Copy)]
+pub struct IconSpec<'a> {
+    pub style: TrayIconStyle,
+    /// 用户挑的固定色（`None` = 跟随任务栏深浅）。
+    pub ink: Option<[u8; 3]>,
+    /// 彩色：颜色按响度插值（只对单色样式生效）。
+    pub color_by_level: bool,
+    /// 律动：整张图随响度胀缩 + 明暗（任何样式都能开）。
+    pub pulse: bool,
+    /// 自定义 ico 的路径（`style == Custom` 时才读）。
+    pub custom: &'a str,
+    pub number: &'a NumberStyle,
+}
+
 /// `Tray::update` 的入参：图标外观 + 提示内容。
 pub struct TrayUpdate<'a> {
     pub volume: f32,
     pub display: f32,
     pub muted: bool,
-    /// 默认播放设备的峰值电平（0..1）。动态模式拿它当输入。
+    /// 默认播放设备的峰值电平（0..1）。律动 / 彩色 / 动态图案都拿它当输入。
     pub peak: f32,
-    pub style: TrayIconStyle,
-    pub number: &'a NumberStyle,
+    /// 图标长什么样。
+    pub icon: IconSpec<'a>,
+    /// 律动的灵敏度（百分比）。
+    pub motion_gain: u32,
+    /// 动态样式画哪一种图案。
+    pub motion_effect: TrayMotion,
     pub logarithmic: bool,
     pub min_db: f32,
     pub lang: Lang,
@@ -147,8 +228,8 @@ pub struct TrayUpdate<'a> {
 }
 
 impl Tray {
-    pub fn new(style: TrayIconStyle, number: &NumberStyle, lang: Lang) -> Result<Self, String> {
-        let rgba = render_icon(0.0, 0.0, 0, false, true, style, number);
+    pub fn new(spec: IconSpec<'_>, lang: Lang) -> Result<Self, String> {
+        let rgba = render(&spec, 0.0, 0.0, 0.0, 0, false);
         let side = canvas() as u32;
         let icon = Icon::from_rgba(rgba, side, side)
             .map_err(|error| format!("创建托盘图标位图失败：{error}"))?;
@@ -164,6 +245,10 @@ impl Tray {
             last: Cell::new(None),
             last_tip: RefCell::new(String::new()),
             motion: RefCell::new(Motion::default()),
+            ink: Cell::new(spec.ink),
+            rainbow: Cell::new(spec.color_by_level),
+            pulse: Cell::new(spec.pulse),
+            custom: RefCell::new(spec.custom.to_string()),
         })
     }
 
@@ -179,21 +264,28 @@ impl Tray {
     /// `volume` 是 0..1 的原始幅度（决定喇叭亮几条弧，照 EarTrumpet 的
     /// `UpdateMasterVolumeIcon` 用幅度而不是滑条位置），`display` 是滑条位置 0..1。
     pub fn update(&self, state: &TrayUpdate<'_>) {
-        // 动态模式的两条规矩：
+        // 这几项先记下来：动态图案的分支下面会提前返回，但它的每一帧
+        // （`animate` → `push_motion`）都要用。
+        let icon = &state.icon;
+        self.ink.set(icon.ink);
+        self.rainbow.set(icon.color_by_level);
+        self.pulse.set(icon.pulse);
+        if *self.custom.borrow() != icon.custom {
+            *self.custom.borrow_mut() = icon.custom.to_string();
+        }
+
+        // 动态图案的两条规矩：
         // - 画面由 `animate` 按 60fps 推（这里再画一遍纯属浪费，还会和它抢时间轴）；
         // - 提示文字照旧，设备名 / 应用列表变了必须跟着换。
-        if matches!(state.style, TrayIconStyle::Dynamic) {
+        if matches!(icon.style, TrayIconStyle::Dynamic) {
             // 动画帧不写 `last`：切回静态样式时那一格必须重画，
             // 否则只要音量和样式码跟进动态前一模一样，就会被当成「没变」跳过，
             // 托盘上一直停着最后一帧动画。
             self.last.set(None);
-            let text = render_tooltip(state.tooltip, state.facts, state.lang);
-            if *self.last_tip.borrow() != text {
-                let _ = self.icon.set_tooltip(Some(text.as_str()));
-                *self.last_tip.borrow_mut() = text;
-            }
+            self.sync_tooltip(state);
             return;
         }
+
         let volume = state.volume.clamp(0.0, 1.0);
         let display = state.display.clamp(0.0, 1.0);
         let percent = state.facts.percent;
@@ -202,14 +294,39 @@ impl Tray {
         } else {
             0
         };
-        let style_code = match state.style {
+        let style_code = match icon.style {
             TrayIconStyle::Number => 0u8,
             TrayIconStyle::Arcs => 1,
             TrayIconStyle::App => 2,
             // 上面已经提前返回了，这里只是让 match 完整。
             TrayIconStyle::Dynamic => 3,
+            TrayIconStyle::Custom => 4,
         };
         let bar_id = bar_icon_id(volume, state.muted);
+
+        // 律动 / 彩色都靠「这会儿多响」驱动，那条时间线只有这里推进：
+        // 音频泵在开这两项时会提到 60fps，所以每帧都会走到这儿。
+        let animated = icon.pulse || (icon.color_by_level && icon.style.is_monochrome());
+        let side = canvas() as u32;
+        let level = if animated {
+            let mut motion = self.motion.borrow_mut();
+            motion.step(
+                if state.muted { 0.0 } else { state.peak },
+                state.motion_gain as f32 / 100.0,
+                state.motion_effect,
+                side,
+            );
+            motion.level()
+        } else {
+            0.0
+        };
+
+        // 颜色也进 key：换了色号，音量和样式码都没动，也必须重画。
+        let ink_code = icon
+            .ink
+            .map(|rgb| ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32)
+            .unwrap_or(u32::MAX);
+        // 律动 / 彩色每帧都在变，key 拦不住也不该拦；静态图标照旧按内容去重。
         let key = (
             percent,
             db_tenths,
@@ -217,27 +334,23 @@ impl Tray {
             style_code,
             state.logarithmic,
             bar_id,
-            state.number.hash(),
+            icon.number.hash(),
+            ink_code,
         );
-        if self.last.get() != Some(key) {
-            self.last.set(Some(key));
-            let rgba = render_icon(
-                volume,
-                display,
-                percent,
-                state.muted,
-                light_taskbar(),
-                state.style,
-                state.number,
-            );
-            let side = canvas() as u32;
+        if animated || self.last.get() != Some(key) {
+            self.last.set(if animated { None } else { Some(key) });
+            let rgba = render(icon, level, volume, display, percent, state.muted);
             if let Ok(icon) = Icon::from_rgba(rgba, side, side) {
                 let _ = self.icon.set_icon(Some(icon));
             }
         }
 
-        // 提示文字和图标分开判断：设备名、正在发声的应用这些变了，
-        // 图标往往一点没动，但提示必须跟着换。
+        self.sync_tooltip(state);
+    }
+
+    /// 提示文字和图标分开判断：设备名、正在发声的应用这些变了，
+    /// 图标往往一点没动，但提示必须跟着换。
+    fn sync_tooltip(&self, state: &TrayUpdate<'_>) {
         let text = render_tooltip(state.tooltip, state.facts, state.lang);
         if *self.last_tip.borrow() != text {
             let _ = self.icon.set_tooltip(Some(text.as_str()));
@@ -250,27 +363,37 @@ impl Tray {
     /// `gain` 是配置里的灵敏度百分比；`peak` 是默认设备的峰值电平。
     pub fn animate(&self, peak: f32, gain: u32, effect: TrayMotion, muted: bool) {
         let side = canvas() as u32;
-        let coverage = self.motion.borrow_mut().step(
-            if muted { 0.0 } else { peak },
-            gain as f32 / 100.0,
-            effect,
-            side,
-        );
-        self.push_motion(&coverage, muted);
+        let (coverage, level) = {
+            let mut motion = self.motion.borrow_mut();
+            let coverage = motion.step(
+                if muted { 0.0 } else { peak },
+                gain as f32 / 100.0,
+                effect,
+                side,
+            );
+            (coverage, motion.level())
+        };
+        self.push_motion(&coverage, level, muted);
     }
 
     /// 不推进时间轴，按当前状态重画一帧（切样式 / 静音状态变化时用）。
     pub fn repaint_motion(&self, effect: TrayMotion, muted: bool) {
         let side = canvas() as u32;
-        let coverage = self.motion.borrow().snapshot(effect, side);
-        self.push_motion(&coverage, muted);
+        let (coverage, level) = {
+            let motion = self.motion.borrow();
+            (motion.snapshot(effect, side), motion.level())
+        };
+        self.push_motion(&coverage, level, muted);
     }
 
-    fn push_motion(&self, coverage: &[f32], muted: bool) {
+    fn push_motion(&self, coverage: &[f32], level: f32, muted: bool) {
         let side = canvas() as u32;
-        if let Ok(icon) =
-            Icon::from_rgba(compose_motion(coverage, light_taskbar(), muted), side, side)
-        {
+        let ink = if self.rainbow.get() {
+            heat_color(level)
+        } else {
+            resolve_ink(light_taskbar(), self.ink.get())
+        };
+        if let Ok(icon) = Icon::from_rgba(compose_motion(coverage, ink, muted), side, side) {
             let _ = self.icon.set_icon(Some(icon));
         }
     }
@@ -641,39 +764,92 @@ fn light_taskbar() -> bool {
     status.is_ok() && data == 1
 }
 
-/// 生成托盘图标的 RGBA（straight alpha，托盘按直通 alpha 处理）。
-fn render_icon(
+/// 画一张托盘图标（RGBA，straight alpha —— 托盘按直通 alpha 处理）。
+///
+/// `level` 是响度包络（0..1）：彩色拿它当色温，律动拿它当胀缩幅度。
+fn render(
+    spec: &IconSpec<'_>,
+    level: f32,
     volume: f32,
     display: f32,
     percent: u32,
     muted: bool,
-    dark_ink: bool,
-    style: TrayIconStyle,
-    number: &NumberStyle,
 ) -> Vec<u8> {
-    match style {
-        TrayIconStyle::Number => render_number_icon(percent, muted, dark_ink, number),
+    let style = spec.style;
+    let light_taskbar = light_taskbar();
+    // 彩色只染得动单色墨迹：软件图标 / 自定义 ico 是彩色原图，染色会毁掉原样。
+    let rgb = if spec.color_by_level && style.is_monochrome() {
+        heat_color(level)
+    } else {
+        resolve_ink(light_taskbar, spec.ink)
+    };
+    let mut rgba = match style {
+        TrayIconStyle::Number => render_number_icon(percent, muted, rgb, spec.number),
         TrayIconStyle::Arcs => {
-            render_system_icon(volume, display, muted, dark_ink, percent, number)
+            // 系统图标本体是白的：浅色任务栏要染成深墨；挑了颜色 / 开了彩色就染成那个色。
+            let tint = if spec.ink.is_some() || spec.color_by_level || light_taskbar {
+                Some(rgb)
+            } else {
+                None
+            };
+            render_system_icon(volume, display, muted, tint, percent, spec.number)
         }
-        TrayIconStyle::App => render_app_icon(percent, muted, dark_ink, number),
-        // 动态模式由 `Tray::animate` 驱动；这里只画一张静止的空场，供启动时先占位。
+        TrayIconStyle::App => render_app_icon(percent, muted, rgb, spec.number),
+        TrayIconStyle::Custom => {
+            render_custom_icon(spec.custom, percent, muted, rgb, spec.number)
+        }
+        // 动态图案由 `Tray::animate` 驱动；这里只画一张静止的空场，供启动时先占位。
         TrayIconStyle::Dynamic => {
             let side = canvas() as u32;
             let coverage = crate::motion::Motion::default().snapshot(TrayMotion::Bars, side);
-            compose_motion(&coverage, !dark_ink, muted)
+            compose_motion(&coverage, rgb, muted)
+        }
+    };
+    // 律动叠在任何静态图标上（动态图案本身就在动，再叠一层只会发飘）。
+    if spec.pulse && !matches!(style, TrayIconStyle::Dynamic) {
+        rgba = pulse(&rgba, level);
+    }
+    rgba
+}
+
+/// 律动：整张图随响度轻微胀缩 + 明暗起伏。
+///
+/// 缩放比 0.86 → 1.0、亮度 0.76 → 1.0，跟着包络连续走 —— 安静时又小又暗，
+/// 一响就胀回原尺寸。任何图标（含彩色原图）都能这么叠，因为它只动尺寸和亮度。
+fn pulse(rgba: &[u8], level: f32) -> Vec<u8> {
+    let side = canvas() as u32;
+    let size = side as usize;
+    let level = level.clamp(0.0, 1.0);
+    let scale = 0.86 + 0.14 * level;
+    let bright = 0.76 + 0.24 * level;
+    let mut out = vec![0u8; size * size * 4];
+    let target = ((side as f32) * scale).round().max(2.0) as u32;
+    // 16px 的图标只能靠面积采样缩：和 ico 取档同一个算法，边缘的透明像素按 alpha 加权。
+    let Some(scaled) = crate::platform::app_icon::scale(rgba, side, side, target) else {
+        return rgba.to_vec();
+    };
+    let inner = target as usize;
+    let offset = (size.saturating_sub(inner)) / 2;
+    for y in 0..inner {
+        for x in 0..inner {
+            let src = (y * inner + x) * 4;
+            let dst = ((y + offset) * size + (x + offset)) * 4;
+            out[dst] = (scaled[src] as f32 * bright).round().min(255.0) as u8;
+            out[dst + 1] = (scaled[src + 1] as f32 * bright).round().min(255.0) as u8;
+            out[dst + 2] = (scaled[src + 2] as f32 * bright).round().min(255.0) as u8;
+            out[dst + 3] = scaled[src + 3];
         }
     }
+    out
 }
 
 /// 把律动的覆盖率图变成托盘要的 RGBA：统一一层墨色，透明度照覆盖率。
 ///
-/// 不做彩色：任务栏上的小图标一旦上了色就在一堆黑白图标里出头，
-/// 律动的「雅」靠形状和节奏，不靠颜色。
-fn compose_motion(coverage: &[f32], dark_ink: bool, muted: bool) -> Vec<u8> {
+/// 默认是黑 / 白一层单色 —— 任务栏上的小图标一旦上了色就在一堆黑白图标里出头，
+/// 律动的「雅」靠形状和节奏，不靠颜色。颜色只在用户自己去设置里挑了才变。
+fn compose_motion(coverage: &[f32], ink: [u8; 3], muted: bool) -> Vec<u8> {
     let side = canvas() as usize;
     let mut buffer = vec![0u8; side * side * 4];
-    let ink = if dark_ink { 20 } else { 248 };
     let scale = if muted { 0.45 } else { 1.0 };
     for (index, coverage) in coverage.iter().take(side * side).enumerate() {
         let alpha = (coverage * scale).clamp(0.0, 1.0);
@@ -681,9 +857,9 @@ fn compose_motion(coverage: &[f32], dark_ink: bool, muted: bool) -> Vec<u8> {
             continue;
         }
         let offset = index * 4;
-        buffer[offset] = ink;
-        buffer[offset + 1] = ink;
-        buffer[offset + 2] = ink;
+        buffer[offset] = ink[0];
+        buffer[offset + 1] = ink[1];
+        buffer[offset + 2] = ink[2];
         buffer[offset + 3] = (alpha * 255.0).round() as u8;
     }
     buffer
@@ -692,10 +868,10 @@ fn compose_motion(coverage: &[f32], dark_ink: bool, muted: bool) -> Vec<u8> {
 /// 软件图标：直接用编进 exe 的那张 `assets/Bolume.ico`（取托盘尺寸对应的那一档）。
 ///
 /// 取不到就退回数字图标——托盘上不能出现一个空白格子。
-fn render_app_icon(percent: u32, muted: bool, dark_ink: bool, number: &NumberStyle) -> Vec<u8> {
+fn render_app_icon(percent: u32, muted: bool, ink: [u8; 3], number: &NumberStyle) -> Vec<u8> {
     let side = canvas() as u32;
     let Some(mut rgba) = crate::platform::app_icon::rgba_at(side) else {
-        return render_number_icon(percent, muted, dark_ink, number);
+        return render_number_icon(percent, muted, ink, number);
     };
     if muted {
         // 静音时压一道透明度，和系统的喇叭静音图标观感一致。
@@ -706,6 +882,61 @@ fn render_app_icon(percent: u32, muted: bool, dark_ink: bool, number: &NumberSty
     rgba
 }
 
+/// 自定义图标：读用户选的那个 `.ico`，取托盘尺寸那一档。
+///
+/// 读不到（没选 / 文件被删 / 根本不是 ico）就退回数字图标 —— 托盘上不能留个空白格子。
+fn render_custom_icon(
+    path: &str,
+    percent: u32,
+    muted: bool,
+    ink: [u8; 3],
+    number: &NumberStyle,
+) -> Vec<u8> {
+    let side = canvas() as u32;
+    let Some(mut rgba) = custom_rgba(path, side) else {
+        return render_number_icon(percent, muted, ink, number);
+    };
+    if muted {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[3] = (pixel[3] as f32 * 0.45).round() as u8;
+        }
+    }
+    rgba
+}
+
+thread_local! {
+    /// 自定义 ico 解码后的位图：按「路径 + 修改时间」缓存。
+    ///
+    /// 律动 / 彩色是每秒 60 帧重画的，每帧读一次盘、解一次 ico 撑不住。
+    static CUSTOM_ICON: RefCell<Option<(String, Option<std::time::SystemTime>, Vec<u8>)>> =
+        RefCell::new(None);
+}
+
+fn custom_rgba(path: &str, side: u32) -> Option<Vec<u8>> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let cached = CUSTOM_ICON.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(cached_path, cached_stamp, _)| cached_path == path && *cached_stamp == stamp)
+            .map(|(_, _, rgba)| rgba.clone())
+    });
+    if cached.is_some() {
+        return cached;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let rgba = crate::platform::app_icon::rgba_from(&bytes, side)?;
+    CUSTOM_ICON.with(|cell| {
+        *cell.borrow_mut() = Some((path.to_string(), stamp, rgba.clone()));
+    });
+    Some(rgba)
+}
+
 /// 喇叭图标：直接从 `SndVolSSO.dll` 取系统资源（EarTrumpet 用的同一批）。
 ///
 /// 取不到（非 Windows / dll 被裁剪）时退回数字图标，功能不受影响。
@@ -713,18 +944,19 @@ fn render_system_icon(
     volume: f32,
     _display: f32,
     muted: bool,
-    dark_ink: bool,
+    tint_to: Option<[u8; 3]>,
     percent: u32,
     number: &NumberStyle,
 ) -> Vec<u8> {
     let Some(mut rgba) =
         crate::platform::sound_icons::icon_rgba(bar_icon_id(volume, muted), canvas() as u32)
     else {
-        return render_number_icon(percent, muted, dark_ink, number);
+        return render_number_icon(percent, muted, tint_to.unwrap_or([248, 248, 248]), number);
     };
-    if dark_ink {
-        // 浅色任务栏：系统图标是白色的，照 EarTrumpet 的做法染成黑色。
-        crate::platform::sound_icons::tint(&mut rgba, [0, 0, 0]);
+    if let Some(color) = tint_to {
+        // 浅色任务栏（或用户自选了颜色）：系统图标是白色的，照 EarTrumpet
+        // 的做法换掉白色像素，形状和抗锯齿都留着。
+        crate::platform::sound_icons::tint(&mut rgba, color);
     }
     rgba
 }
@@ -817,7 +1049,7 @@ fn ink_ratio(family: &str, weight: i32, aa: crate::config::TrayAntialias) -> f32
 /// （「88」的墨迹宽高比约 1.4），以前只能靠收字号来适配宽度，于是
 /// 数字高度设到 10px 以上就没效果了。现在改为**横向压窄**字形 ——
 /// 高度照设，宽度压到盒子里；压得过头（会瘦成一条）才回头收字号。
-fn render_number_icon(percent: u32, muted: bool, dark_ink: bool, style: &NumberStyle) -> Vec<u8> {
+fn render_number_icon(percent: u32, muted: bool, ink: [u8; 3], style: &NumberStyle) -> Vec<u8> {
     let text = percent.min(100).to_string();
     let family = if style.font.trim().is_empty() {
         crate::config::DEFAULT_NUMBER_FONT
@@ -826,7 +1058,6 @@ fn render_number_icon(percent: u32, muted: bool, dark_ink: bool, style: &NumberS
     };
     let weight = DIGIT_WEIGHT;
     let aa = style.antialias;
-    let ink = if dark_ink { 20.0 } else { 248.0 };
     let alpha_scale = if muted { 0.4 } else { 1.0 };
 
     let canvas = canvas();
@@ -1321,7 +1552,7 @@ fn downsample(mask: &TextMask, factor: u32) -> TextMask {
 ///
 /// 蒙版比画布大时**居中裁**（左右 / 上下各切掉一半）：用户把字号调得比画布还大
 /// 是他的自由，这里不偷偷缩小字形，只是画不下的部分自然落在图标外面。
-fn compose_native(mask: &TextMask, ink: f32, alpha_scale: f32) -> Vec<u8> {
+fn compose_native(mask: &TextMask, ink: [u8; 3], alpha_scale: f32) -> Vec<u8> {
     let canvas = canvas();
     let size = canvas as usize;
     let mut buffer = vec![0u8; size * size * 4];
@@ -1347,9 +1578,9 @@ fn compose_native(mask: &TextMask, ink: f32, alpha_scale: f32) -> Vec<u8> {
                 continue;
             }
             let offset = (ty as usize * size + tx as usize) * 4;
-            buffer[offset] = ink as u8;
-            buffer[offset + 1] = ink as u8;
-            buffer[offset + 2] = ink as u8;
+            buffer[offset] = ink[0];
+            buffer[offset + 1] = ink[1];
+            buffer[offset + 2] = ink[2];
             buffer[offset + 3] = (alpha * 255.0).round() as u8;
         }
     }
@@ -1842,28 +2073,28 @@ mod tests {
         let icons: Vec<Vec<u8>> = {
             let mut list = Vec::new();
             for percent in [0u32, 1, 5, 9, 10, 11, 12, 25, 42, 50, 68, 75, 88, 99, 100] {
-                list.push(super::render_number_icon(percent, false, false, &number));
+                list.push(super::render_number_icon(percent, false, [248, 248, 248], &number));
             }
             for volume in [0.0f32, 0.15, 0.4, 0.7, 1.0] {
-                list.push(super::render_icon(
-                    volume,
-                    volume,
-                    50,
-                    false,
-                    false,
-                    super::TrayIconStyle::Arcs,
-                    &number,
-                ));
+                let spec = super::IconSpec {
+                    style: super::TrayIconStyle::Arcs,
+                    ink: None,
+                    color_by_level: false,
+                    pulse: false,
+                    custom: "",
+                    number: &number,
+                };
+                list.push(super::render(&spec, 0.0, volume, volume, 50, false));
             }
-            list.push(super::render_icon(
-                0.7,
-                0.7,
-                50,
-                true,
-                false,
-                super::TrayIconStyle::Arcs,
-                &number,
-            ));
+            let spec = super::IconSpec {
+                style: super::TrayIconStyle::Arcs,
+                ink: None,
+                color_by_level: false,
+                pulse: false,
+                custom: "",
+                number: &number,
+            };
+            list.push(super::render(&spec, 0.0, 0.7, 0.7, 50, true));
             list
         };
         let size = super::canvas() as usize;
@@ -1923,7 +2154,7 @@ mod tests {
     fn number_icon_keeps_uniform_height() {
         let number = super::NumberStyle::default();
         let height = |percent: u32| {
-            let rgba = super::render_number_icon(percent, false, false, &number);
+            let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number);
             let size = super::canvas() as usize;
             let rows: Vec<usize> = (0..size)
                 .filter(|y| (0..size).any(|x| rgba[(y * size + x) * 4 + 3] > 40))
@@ -1955,7 +2186,7 @@ mod tests {
             for metrics in &mut style.metrics {
                 metrics.size_pt = size_pt;
             }
-            let rgba = super::render_number_icon(88, false, false, &style);
+            let rgba = super::render_number_icon(88, false, [248, 248, 248], &style);
             let rows: Vec<usize> = (0..size)
                 .filter(|y| (0..size).any(|x| rgba[(y * size + x) * 4 + 3] > 40))
                 .collect();
@@ -2001,7 +2232,7 @@ mod tests {
             for percent in [
                 0u32, 3, 7, 9, 10, 11, 17, 21, 33, 47, 58, 66, 74, 88, 99, 100,
             ] {
-                let rgba = super::render_number_icon(percent, false, false, number);
+                let rgba = super::render_number_icon(percent, false, [248, 248, 248], number);
                 let inked = |x: usize, y: usize| rgba[(y * size + x) * 4 + 3] > 40;
 
                 // 1) 不许有孤立像素。
@@ -2080,7 +2311,7 @@ mod tests {
     fn number_icon_covers_digits() {
         let number = super::NumberStyle::default();
         for percent in [0u32, 1, 9, 10, 42, 99, 100] {
-            let rgba = super::render_number_icon(percent, false, false, &number);
+            let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number);
             let side = super::canvas() as usize;
             assert_eq!(rgba.len(), side * side * 4);
             let inked = rgba.chunks_exact(4).filter(|px| px[3] > 40).count();
@@ -2171,7 +2402,7 @@ mod tests {
                 *slot = metrics;
             }
             for percent in [1u32, 10, 11, 20, 44, 88, 91, 99, 100] {
-                let rgba = super::render_number_icon(percent, false, false, &number);
+                let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number);
                 println!("=== {label} / {percent} ===");
                 for y in 0..size {
                     let mut line = String::new();

@@ -104,13 +104,34 @@ fn is_cloaked(hwnd: HWND) -> bool {
 pub fn pick_path_async(folder: bool) -> async_channel::Receiver<Option<String>> {
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let path = unsafe { show_dialog(folder) };
+        let path = unsafe { show_dialog(folder, false) };
         let _ = sender.send_blocking(path);
     });
     receiver
 }
 
-unsafe fn show_dialog(folder: bool) -> Option<String> {
+/// 选一个 `.ico`：托盘图标「自定义」用的。
+///
+/// 和 `pick_path_async` 是同一套（独立 STA 线程 + channel）。**不能**在 UI 线程里
+/// 直接调 `GetOpenFileName` 那类模态框：它会在本线程跑消息循环，期间 Windows 把
+/// 消息灌进 gpui 的 WndProc，而这时鼠标事件那一层的状态还借在手上 —— 一借就是
+/// `BorrowMutError`，release 是 `panic = "abort"`，表现是「点一下程序直接没了」。
+pub fn pick_icon_async(owner: isize) -> async_channel::Receiver<Option<String>> {
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let path = unsafe { show_dialog_owned(false, true, owner) };
+        let _ = sender.send_blocking(path);
+    });
+    receiver
+}
+
+unsafe fn show_dialog(folder: bool, icon: bool) -> Option<String> {
+    unsafe { show_dialog_owned(folder, icon, 0) }
+}
+
+/// `owner` 是设置窗的 HWND（0 = 不认主）。给了主，对话框就是**模态**：
+/// 一直是设置窗的前面那一层，也不会被再点一下「选择…」叠出第二个。
+unsafe fn show_dialog_owned(folder: bool, icon: bool, owner: isize) -> Option<String> {
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
         CoTaskMemFree, CoUninitialize,
@@ -149,8 +170,18 @@ unsafe fn show_dialog(folder: bool) -> Option<String> {
         options | FOS_FILEMUSTEXIST
     };
     let _ = unsafe { dialog.SetOptions(options) };
+    if icon {
+        // 只让选 .ico：手打路径或者挑错格式，最后都读不出一张图。
+        let spec = [windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC {
+            pszName: w!("图标文件 (*.ico)"),
+            pszSpec: w!("*.ico"),
+        }];
+        let _ = unsafe { dialog.SetFileTypes(&spec) };
+    }
     let _ = unsafe {
-        dialog.SetTitle(if folder {
+        dialog.SetTitle(if icon {
+            w!("选择托盘图标")
+        } else if folder {
             w!("Select the folder to disable Bolume in")
         } else {
             w!("Select the app to disable Bolume in")
@@ -158,7 +189,8 @@ unsafe fn show_dialog(folder: bool) -> Option<String> {
     };
 
     // 用户取消会返回 HRESULT(0x800704C7)，这里一律当「没选」。
-    if unsafe { dialog.Show(None) }.is_err() {
+    let parent = (owner != 0).then(|| unsafe { HWND(owner as *mut _) });
+    if unsafe { dialog.Show(parent) }.is_err() {
         if initialized.is_ok() {
             unsafe { CoUninitialize() };
         }

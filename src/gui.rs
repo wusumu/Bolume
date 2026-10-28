@@ -292,7 +292,18 @@ pub fn run(
     // 那条 MTA 线程和 manager 提前备好，否则第一次按键要等 WinRT 起服务。
     std::thread::spawn(crate::platform::media::prewarm);
 
-    let tray = match Tray::new(cfg0.tray_icon_style, &number_style(&cfg0), cfg0.language) {
+    let startup_number = number_style(&cfg0);
+    let tray = match Tray::new(
+        crate::tray::IconSpec {
+            style: cfg0.tray_icon_style,
+            ink: crate::tray::parse_ink(&cfg0.tray_icon_color),
+            color_by_level: cfg0.tray_color_by_level,
+            pulse: cfg0.tray_pulse,
+            custom: &cfg0.tray_icon_custom,
+            number: &startup_number,
+        },
+        cfg0.language,
+    ) {
         Ok(tray) => Rc::new(tray),
         Err(error) => {
             eprintln!("{error}");
@@ -407,14 +418,13 @@ pub fn run(
             cx.spawn(async move |cx| {
                 loop {
                     let running = cx.update(|cx| {
-                        matches!(
-                            cx.global::<AppState>()
-                                .config
-                                .borrow()
-                                .get()
-                                .tray_icon_style,
-                            TrayIconStyle::Dynamic
-                        )
+                        let state = cx.global::<AppState>();
+                        let config = state.config.borrow();
+                        let cfg = config.get();
+                        // 动态图案、律动、彩色 —— 三项都靠这条 60fps 的循环推包络。
+                        matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic)
+                            || cfg.tray_pulse
+                            || cfg.tray_color_by_level
                     });
                     let wait = if running { 16 } else { 400 };
                     cx.background_executor()
@@ -429,7 +439,8 @@ pub fn run(
                         // 再确认一次：这一帧等的那 16ms 里用户可能刚好把动态关掉。
                         // 只看 sleep 前那个快照的话，这最后一帧会把静态图标又盖回动画帧，
                         // 表现就是「从动态切到别的模式不刷新，得再点一下或调音量」。
-                        if !matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic) {
+                        let dynamic = matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic);
+                        if !dynamic && !cfg.tray_pulse && !cfg.tray_color_by_level {
                             return;
                         }
                         let device = state
@@ -438,12 +449,28 @@ pub fn run(
                             .devices
                             .iter()
                             .find(|device| device.is_default)
-                            .map(|device| (device.peak, device.muted));
-                        if let Some((peak, muted)) = device {
+                            .map(|device| device.peak);
+                        let Some(peak) = device else {
+                            return;
+                        };
+                        if dynamic {
+                            // 动态图案：整张图由 `animate` 一步步推。
+                            let muted = state
+                                .snapshot
+                                .borrow()
+                                .devices
+                                .iter()
+                                .find(|device| device.is_default)
+                                .map(|device| device.muted)
+                                .unwrap_or(false);
                             state
                                 .tray
                                 .animate(peak, cfg.tray_motion_gain, cfg.tray_motion, muted);
+                            return;
                         }
+                        // 律动 / 彩色叠在静态图标上：那一帧还是走 `update`，
+                        // 它自己会推一次包络再重画（`last` 已清空，不会被去重跳过）。
+                        refresh_tray_icon(cx);
                     });
                 }
             })
@@ -723,13 +750,22 @@ pub fn run(
                             device.volume
                         };
                         let facts = tooltip_facts(&snapshot, &cfg, &device);
+                        let number = number_style(&cfg);
                         tray.update(&TrayUpdate {
                             volume: device.volume,
                             display,
                             muted: device.muted,
                             peak: device.peak,
-                            style: cfg.tray_icon_style,
-                            number: &number_style(&cfg),
+                            icon: crate::tray::IconSpec {
+                                style: cfg.tray_icon_style,
+                                ink: crate::tray::parse_ink(&cfg.tray_icon_color),
+                                color_by_level: cfg.tray_color_by_level,
+                                pulse: cfg.tray_pulse,
+                                custom: &cfg.tray_icon_custom,
+                                number: &number,
+                            },
+                            motion_gain: cfg.tray_motion_gain,
+                            motion_effect: cfg.tray_motion,
                             logarithmic: cfg.use_logarithmic_volume,
                             min_db,
                             lang: cfg.language,
@@ -2616,7 +2652,9 @@ pub fn sync_tray_motion(cx: &mut App) {
         let state = cx.global::<AppState>();
         let cfg = state.config.borrow().get().clone();
         (
-            matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic),
+            matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic)
+                || cfg.tray_pulse
+                || cfg.tray_color_by_level,
             cfg.tray_motion,
         )
     };
@@ -2671,13 +2709,22 @@ pub fn refresh_tray_icon(cx: &mut App) {
     // 离开动态：动态期间 `last` 是空的，这里本来就会重画；再清一次是保险 ——
     // 万一音量和样式码刚好和进动态前那一格对得上，别让「换样式没反应」再回来。
     state.tray.invalidate();
+    let number = number_style(&cfg);
     state.tray.update(&TrayUpdate {
         volume: device.volume,
         display,
         muted: device.muted,
         peak: device.peak,
-        style: cfg.tray_icon_style,
-        number: &number_style(&cfg),
+        icon: crate::tray::IconSpec {
+            style: cfg.tray_icon_style,
+            ink: crate::tray::parse_ink(&cfg.tray_icon_color),
+            color_by_level: cfg.tray_color_by_level,
+            pulse: cfg.tray_pulse,
+            custom: &cfg.tray_icon_custom,
+            number: &number,
+        },
+        motion_gain: cfg.tray_motion_gain,
+        motion_effect: cfg.tray_motion,
         logarithmic: cfg.use_logarithmic_volume,
         min_db,
         lang: cfg.language,

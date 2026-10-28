@@ -107,6 +107,13 @@ impl Motion {
         self.paint(effect, side)
     }
 
+    /// 当前包络（0..1，快起慢落之后的值）。
+    ///
+    /// 「彩色律动」拿它当色温：颜色跟着这个值走，才不会每一帧都跳色。
+    pub fn level(&self) -> f32 {
+        self.level
+    }
+
     /// 静音 / 正在暂停：把状态压回去，避免切回来时先跳一下。
     pub fn reset(&mut self) {
         self.level = 0.0;
