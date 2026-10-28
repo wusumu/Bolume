@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -14,6 +15,14 @@ use crate::motion::Motion;
 
 /// 画布尺寸的兜底值（取不到系统指标时用）。
 const CANVAS_FALLBACK: f32 = 16.0;
+
+/// 托盘图标还需要每帧推进吗？
+///
+/// 两种都要靠这条 60fps 的时间线：动态图案本身在动，彩色律动要跟着响度换色。
+/// 彩色律动只对单色样式生效，所以选了软件图标 / 自定义 ico 就没什么可推的。
+pub fn needs_frames(style: TrayIconStyle, color_by_level: bool) -> bool {
+    matches!(style, TrayIconStyle::Dynamic) || (color_by_level && style.is_monochrome())
+}
 
 /// 数字图标的外观：字体族 + 抗锯齿 + 按位数分档的字号 / 宽高 / 字距。
 ///
@@ -106,14 +115,17 @@ fn resolve_ink(dark_taskbar: bool, ink: Option<[u8; 3]>) -> [u8; 3] {
 
 /// 彩色律动的色温：响度越高越红。
 ///
-/// 低响度偏冷（天蓝），中段过一档琥珀，满响落到红。分三段而不是蓝红直连：
-/// RGB 直接插值会在中间经过一段发灰的脏色，加一档暖黄再落到红才像「在升温」。
+/// 低响度偏冷（天蓝），中段过一档青，再到琥珀，满幅才落到红。分四段而不是
+/// 蓝红直连：RGB 直接插值会在中间经过一段发灰的脏色，加两档过渡才像「在升温」。
 fn heat_color(level: f32) -> [u8; 3] {
-    // (位置, RGB)：天蓝 → 琥珀 → 红。
-    const STOPS: [(f32, [f32; 3]); 3] = [
-        (0.0, [56.0, 189.0, 248.0]),
-        (0.5, [250.0, 204.0, 21.0]),
-        (1.0, [239.0, 68.0, 68.0]),
+    // (位置, RGB)：天蓝 → 青 → 琥珀 → 红。
+    //
+    // 红色提前到 0.92：真顶到满幅那一下才走到 1.0，不提前一点，红几乎看不见。
+    const STOPS: [(f32, [f32; 3]); 4] = [
+        (0.00, [56.0, 189.0, 248.0]),
+        (0.45, [45.0, 212.0, 191.0]),
+        (0.75, [250.0, 204.0, 21.0]),
+        (0.92, [239.0, 68.0, 68.0]),
     ];
     let level = level.clamp(0.0, 1.0);
     let mut index = 0;
@@ -126,6 +138,64 @@ fn heat_color(level: f32) -> [u8; 3] {
     let k = ((level - from_at) / span).clamp(0.0, 1.0);
     let mix = |a: f32, b: f32| (a + (b - a) * k).round() as u8;
     [mix(from[0], to[0]), mix(from[1], to[1]), mix(from[2], to[2])]
+}
+
+/// 彩色律动的响度包络。
+///
+/// 不复用动态图案那条 `Motion`：那条为了让条画高会乘灵敏度，峰值本来就在
+/// 0.9 上下，一乘就贴满格 —— 色温会一直停在红（这正是它单拎出来的原因）。
+///
+/// 也不把峰值直接铺到整条色带上：同一首歌的峰值几乎恒定（母带之后基本都在
+/// 0.8 以上），铺上去就是一片死色，只看得到红。这里先跟一条「这几秒有多响」
+/// 的基线，再以基线为中点把摆动摊开 —— 于是同一段音乐里也有蓝有黄。
+struct Heat {
+    /// 输出：色带上的位置（平滑后）。
+    level: f32,
+    /// 自适应基线：最近几秒的整体响度。
+    mean: f32,
+    last: Option<Instant>,
+}
+
+impl Heat {
+    /// 喂一帧峰值，返回平滑后的色带位置。
+    fn step(&mut self, peak: f32) -> f32 {
+        let now = Instant::now();
+        // 第一帧没有上一帧可比：按 60fps 估一个 dt，不然会有一个巨大的时间跳变。
+        let dt = self
+            .last
+            .map(|last| now.duration_since(last).as_secs_f32())
+            .unwrap_or(1.0 / 60.0)
+            .clamp(0.0, 0.1);
+        self.last = Some(now);
+        let peak = peak.clamp(0.0, 1.0);
+
+        // 基线：响度上来时跟得快（2 秒），掉下去时回落得慢（8 秒）。
+        // 一段音乐里它稳定在「这段有多响」，颜色才有参照物。
+        if self.mean <= 0.001 {
+            self.mean = peak;
+        } else {
+            let follow = if peak > self.mean { dt / 2.0 } else { dt / 8.0 };
+            self.mean += (peak - self.mean) * follow.min(1.0);
+        }
+
+        // 摆动范围取基线的一半多一点：响的音乐摆得开，安静的音乐摆得窄。
+        // 上界不钳到 1.0：钳了之后「恒定很响」的那一类会贴到顶端，又变成一片红。
+        // 上界放宽到 mean + span 之后，满幅只在比基线明显更高的那一下出现。
+        let span = (self.mean * 0.55).max(0.10);
+        let low = (self.mean - span).max(0.0);
+        let high = self.mean + span;
+        let relative = ((peak - low) / (high - low).max(1e-3)).clamp(0.0, 1.0);
+        // 绝对响度兜底：整首本来就很轻的歌，别让相对摆动把它染红。
+        let ceiling = 0.40 + 0.60 * (self.mean / 0.80).clamp(0.0, 1.0);
+        let target = relative * ceiling;
+
+        // 起得快（听见就热），落得慢（不然一段持续的响里会一闪一闪）。
+        let attack = (dt * 16.0).min(1.0);
+        let release = (dt * 4.0).min(1.0);
+        let follow = if target > self.level { attack } else { release };
+        self.level += (target - self.level) * follow;
+        self.level
+    }
 }
 
 /// 系统 DPI（96 / 120 / 144 …）。字号按「点」存，换算成像素要用它。
@@ -151,10 +221,10 @@ pub struct Tray {
     ///
     /// 动态图案的每一帧由 `animate` 推，那条路上拿不到配置，所以这几项存在这里。
     ink: Cell<Option<[u8; 3]>>,
-    /// 彩色：颜色按包络插值（越小越冷、越响越红），压过上面那个固定色。
+    /// 彩色律动：颜色按包络插值（越小越冷、越响越红），压过上面那个固定色。
     rainbow: Cell<bool>,
-    /// 律动：整张图随响度胀缩 + 明暗。
-    pulse: Cell<bool>,
+    /// 彩色律动的响度包络（和动态图案的 `motion` 分开算，见 `Heat`）。
+    heat: RefCell<Heat>,
     /// 自定义 ico 的路径。
     custom: RefCell<String>,
 }
@@ -189,17 +259,15 @@ pub struct TooltipFacts {
 
 /// 一张托盘图标的外观参数。
 ///
-/// 单独拎出来是因为「样式 / 颜色 / 律动 / 自定义图标」这几项现在互相叠着：
-/// 彩色可以配喇叭也可以配数字，律动可以叠在任何图标上，自定义 ico 又是另一档。
+/// 单独拎出来是因为「样式 / 颜色 / 自定义图标」这几项现在互相叠着：
+/// 彩色律动可以配喇叭也可以配数字，自定义 ico 又是另一档。
 #[derive(Clone, Copy)]
 pub struct IconSpec<'a> {
     pub style: TrayIconStyle,
     /// 用户挑的固定色（`None` = 跟随任务栏深浅）。
     pub ink: Option<[u8; 3]>,
-    /// 彩色：颜色按响度插值（只对单色样式生效）。
+    /// 彩色律动：颜色按响度插值（只对单色样式生效）。
     pub color_by_level: bool,
-    /// 律动：整张图随响度胀缩 + 明暗（任何样式都能开）。
-    pub pulse: bool,
     /// 自定义 ico 的路径（`style == Custom` 时才读）。
     pub custom: &'a str,
     pub number: &'a NumberStyle,
@@ -210,7 +278,7 @@ pub struct TrayUpdate<'a> {
     pub volume: f32,
     pub display: f32,
     pub muted: bool,
-    /// 默认播放设备的峰值电平（0..1）。律动 / 彩色 / 动态图案都拿它当输入。
+    /// 默认播放设备的峰值电平（0..1）。彩色律动 / 动态图案都拿它当输入。
     pub peak: f32,
     /// 图标长什么样。
     pub icon: IconSpec<'a>,
@@ -247,7 +315,11 @@ impl Tray {
             motion: RefCell::new(Motion::default()),
             ink: Cell::new(spec.ink),
             rainbow: Cell::new(spec.color_by_level),
-            pulse: Cell::new(spec.pulse),
+            heat: RefCell::new(Heat {
+                level: 0.0,
+                mean: 0.0,
+                last: None,
+            }),
             custom: RefCell::new(spec.custom.to_string()),
         })
     }
@@ -269,7 +341,6 @@ impl Tray {
         let icon = &state.icon;
         self.ink.set(icon.ink);
         self.rainbow.set(icon.color_by_level);
-        self.pulse.set(icon.pulse);
         if *self.custom.borrow() != icon.custom {
             *self.custom.borrow_mut() = icon.custom.to_string();
         }
@@ -304,19 +375,13 @@ impl Tray {
         };
         let bar_id = bar_icon_id(volume, state.muted);
 
-        // 律动 / 彩色都靠「这会儿多响」驱动，那条时间线只有这里推进：
-        // 音频泵在开这两项时会提到 60fps，所以每帧都会走到这儿。
-        let animated = icon.pulse || (icon.color_by_level && icon.style.is_monochrome());
+        // 彩色律动靠「这会儿多响」驱动，那条时间线只有这里推进：
+        // 音频泵在开着它时会提到 60fps，所以每帧都会走到这儿。
+        let animated = icon.color_by_level && icon.style.is_monochrome();
         let side = canvas() as u32;
         let level = if animated {
-            let mut motion = self.motion.borrow_mut();
-            motion.step(
-                if state.muted { 0.0 } else { state.peak },
-                state.motion_gain as f32 / 100.0,
-                state.motion_effect,
-                side,
-            );
-            motion.level()
+            let peak = if state.muted { 0.0 } else { state.peak };
+            self.heat.borrow_mut().step(peak)
         } else {
             0.0
         };
@@ -363,33 +428,29 @@ impl Tray {
     /// `gain` 是配置里的灵敏度百分比；`peak` 是默认设备的峰值电平。
     pub fn animate(&self, peak: f32, gain: u32, effect: TrayMotion, muted: bool) {
         let side = canvas() as u32;
-        let (coverage, level) = {
-            let mut motion = self.motion.borrow_mut();
-            let coverage = motion.step(
-                if muted { 0.0 } else { peak },
-                gain as f32 / 100.0,
-                effect,
-                side,
-            );
-            (coverage, motion.level())
-        };
-        self.push_motion(&coverage, level, muted);
+        let coverage = self.motion.borrow_mut().step(
+            if muted { 0.0 } else { peak },
+            gain as f32 / 100.0,
+            effect,
+            side,
+        );
+        if self.rainbow.get() {
+            self.heat.borrow_mut().step(if muted { 0.0 } else { peak });
+        }
+        self.push_motion(&coverage, muted);
     }
 
     /// 不推进时间轴，按当前状态重画一帧（切样式 / 静音状态变化时用）。
     pub fn repaint_motion(&self, effect: TrayMotion, muted: bool) {
         let side = canvas() as u32;
-        let (coverage, level) = {
-            let motion = self.motion.borrow();
-            (motion.snapshot(effect, side), motion.level())
-        };
-        self.push_motion(&coverage, level, muted);
+        let coverage = self.motion.borrow().snapshot(effect, side);
+        self.push_motion(&coverage, muted);
     }
 
-    fn push_motion(&self, coverage: &[f32], level: f32, muted: bool) {
+    fn push_motion(&self, coverage: &[f32], muted: bool) {
         let side = canvas() as u32;
         let ink = if self.rainbow.get() {
-            heat_color(level)
+            heat_color(self.heat.borrow().level)
         } else {
             resolve_ink(light_taskbar(), self.ink.get())
         };
@@ -766,7 +827,7 @@ fn light_taskbar() -> bool {
 
 /// 画一张托盘图标（RGBA，straight alpha —— 托盘按直通 alpha 处理）。
 ///
-/// `level` 是响度包络（0..1）：彩色拿它当色温，律动拿它当胀缩幅度。
+/// `level` 是彩色律动的色带位置（0..1）：只有开着彩色律动时才有意义。
 fn render(
     spec: &IconSpec<'_>,
     level: f32,
@@ -777,16 +838,16 @@ fn render(
 ) -> Vec<u8> {
     let style = spec.style;
     let light_taskbar = light_taskbar();
-    // 彩色只染得动单色墨迹：软件图标 / 自定义 ico 是彩色原图，染色会毁掉原样。
+    // 彩色律动只染得动单色墨迹：软件图标 / 自定义 ico 是彩色原图，染色会毁掉原样。
     let rgb = if spec.color_by_level && style.is_monochrome() {
         heat_color(level)
     } else {
         resolve_ink(light_taskbar, spec.ink)
     };
-    let mut rgba = match style {
+    match style {
         TrayIconStyle::Number => render_number_icon(percent, muted, rgb, spec.number),
         TrayIconStyle::Arcs => {
-            // 系统图标本体是白的：浅色任务栏要染成深墨；挑了颜色 / 开了彩色就染成那个色。
+            // 系统图标本体是白的：浅色任务栏要染成深墨；挑了颜色 / 开了彩色律动就染成那个色。
             let tint = if spec.ink.is_some() || spec.color_by_level || light_taskbar {
                 Some(rgb)
             } else {
@@ -804,43 +865,7 @@ fn render(
             let coverage = crate::motion::Motion::default().snapshot(TrayMotion::Bars, side);
             compose_motion(&coverage, rgb, muted)
         }
-    };
-    // 律动叠在任何静态图标上（动态图案本身就在动，再叠一层只会发飘）。
-    if spec.pulse && !matches!(style, TrayIconStyle::Dynamic) {
-        rgba = pulse(&rgba, level);
     }
-    rgba
-}
-
-/// 律动：整张图随响度轻微胀缩 + 明暗起伏。
-///
-/// 缩放比 0.86 → 1.0、亮度 0.76 → 1.0，跟着包络连续走 —— 安静时又小又暗，
-/// 一响就胀回原尺寸。任何图标（含彩色原图）都能这么叠，因为它只动尺寸和亮度。
-fn pulse(rgba: &[u8], level: f32) -> Vec<u8> {
-    let side = canvas() as u32;
-    let size = side as usize;
-    let level = level.clamp(0.0, 1.0);
-    let scale = 0.86 + 0.14 * level;
-    let bright = 0.76 + 0.24 * level;
-    let mut out = vec![0u8; size * size * 4];
-    let target = ((side as f32) * scale).round().max(2.0) as u32;
-    // 16px 的图标只能靠面积采样缩：和 ico 取档同一个算法，边缘的透明像素按 alpha 加权。
-    let Some(scaled) = crate::platform::app_icon::scale(rgba, side, side, target) else {
-        return rgba.to_vec();
-    };
-    let inner = target as usize;
-    let offset = (size.saturating_sub(inner)) / 2;
-    for y in 0..inner {
-        for x in 0..inner {
-            let src = (y * inner + x) * 4;
-            let dst = ((y + offset) * size + (x + offset)) * 4;
-            out[dst] = (scaled[src] as f32 * bright).round().min(255.0) as u8;
-            out[dst + 1] = (scaled[src + 1] as f32 * bright).round().min(255.0) as u8;
-            out[dst + 2] = (scaled[src + 2] as f32 * bright).round().min(255.0) as u8;
-            out[dst + 3] = scaled[src + 3];
-        }
-    }
-    out
 }
 
 /// 把律动的覆盖率图变成托盘要的 RGBA：统一一层墨色，透明度照覆盖率。
@@ -2080,7 +2105,6 @@ mod tests {
                     style: super::TrayIconStyle::Arcs,
                     ink: None,
                     color_by_level: false,
-                    pulse: false,
                     custom: "",
                     number: &number,
                 };
@@ -2090,7 +2114,6 @@ mod tests {
                 style: super::TrayIconStyle::Arcs,
                 ink: None,
                 color_by_level: false,
-                pulse: false,
                 custom: "",
                 number: &number,
             };

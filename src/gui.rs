@@ -298,7 +298,6 @@ pub fn run(
             style: cfg0.tray_icon_style,
             ink: crate::tray::parse_ink(&cfg0.tray_icon_color),
             color_by_level: cfg0.tray_color_by_level,
-            pulse: cfg0.tray_pulse,
             custom: &cfg0.tray_icon_custom,
             number: &startup_number,
         },
@@ -421,10 +420,8 @@ pub fn run(
                         let state = cx.global::<AppState>();
                         let config = state.config.borrow();
                         let cfg = config.get();
-                        // 动态图案、律动、彩色 —— 三项都靠这条 60fps 的循环推包络。
-                        matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic)
-                            || cfg.tray_pulse
-                            || cfg.tray_color_by_level
+                        // 动态图案 / 彩色律动都靠这条 60fps 的循环推包络。
+                        crate::tray::needs_frames(cfg.tray_icon_style, cfg.tray_color_by_level)
                     });
                     let wait = if running { 16 } else { 400 };
                     cx.background_executor()
@@ -440,7 +437,8 @@ pub fn run(
                         // 只看 sleep 前那个快照的话，这最后一帧会把静态图标又盖回动画帧，
                         // 表现就是「从动态切到别的模式不刷新，得再点一下或调音量」。
                         let dynamic = matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic);
-                        if !dynamic && !cfg.tray_pulse && !cfg.tray_color_by_level {
+                        if !crate::tray::needs_frames(cfg.tray_icon_style, cfg.tray_color_by_level)
+                        {
                             return;
                         }
                         let device = state
@@ -468,7 +466,7 @@ pub fn run(
                                 .animate(peak, cfg.tray_motion_gain, cfg.tray_motion, muted);
                             return;
                         }
-                        // 律动 / 彩色叠在静态图标上：那一帧还是走 `update`，
+                        // 彩色律动叠在静态图标上：那一帧还是走 `update`，
                         // 它自己会推一次包络再重画（`last` 已清空，不会被去重跳过）。
                         refresh_tray_icon(cx);
                     });
@@ -760,7 +758,6 @@ pub fn run(
                                 style: cfg.tray_icon_style,
                                 ink: crate::tray::parse_ink(&cfg.tray_icon_color),
                                 color_by_level: cfg.tray_color_by_level,
-                                pulse: cfg.tray_pulse,
                                 custom: &cfg.tray_icon_custom,
                                 number: &number,
                             },
@@ -2652,9 +2649,7 @@ pub fn sync_tray_motion(cx: &mut App) {
         let state = cx.global::<AppState>();
         let cfg = state.config.borrow().get().clone();
         (
-            matches!(cfg.tray_icon_style, TrayIconStyle::Dynamic)
-                || cfg.tray_pulse
-                || cfg.tray_color_by_level,
+            crate::tray::needs_frames(cfg.tray_icon_style, cfg.tray_color_by_level),
             cfg.tray_motion,
         )
     };
@@ -2719,7 +2714,6 @@ pub fn refresh_tray_icon(cx: &mut App) {
             style: cfg.tray_icon_style,
             ink: crate::tray::parse_ink(&cfg.tray_icon_color),
             color_by_level: cfg.tray_color_by_level,
-            pulse: cfg.tray_pulse,
             custom: &cfg.tray_icon_custom,
             number: &number,
         },

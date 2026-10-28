@@ -36,7 +36,7 @@ pub enum TrayIconStyle {
 impl TrayIconStyle {
     /// 是不是单色墨迹画的（字母、喇叭、律动图案）。
     ///
-    /// 「彩色」只染得动这一类；软件图标和自定义 ico 是彩色原图，染色会毁掉原样。
+    /// 「彩色律动」只染得动这一类；软件图标和自定义 ico 是彩色原图，染色会毁掉原样。
     pub fn is_monochrome(self) -> bool {
         !matches!(self, Self::App | Self::Custom)
     }
@@ -413,21 +413,6 @@ impl Default for TrayMenuConfig {
 }
 
 impl TrayMenuConfig {
-    /// 设备列表那一项的显隐（设置页那个快捷开关直接改它）。
-    pub fn devices_visible(&self) -> bool {
-        self.root
-            .iter()
-            .find(|node| node.id == "devices")
-            .map(|node| node.visible)
-            .unwrap_or(false)
-    }
-
-    pub fn set_devices_visible(&mut self, visible: bool) {
-        if let Some(node) = self.root.iter_mut().find(|node| node.id == "devices") {
-            node.visible = visible;
-        }
-    }
-
     /// 这个 id 在菜单树里（含子菜单）有没有出现过。
     pub fn contains(&self, id: &str) -> bool {
         fn walk(nodes: &[TrayMenuNode], id: &str) -> bool {
@@ -3848,13 +3833,10 @@ pub struct Config {
     /// 自定义托盘图标的路径（`.ico`）。样式选「自定义」时读它。
     #[serde(default)]
     pub tray_icon_custom: String,
-    /// 图标律动：整张图跟着响度轻微胀缩、明暗起伏。任何样式都能开。
-    #[serde(default)]
-    pub tray_pulse: bool,
-    /// 彩色：图标颜色跟着响度走（安静偏冷、越响越红）。
+    /// 彩色律动：图标颜色跟着响度走（安静偏冷、越响越红）。
     ///
-    /// 和上面那个固定色是上下位关系：开着彩色时固定色不生效。
-    /// 只作用于单色样式；软件图标 / 自定义 ico 是彩色原图，不染。
+    /// 和上面那个固定色是上下位关系：开着它时固定色不生效。
+    /// 只作用于单色样式；软件图标 / 自定义 ico 是彩色原图，染色会毁掉原样。
     #[serde(default)]
     pub tray_color_by_level: bool,
 
@@ -4220,7 +4202,6 @@ impl Default for Config {
             tray_icon_style: TrayIconStyle::Arcs,
             tray_icon_color: String::new(),
             tray_icon_custom: String::new(),
-            tray_pulse: false,
             tray_color_by_level: false,
             tray_motion: TrayMotion::default(),
             tray_motion_gain: DEFAULT_TRAY_MOTION_GAIN,
@@ -6139,7 +6120,7 @@ mod tests {
             assert!(ids.contains(&id), "{id} 应该直接摆在右键里");
         }
         assert!(menu.root.iter().all(|node| !node.is_folder()));
-        assert!(menu.devices_visible());
+        assert!(menu.root.iter().any(|node| node.id == "devices" && node.visible));
 
         // 老配置（没有 tray_menu 段）也要拿到这套默认。
         let legacy: Config = serde_json::from_str(r#"{"config_rev": 18}"#).unwrap();

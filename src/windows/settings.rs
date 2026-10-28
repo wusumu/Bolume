@@ -10694,37 +10694,16 @@ impl Settings {
             cx,
         );
 
-        // 律动 + 彩色：这两项不挑样式，喇叭 / 数字 / 自定义 ico 都能叠。
-        let icon_pulse = {
-            let store = self.config.clone();
-            self.toggle_row(
-                "tray-icon-pulse",
-                lang.pick("律动", "Pulse"),
-                lang.pick(
-                    "图标跟着响度胀缩、明暗起伏；和图案那种律动不一样，这个能叠在任何图标上",
-                    "The icon swells and brightens with the level; stacks on any icon style",
-                ),
-                config.tray_pulse,
-                move |window, cx| {
-                    let _ = store
-                        .borrow_mut()
-                        .update(|config| config.tray_pulse = !config.tray_pulse);
-                    // 开了要把音频线程提频（每秒 60 帧推包络），关了就退回去。
-                    crate::gui::sync_tray_motion(cx);
-                    crate::gui::refresh_tray_icon(cx);
-                    refresh_ui(window, cx);
-                },
-            )
-        };
-
-        let icon_color_by_level = {
+        // 彩色律动只在单色墨迹上画得出来：软件图标 / 自定义 ico 是彩色原图，
+        // 染上去只会把原样毁掉，所以这两种样式下整行都不出现。
+        let icon_color_by_level = config.tray_icon_style.is_monochrome().then(|| {
             let store = self.config.clone();
             self.toggle_row(
                 "tray-icon-color-level",
-                lang.pick("彩色", "Colour by level"),
+                lang.pick("彩色律动", "Colour pulse"),
                 lang.pick(
-                    "颜色跟着响度走：安静偏蓝、越响越红；只对单色图标生效，软件图标和自定义 ico 保持原样",
-                    "Hue follows the level: cool when quiet, red when loud; monochrome icons only",
+                    "颜色跟着响度走：安静偏蓝，越响越往红走",
+                    "Hue follows the level: cool when quiet, red when loud",
                 ),
                 config.tray_color_by_level,
                 move |window, cx| {
@@ -10736,7 +10715,7 @@ impl Settings {
                     refresh_ui(window, cx);
                 },
             )
-        };
+        });
 
         // 音量条上的发声特效：画在填充之上，满音量也看得见谁在响。
         let activity_effect = {
@@ -11026,29 +11005,6 @@ impl Settings {
             cx,
         );
 
-        // 托盘右键菜单：设备列表可以整段关掉（只留面板 / 设置 / 系统入口）。
-        let tray_menu_devices = {
-            let store = self.config.clone();
-            self.toggle_row(
-                "tray-menu-devices",
-                lang.pick("托盘菜单显示设备列表", "List devices in the tray menu"),
-                lang.pick(
-                    "右键菜单顶部列出播放设备，点一下切默认设备",
-                    "List playback devices at the top of the right-click menu; click one to switch",
-                ),
-                config.tray_menu.devices_visible(),
-                move |window, cx| {
-                    let _ = store.borrow_mut().update(|config| {
-                        let next = !config.tray_menu.devices_visible();
-                        config.tray_menu.set_devices_visible(next);
-                    });
-                    // 菜单是原生弹出菜单，得按新配置重建一份。
-                    crate::gui::refresh_tray_menu(cx);
-                    refresh_ui(window, cx);
-                },
-            )
-        };
-
         // 界面动效：切换设置页面（左栏分页、页内页签）时内容淡入 + 轻微上浮。
         let ui_motion = self.toggle_row(
             "toggle-ui-motion",
@@ -11183,9 +11139,9 @@ impl Settings {
         if let Some(color) = icon_color {
             tray_rows.push(color);
         }
-        tray_rows.push(icon_pulse);
-        tray_rows.push(icon_color_by_level);
-        tray_rows.push(tray_menu_devices);
+        if let Some(row) = icon_color_by_level {
+            tray_rows.push(row);
+        }
         let mut sections = vec![self.section(
             lang.pick("托盘图标", "Tray icon"),
             "speaker",
