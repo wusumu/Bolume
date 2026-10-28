@@ -9484,28 +9484,11 @@ impl Settings {
             ))
             .into_any_element();
 
-        // 「预览一下」：拿当前设置真的弹一次，看的和用的时候一模一样。
-        let try_row = self.action_row(
-            "osd-try",
-            lang.pick("预览一下", "Preview it"),
-            lang.pick(
-                "用当前设置真的弹一次提示条",
-                "Show the real card with the current settings",
-            )
-            .to_string(),
-            lang.pick("弹一次", "Show"),
-            |window, cx| {
-                crate::gui::show_osd(
-                    cx,
-                    crate::windows::osd::OsdRequest::device(OsdFunction::Volume),
-                );
-                let _ = window;
-            },
-        );
-
-        // 「保持显示」：把提示条钉住，边看边调；再点一下收起。
+        // 「预览屏幕提示」：右边两个按钮 —— 弹一次看效果，或者钉住不消失。
+        // 这两件事本来就是「看一眼」的两种做法，分成两行还各带一句说明，
+        // 白占一行高度，所以并成一行。
         let pinned = self.osd_pinned;
-        let pin_row = div()
+        let preview_row = div()
             .flex()
             .items_center()
             .gap(px(10.))
@@ -9523,17 +9506,37 @@ impl Settings {
                         div()
                             .text_size(theme::fs(13.))
                             .text_color(theme::text_primary())
-                            .child(lang.pick("保持显示", "Keep it on screen")),
+                            .child(lang.pick("预览屏幕提示", "Preview the card")),
                     )
                     .child(
                         div()
                             .text_size(theme::fs(10.5))
                             .text_color(theme::text_tertiary())
                             .child(lang.pick(
-                                "钉住提示条、不自动消失，方便对着调外观；再点一下收起",
-                                "Pin the card so it stays while you tweak; click again to hide it",
+                                "弹出一次看看效果；保持显示则不自动消失，便于对照调整外观",
+                                "Show it once to check the look, or keep it on screen while you tweak",
                             )),
                     ),
+            )
+            .child(
+                div()
+                    .id("osd-try-button")
+                    .flex_none()
+                    .px(px(9.))
+                    .py(px(3.))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(theme::track())
+                    .cursor_pointer()
+                    .text_size(theme::fs(11.))
+                    .text_color(theme::text_secondary())
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(cx.listener(|_, _: &ClickEvent, _window, cx| {
+                        crate::gui::show_osd(
+                            cx,
+                            crate::windows::osd::OsdRequest::device(OsdFunction::Volume),
+                        );
+                    }))
+                    .child(lang.pick("弹出一次", "Show once")),
             )
             .child(
                 div()
@@ -9565,7 +9568,7 @@ impl Settings {
                     .child(if pinned {
                         lang.pick("收起", "Hide")
                     } else {
-                        lang.pick("保持", "Pin")
+                        lang.pick("保持显示", "Keep on screen")
                     }),
             )
             .into_any_element();
@@ -10074,7 +10077,7 @@ impl Settings {
             self.section(
                 lang.pick("屏幕提示", "On-screen display"),
                 "monitor",
-                vec![enable, try_row, pin_row],
+                vec![enable, preview_row],
             ),
             self.section(
                 lang.pick("布局与样式", "Layout and style"),
