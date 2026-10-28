@@ -2,7 +2,7 @@
 name = "Bolume"
 # 版本号按 0.01 一档往上走：0.41 → 0.49 → 0.50（不是 0.4.10）。
 # Cargo 必须写三段，界面上显示时去掉末尾的 .0（见 `main::version`）。
-version = "0.86.0"
+version = "0.87.0"
 edition = "2024"
 description = "Next-generation Windows audio mixer"
 

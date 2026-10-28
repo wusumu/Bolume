@@ -4,7 +4,7 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写 · 单文件 exe · 绿色免安装 · 配置就在 exe 旁边 · 中英双语界面**
 
-目前版本 **0.86** · [下载](../../releases) · [English](#english)
+目前版本 **0.87** · [下载](../../releases) · [English](#english)
 
 ---
 
@@ -85,6 +85,10 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 设置 · 外观页（主题、强调色、字体）：
 
 ![设置](docs/settings.png)
+
+屏幕提示（音量、静音、切歌、亮度各弹一条，位置与样式都能改）：
+
+![屏幕提示](docs/osd.png)
 
 ## 关于
 
