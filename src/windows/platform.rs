@@ -601,6 +601,20 @@ pub fn present_behind_taskbar(window: &Window) {
     behind_taskbar(window);
 }
 
+/// 提示条（OSD）摆 z 序：平时压在任务栏后面，全屏时提到最前。
+///
+/// 为什么全屏要分开处理：无边框全屏的游戏 / 播放器往往自己也挂在 TOPMOST 组里，
+/// 把提示条压到任务栏后面就等于排到它下头 —— 用户看到的就是「全屏时提示条
+/// 被画面盖住」（全屏禁用那个开关关着也一样，因为这里根本走不到那条判断）。
+/// 全屏时任务栏本来就看不见，提到最前没有「从任务栏前面滑过去」的副作用。
+pub fn place_osd(window: &Window) {
+    if crate::platform::fullscreen::is_fullscreen() {
+        bring_to_front(window);
+    } else {
+        present_behind_taskbar(window);
+    }
+}
+
 /// 整个窗口的不透明度（0.0 ~ 1.0），照搬 QcClip 的 `set_window_opacity`。
 ///
 /// 弹出时必须先把窗口设成全透明再 `ShowWindow`：窗口一露头，DWM 会立刻画出
