@@ -4,7 +4,7 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写 · 单文件 exe · 绿色免安装 · 配置就在 exe 旁边 · 中英双语界面**
 
-目前版本 **0.85** · [下载](../../releases) · [English](#english)
+目前版本 **0.86** · [下载](../../releases) · [English](#english)
 
 ---
 
@@ -30,6 +30,7 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 - 面板里可隐藏不想看到的会话（折叠此应用）；正在发声的应用可置顶
 - 应用可以自己起名字：右键 → 重命名，最长 24 字，写进配置，折叠和改名共用同一套键
 - 鼠标停在应用图标上 400ms 会浮出完整应用名（名字被省略号截掉、或竖向排版只留图标时用）
+- 调音量时响一声：七个内置音色（轻点 / 滴答 / 气泡 / 木鱼 / 棘轮 / 电子 / 铃音）或自己的 WAV，音效音量与生效范围（快捷键 / 滚轮 / 拖拽）分开调
 
 **设备**
 
@@ -60,7 +61,7 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 
 - 音量 / 应用音量 / 亮度 / 打开面板 / 打开设置 / 媒体键，每组可绑三个组合
 - 媒体键与音量键由低级键盘钩子接管，可以自己弹提示、自己转发
-- 按住连续触发（间隔可调、可忽略系统长按重复）
+- 按住连续触发：每个键自己勾选要不要连发，间隔可调，可忽略系统长按重复
 - NumLock 关着也能识别小键盘数字
 - 应用黑名单 + 全屏自动让路：玩游戏时按音量键不会被弹窗打扰
 
@@ -73,7 +74,7 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 - 弹出动画二选一：`跟随系统`（照系统的指数曲线，从屏幕最底边、任务栏背后滑进来，速度按同一比例缩放）/ `淡入淡出`（原地淡入）；都按屏幕刷新率逐帧推进，**怎么出就怎么回**，收起也能选带不带动画
 - 动画可以**打断**：没出完再按一次就从当前位置掉头收回，收回一半再按也能接着弹回来
 - 屏幕提示的动画二选一：`淡入淡出` / `跟随系统`（滑上来 + 淡入，消失时滑回去）
-- 托盘图标：喇叭弧线跟随音量、或直接显示数字；波形动画可调增益
+- 托盘图标：喇叭弧线跟随音量、或直接显示数字；单色样式可固定颜色，也可让色温随响度走；还能换成自己的 ico
 
 ## 截图
 
@@ -195,6 +196,7 @@ vendor/
 **Bolume** is a from-scratch replacement for the Windows volume mixer, written in Rust with a fully custom-drawn UI (GPUI).
 
 - Per-app volume (percentage / logarithmic / fixed dB), per-app mute, volume caps
+- Optional click sound on every volume step: seven built-in tones or your own WAV, with its own volume and per-gesture switches (hotkeys / wheel / drag)
 - Switch playback & recording devices, rename them, restore a saved device state at startup
 - Monitor brightness over DDC/CI (current / all / a specific display), optionally merged into the volume panel itself — above/below when it is horizontal, left/right when vertical
 - Saved brightness presets in one row at the bottom of the block: click to apply to the display under the cursor, middle-click to apply to all, drag onto another display's slider for just that one, right-click to delete after a confirm
