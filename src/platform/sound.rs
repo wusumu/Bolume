@@ -465,7 +465,7 @@ fn synth(style: VolumeSoundStyle) -> Vec<f32> {
         VolumeSoundStyle::Tick => 0.045,
         VolumeSoundStyle::Pop => 0.070,
         VolumeSoundStyle::Wood => 0.080,
-        VolumeSoundStyle::Ratchet => 0.042,
+        VolumeSoundStyle::Ratchet => 0.032,
         VolumeSoundStyle::Blip => 0.060,
         // 「铃音」原来有 300ms，快拖时缓冲排到两声之后，手停了还在「叮」。
         // 收到 150ms：还是那声「叮」，但连着响不会堆起来。
@@ -475,6 +475,8 @@ fn synth(style: VolumeSoundStyle) -> Vec<f32> {
     };
     let mut noise = Noise::new(0x2545_F491);
     let mut phase = 0.0f32;
+    // 预加重要上一拍的噪声值（只有棘轮用）。
+    let mut previous_noise = 0.0f32;
     // 配平系数见 `normalize`。
     let trim = trim_of(style);
     let mut samples = Vec::with_capacity((seconds * rate) as usize);
@@ -507,20 +509,30 @@ fn synth(style: VolumeSoundStyle) -> Vec<f32> {
                 let knock = noise.next() * (-t / 0.002).exp() * 0.35;
                 attack(t, 0.0003) * (body + ring + knock)
             }
-            // 棘轮：一记干硬的金属齿「咔」—— 噪声尖 + 2.6k 的芯 + 一点低频实体，
-            // 9ms 后棘爪回弹一下更轻的「嗒」。比轻点更低、比木鱼更脆。
+            // 棘轮：挨着 B 站那两段棘轮扳手的录音调的 —— 把录下来的音频拆开量过，
+            // 最脆的那几下频谱质心 ≈ 2.5kHz，能量铺在 500Hz~5kHz，8k/12k 还留一点毛刺。
+            // 所以这一版是**宽带噪声打底 + 三个靠得近的金属模（2k / 3.4k / 5.2k）**，
+            // 低频只留一丝实体：早先那版 820Hz 一个峰就占了近一半能量，
+            // 听感是「咚」而不是「咔」。噪声还做了一阶预加重，白噪声直接上是「嘶」。
             VolumeSoundStyle::Ratchet => {
-                let hit = noise.next() * (-t / 0.0018).exp() * 0.70;
-                let ring = (TAU * 2_650.0 * t).sin() * (-t / 0.0060).exp() * 0.45;
-                let body = (TAU * 820.0 * t).sin() * (-t / 0.0040).exp() * 0.30;
-                let snap = if t > 0.009 {
-                    let back = t - 0.009;
-                    noise.next() * (-back / 0.0012).exp() * 0.32
-                        + (TAU * 2_200.0 * back).sin() * (-back / 0.0030).exp() * 0.18
+                let raw = noise.next();
+                let previous = raw - 0.70 * previous_noise;
+                previous_noise = raw;
+                let hit = previous * (-t / 0.0016).exp() * 0.45;
+                let tail = raw * (-t / 0.0045).exp() * 0.32;
+                let ring = (TAU * 2_450.0 * t).sin() * (-t / 0.0030).exp() * 0.220
+                    + (TAU * 3_400.0 * t).sin() * (-t / 0.0024).exp() * 0.360
+                    + (TAU * 5_200.0 * t).sin() * (-t / 0.0015).exp() * 0.240;
+                let body = (TAU * 650.0 * t).sin() * (-t / 0.0020).exp() * 0.12;
+                // 7.5ms 后棘爪回弹一下更轻、更高的「嗒」。
+                let snap = if t > 0.0075 {
+                    let back = t - 0.0075;
+                    (TAU * 4_600.0 * back).sin() * (-back / 0.0011).exp() * 0.22
+                        + noise.next() * (-back / 0.0008).exp() * 0.26
                 } else {
                     0.0
                 };
-                attack(t, 0.0002) * (hit + ring + body + snap)
+                attack(t, 0.0002) * (hit + tail + ring + body + snap)
             }
             // 电子：880Hz 过 tanh 近似方波，尾巴收得快。
             VolumeSoundStyle::Blip => {
@@ -543,8 +555,8 @@ fn synth(style: VolumeSoundStyle) -> Vec<f32> {
 
 /// 每一档的峰值（也是最终写进样本的幅度）。
 ///
-/// 这组数不是拍出来的，是拿端点电平表**逐档量**出来的：六档都调到 60%，
-/// 谁读数高就把谁的峰值压下去，直到六个都落在 0.50 上下。
+/// 这组数不是拍出来的，是拿端点电平表**逐档量**出来的：七档都调到 60%，
+/// 谁读数高就把谁的峰值压下去，直到七个都落在 0.50 上下。
 /// 所以它更像是「响度配平」而不是「音量」——峰值高的都是波形稀疏、听感偏轻的，
 /// 峰值低的（电子那种方波味、木鱼那种低频）反而更压耳朵。
 /// 「自定义」跟「轻点」共用一档：还没挑文件时本来就是它兜底。
@@ -554,7 +566,7 @@ fn trim_of(style: VolumeSoundStyle) -> f32 {
         VolumeSoundStyle::Tick => 0.48,
         VolumeSoundStyle::Pop => 0.50,
         VolumeSoundStyle::Wood => 0.93,
-        VolumeSoundStyle::Ratchet => 0.50,
+        VolumeSoundStyle::Ratchet => 0.56,
         VolumeSoundStyle::Blip => 0.33,
         VolumeSoundStyle::Chime => 0.50,
     }
@@ -567,7 +579,7 @@ fn attack(t: f32, seconds: f32) -> f32 {
 
 /// 峰值归一化到 1.0，再乘这一档自己的「配平」系数。
 ///
-/// 六个音效的波形差别很大：方波味的 `Blip` 能量集中、听感最响，`Click` 只有
+/// 七个音效的波形差别很大：方波味的 `Blip` 能量集中、听感最响，`Click` 只有
 /// 二十来毫秒、峰值又只有一个尖，照 1.0 铺平的话切到「轻点」会像没响。
 /// 这组系数是拿端点电平表逐档量出来配的（同样 60% 音量下读数落在 0.45 上下），
 /// 换音效时响度不会突然跳一大截。超过 1 的在最后一步钳住 —— 敲击类音效削顶
@@ -693,7 +705,7 @@ mod tests {
             .fold(0i16, |peak, value| peak.max(value.abs()))
     }
 
-    /// 六个内置音效都得是一段像样的 WAV：头对、有声音、峰值按增益缩放。
+    /// 七个内置音效都得是一段像样的 WAV：头对、有声音、峰值按增益缩放。
     #[test]
     fn builtin_sounds_are_valid_wav() {
         for style in VolumeSoundStyle::ALL {
@@ -713,7 +725,7 @@ mod tests {
             let data_len = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
             assert_eq!(bytes.len(), 44 + data_len, "{style:?}");
             assert!(data_len > 1_000, "{style:?} 太短了（{data_len} 字节）");
-            // 峰值就是配平系数（满音量、1.0 增益时）：六个音效靠这组系数
+            // 峰值就是配平系数（满音量、1.0 增益时）：七个音效靠这组系数
             // 在端点电平表上读到同一个数，换档不会突然响一大截或像没响。
             let peak = peaks(&bytes) as f32 / i16::MAX as f32;
             let want = trim_of(style);
@@ -809,6 +821,69 @@ mod tests {
         // 棘轮是「一下」，必须比铃音更短促。
         let ratchet = synth(VolumeSoundStyle::Ratchet).len() as f32 / RATE as f32 * 1000.0;
         assert!(ratchet <= 60.0, "棘轮 {ratchet:.0}ms 太长了");
+    }
+
+    /// 「脆」是能量的：把前 10ms 拆成几个频点算频谱质心。
+    ///
+    /// 参考是 B 站那两段棘轮扳手（把音轨扒下来逐下量过：能量铺在 500Hz~6kHz，
+    /// 3k 一带最集中，低频只占一成）。这一版是宽带噪声 + 2.45k/3.4k/5.2k 三个
+    /// 金属模，质心必须留在 2.8kHz 以上 —— 掉下去就是又变回「咚」了。
+    #[test]
+    fn ratchet_stays_crisp() {
+        let samples = synth(VolumeSoundStyle::Ratchet);
+        // 想看波形就设 BOLUME_DUMP_SOUND=1，会写一份 wav 到 target/ 下。
+        if std::env::var_os("BOLUME_DUMP_SOUND").is_some() {
+            let _ = std::fs::write("target/ratchet_new.wav", encode(&samples, 1.0));
+        }
+        let centroid = centroid(&samples);
+        println!("棘轮质心 {centroid:.0}Hz");
+        assert!(centroid > 2_800.0, "棘轮质心只有 {centroid:.0}Hz，听着会发闷");
+    }
+
+    /// 1/3 倍频程能量加权出来的频谱质心（前 23ms）。
+    ///
+    /// 单点 DFT 在噪声上抖得厉害（同样是「脆」，读数能差 1000Hz），
+    /// 按倍频程把一片格子加起来才稳 —— 参考录音也用同一把尺子量，
+    /// 量出来是 3300Hz 上下。
+    fn centroid(samples: &[f32]) -> f32 {
+        const BANDS: [f32; 21] = [
+            125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0, 1_000.0, 1_250.0,
+            1_600.0, 2_000.0, 2_500.0, 3_150.0, 4_000.0, 5_000.0, 6_300.0, 8_000.0, 10_000.0,
+            12_500.0,
+        ];
+        let take = ((RATE as f32 * 0.023) as usize).min(samples.len());
+        let window = &samples[..take];
+        let mut total = 0.0;
+        let mut weighted = 0.0;
+        for center in BANDS {
+            let (low, high) = (center / 1.122, center * 1.122);
+            // 每一格 43Hz（1024 点窗），落在这一档里的都加起来。
+            let mut magnitude = 0.0;
+            let mut bin = ((low * take as f32 / RATE as f32).floor() as usize).max(1);
+            let stop = ((high * take as f32 / RATE as f32).ceil() as usize).min(take / 2);
+            let mut count = 0;
+            while bin <= stop {
+                let omega = TAU * bin as f32 / take as f32;
+                let (mut re, mut im) = (0.0f32, 0.0f32);
+                for (index, value) in window.iter().enumerate() {
+                    let angle = omega * index as f32;
+                    re += value * angle.cos();
+                    im -= value * angle.sin();
+                }
+                magnitude += (re * re + im * im).sqrt() / take as f32;
+                count += 1;
+                bin += 1;
+            }
+            // 取每格平均：高端一格里挤的 bin 多，直接求和会把白噪声读成「高频很亮」。
+            magnitude /= count.max(1) as f32;
+            total += magnitude;
+            weighted += center * magnitude;
+        }
+        if total > 0.0 {
+            weighted / total
+        } else {
+            0.0
+        }
     }
 
     /// 三种手势各自看自己的勾，总开关关掉一律不响。
