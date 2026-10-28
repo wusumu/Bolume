@@ -37,9 +37,14 @@ const CAPTION_HEIGHT: f32 = 20.0;
 /// 卡片宽度：原来的 216 够放 `Headphones (Meizu HiFi DAC…)` 这一档设备名。
 const WIDTH: f32 = 216.0;
 /// 行首图标块宽度：有图标的行和没图标的行文字左沿要齐。
-const ICON_SLOT: f32 = 18.0;
+const ICON_SLOT: f32 = 20.0;
 /// 图标与文字之间的间隙。
-const ICON_GAP: f32 = 7.0;
+const ICON_GAP: f32 = 6.0;
+/// 行首图标尺寸。
+///
+/// 13 那档在 24×24 的线条图上等于把描边压到 0.95px，抗锯齿糊成一团灰 ——
+/// 音箱只剩个方框、耳机看不出是耳机。16 是这里能摆进 28 高行里的最大值。
+const ICON_SIZE: f32 = 16.0;
 /// 离屏幕边至少留这么多。
 const EDGE_MARGIN: f32 = 4.0;
 
@@ -146,7 +151,7 @@ impl AppMenu {
         rows.push(Row::Item {
             action: Action::Rename,
             label: lang.pick("重命名", "Rename").to_string(),
-            icon: None,
+            icon: Some("pencil".to_string()),
             checked: false,
         });
         rows.push(Row::Item {
@@ -157,7 +162,15 @@ impl AppMenu {
                 lang.pick("折叠此应用", "Collapse this app")
             }
             .to_string(),
-            icon: None,
+            // 折叠 / 取消折叠就是箭头朝里收还是朝外放，不另配两张图形。
+            icon: Some(
+                if target.hidden {
+                    "unfold"
+                } else {
+                    "fold"
+                }
+                .to_string(),
+            ),
             checked: false,
         });
         // 系统声音没有独立会话，响度均衡对它不生效（音频线程那边也是直接跳过）。
@@ -165,7 +178,7 @@ impl AppMenu {
             rows.push(Row::Item {
                 action: Action::ToggleLoudness,
                 label: lang.pick("响度均衡", "Loudness equalization").to_string(),
-                icon: None,
+                icon: Some("levels".to_string()),
                 checked: target.loudness,
             });
         }
@@ -179,7 +192,8 @@ impl AppMenu {
             rows.push(Row::Item {
                 action: Action::Route(None),
                 label: lang.pick("跟随默认设备", "Default device").to_string(),
-                icon: None,
+                // 不指定设备 = 用系统默认那台音箱。
+                icon: Some("speaker".to_string()),
                 checked: target.device_id.is_none(),
             });
             let devices = self.snapshot.borrow().devices.clone();
@@ -362,7 +376,7 @@ impl AppMenu {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(icon(name, 13.0, if *checked {
+                            .child(icon(name, ICON_SIZE, if *checked {
                                 theme::accent()
                             } else {
                                 theme::text_tertiary()

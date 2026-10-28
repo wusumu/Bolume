@@ -142,9 +142,11 @@ impl Page {
             Self::Devices => "headphones",
             Self::Appearance => "palette",
             Self::Volume => "volume-high",
-            // 面板 = 那条音量面板本身，用条状图标；托盘用喇叭。
-            Self::Panel => "volume-bar-high",
-            Self::Tray => "speaker",
+            // 面板 = 从屏幕底边弹出来的那块卡片；托盘 = 任务栏上那个小方图标。
+            // 别再拿音量条 / 喇叭顶替：左侧导航里「音量」「面板」「托盘」三页
+            // 各是各的事，图标重复了分不清点的是哪一页。
+            Self::Panel => "panel",
+            Self::Tray => "tray",
             Self::Shortcuts => "keyboard",
             Self::Osd => "monitor",
             Self::Blocklist => "ban",

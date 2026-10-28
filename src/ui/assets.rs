@@ -66,6 +66,13 @@ icon_assets!(
     "levels",
     "wifi",
     "bluetooth",
+    "pencil",
+    "fold",
+    "unfold",
+    "panel",
+    "restart",
+    "dialog",
+    "tray",
 );
 
 pub struct Assets;

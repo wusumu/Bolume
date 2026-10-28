@@ -34,9 +34,14 @@ const MIN_WIDTH: f32 = 168.0;
 /// 分隔线占的高度（1px 线 + 上下留白）。
 const SEPARATOR_HEIGHT: f32 = 9.0;
 /// 行首图标块宽度：有图标的行和没图标的行文字左沿要齐。
-const ICON_SLOT: f32 = 18.0;
+const ICON_SLOT: f32 = 20.0;
 /// 图标与文字之间的间隙。
-const ICON_GAP: f32 = 7.0;
+const ICON_GAP: f32 = 6.0;
+/// 行首图标尺寸。
+///
+/// 13 那档等于把 24×24 线条图的描边压到 0.95px，抗锯齿糊成一团灰；
+/// 24 高的菜单行里 16 是还能留出上下各 4px 的最大值。
+const ICON_SIZE: f32 = 16.0;
 /// 行尾预留（勾选圆点 / 子菜单箭头）。
 const TAIL: f32 = 16.0;
 
@@ -56,6 +61,8 @@ enum Row {
     Action {
         id: String,
         label: String,
+        /// 动作图标；认不出的 id 就是 `None`（只留空位，文字仍对齐）。
+        icon: Option<&'static str>,
     },
     Folder {
         label: String,
@@ -374,30 +381,32 @@ impl TrayMenu {
                     this.hide_and(window, cx, &id);
                 });
                 self.item_row(
-                    name,
+                    Some(name.as_str()),
                     label,
                     if *checked {
                         theme::accent()
                     } else {
                         theme::text_primary()
                     },
-                    false,
                     Some(*checked),
                     None,
                     self.hovered == Some(index),
                     click,
                 )
             }
-            Row::Action { id, label } => {
+            Row::Action {
+                id,
+                label,
+                icon: action_icon,
+            } => {
                 let id = id.clone();
                 let click = cx.listener(move |this, _: &MouseUpEvent, window, cx| {
                     this.hide_and(window, cx, &id);
                 });
                 self.item_row(
-                    "chevron-right",
+                    *action_icon,
                     label,
                     theme::text_primary(),
-                    true,
                     None,
                     None,
                     self.hovered == Some(index),
@@ -412,14 +421,13 @@ impl TrayMenu {
                     cx.notify();
                 });
                 self.item_row(
-                    "folder",
+                    Some("folder"),
                     label,
                     if open {
                         theme::accent()
                     } else {
                         theme::text_primary()
                     },
-                    false,
                     None,
                     Some(open),
                     // 子菜单展开着的那一行也保持高亮，否则「点了哪个子菜单」得靠颜色猜。
@@ -441,16 +449,19 @@ impl TrayMenu {
                 .px(px(6.))
                 .child(div().w_full().h(px(1.)).bg(theme::border()))
                 .into_any_element(),
-            Row::Action { id, label } => {
+            Row::Action {
+                id,
+                label,
+                icon: action_icon,
+            } => {
                 let id = id.clone();
                 let click = cx.listener(move |this, _: &MouseUpEvent, window, cx| {
                     this.hide_and(window, cx, &id);
                 });
                 self.item_row(
-                    "chevron-right",
+                    *action_icon,
                     label,
                     theme::text_primary(),
-                    true,
                     None,
                     None,
                     self.hovered_sub == Some(index),
@@ -477,13 +488,11 @@ impl TrayMenu {
     }
 
     /// 通用的菜单行外壳：悬停高亮、按下执行、可选右侧标记。
-    #[allow(clippy::too_many_arguments)]
     fn item_row(
         &self,
-        icon_name: &str,
+        icon_name: Option<&str>,
         label: &str,
         color: gpui::Hsla,
-        plain: bool,
         checked: Option<bool>,
         arrow: Option<bool>,
         hovered: bool,
@@ -504,20 +513,17 @@ impl TrayMenu {
             // 按下只高亮，**抬起**才执行 —— 跟原生菜单一致：按错了可以把光标
             // 拖出去再松手，这一项就不会被触发。
             .on_mouse_up(MouseButton::Left, onclick);
-        // 「纯动作行」不放图标，但左沿要跟设备行对齐，留同样宽的坑。
-        if plain {
-            row = row.child(div().w(px(ICON_SLOT)).flex_none());
-        } else {
-            row = row.child(
-                div()
-                    .w(px(ICON_SLOT))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(icon_name, 13.0, color)),
-            );
-        }
+        // 认不出的动作只留同样宽的空坑，文字左沿才不会跟着跳。
+        row = row.child(match icon_name {
+            Some(name) => div()
+                .w(px(ICON_SLOT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(name, ICON_SIZE, color)),
+            None => div().w(px(ICON_SLOT)).flex_none(),
+        });
         row = row.child(
             div()
                 .flex_1()
@@ -653,6 +659,29 @@ impl Render for TrayMenu {
 }
 
 /// 把配置里的菜单布局摊平成行列表（设备块会展开成一串设备行）。
+/// 菜单动作对应的图标（`assets/icons/<name>.svg`）。
+///
+/// 只认 `gui::tray_action_label` 里那张 id 表；配置里混进别的 id 时返回 `None`，
+/// 那一行只留空位 —— 不能拿一个「看起来像图标」的占位图糊过去。
+///
+/// 新旧两个入口指向同一样东西，就用同一张图：`音量合成器 [旧]` 和 `音量合成器`
+/// 都是推子，`声音设置 [旧]` 和 `声音设置` 都是那个对话框。同一个功能配两种图形，
+/// 只会让人以为它们干的事不一样。
+fn action_icon(id: &str) -> Option<&'static str> {
+    Some(match id {
+        // 弹面板用「窗口 + 底栏」：这块东西就是从屏幕底部弹出来的。
+        "toggle" => "panel",
+        "apps-volume" | "legacy-mixer" => "adjustments",
+        "sound-settings" | "legacy-sounds" => "dialog",
+        "legacy-playback" => "headphones",
+        "legacy-recording" => "microphone",
+        "restart" => "restart",
+        "settings" => "settings",
+        "quit" => "power",
+        _ => return None,
+    })
+}
+
 fn build_rows(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo]) -> Vec<Row> {
     let lang = cfg.language;
     let mut rows: Vec<Row> = Vec::new();
@@ -700,6 +729,7 @@ fn build_rows(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo])
                     crate::gui::tray_action_label(lang, &child.id).map(|label| Row::Action {
                         id: child.id.clone(),
                         label: label.to_string(),
+                        icon: action_icon(&child.id),
                     })
                 })
                 .collect();
@@ -717,6 +747,7 @@ fn build_rows(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo])
             rows.push(Row::Action {
                 id: node.id.clone(),
                 label: label.to_string(),
+                icon: action_icon(&node.id),
             });
         }
     }
