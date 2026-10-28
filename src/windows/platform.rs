@@ -3,18 +3,20 @@
 use gpui::{Bounds, Pixels, Window};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
-    Foundation::HWND,
+    Foundation::{HWND, RECT},
     Graphics::Dwm::{
         DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_TRANSITIONS_FORCEDISABLED,
         DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmSetWindowAttribute,
     },
     UI::WindowsAndMessaging::{
-        FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect,
-        HWND_NOTOPMOST,
-        HWND_TOP, HWND_TOPMOST, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_CAPTION,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_SYSMENU, WS_THICKFRAME,
+        FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetClientRect,
+        GetTopWindow, GetWindow,
+        GetWindowLongPtrW, GetWindowRect, HWND_NOTOPMOST,
+        HWND_TOP, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+        SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        ShowWindow, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_SYSMENU, WS_THICKFRAME,
     },
 };
 
@@ -607,12 +609,89 @@ pub fn present_behind_taskbar(window: &Window) {
 /// 把提示条压到任务栏后面就等于排到它下头 —— 用户看到的就是「全屏时提示条
 /// 被画面盖住」（全屏禁用那个开关关着也一样，因为这里根本走不到那条判断）。
 /// 全屏时任务栏本来就看不见，提到最前没有「从任务栏前面滑过去」的副作用。
+///
+/// 非全屏也有同样的问题：任务栏之外还有别的置顶窗口，谁抢到了组首，
+/// 「任务栏之后」就落到谁下面。所以先问一句这块地方有没有人压着（
+/// [`covered_by_other_topmost`]），有就直接提到最前。
+///
+/// 只用在**滑动阶段**（起点 / 出场前）：那几帧要的就是被任务栏挡住。
+/// 停留展示时必须换 [`raise_osd`]。
 pub fn place_osd(window: &Window) {
-    if crate::platform::fullscreen::is_fullscreen() {
+    if crate::platform::fullscreen::is_fullscreen() || covered_by_other_topmost(window) {
         bring_to_front(window);
     } else {
         present_behind_taskbar(window);
     }
+}
+
+/// 提示条要占的那块地方，现在有没有「别人的置顶窗口」压着。
+///
+/// `place_osd` 拿它决定这一轮还要不要往任务栏后面压：任务栏之后并不等于最前，
+/// 别的置顶窗口只要抢到了组首就会把提示条整块埋掉 —— 而那时候
+/// 「从任务栏背后滑出来」本来也看不见，不如直接提到最前。
+///
+/// **不能**用 `WindowFromPoint` 采样：提示条自己这会儿正摆在那块位置上，
+/// 命中永远落在它身上，看不出底下压着谁。只能顺着 z 序从头往下走，
+/// 看「和卡片矩形相交、又不是自己 / 任务栏」的置顶窗口是不是排在它前面。
+///
+/// 走到自己之后还要继续：z 序最前面偶尔夹着不是置顶的 UIAccess / 输入法窗口，
+/// 遇到它们就停会把后面的置顶窗口全漏掉。
+fn covered_by_other_topmost(window: &Window) -> bool {
+    let Some(hwnd) = hwnd_of(window) else {
+        return false;
+    };
+    let mut card = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut card) }.is_err() {
+        return false;
+    }
+    let Ok(mut cur) = (unsafe { GetTopWindow(None) }) else {
+        return false;
+    };
+    // 还没走到提示条自己：这一段里的置顶窗口都压在它上面。
+    let mut ahead = true;
+    loop {
+        if cur == hwnd {
+            ahead = false;
+        } else if ahead && unsafe { IsWindowVisible(cur) }.as_bool() {
+            let ex = unsafe { GetWindowLongPtrW(cur, GWL_EXSTYLE) } as u32;
+            if ex & WS_EX_TOPMOST.0 != 0 && !is_taskbar(cur) {
+                let mut other = RECT::default();
+                if unsafe { GetWindowRect(cur, &mut other) }.is_ok() && overlaps(&other, &card) {
+                    return true;
+                }
+            }
+        }
+        cur = match unsafe { GetWindow(cur, GW_HWNDNEXT) } {
+            Ok(next) if !next.is_invalid() => next,
+            _ => return false,
+        };
+    }
+}
+
+/// 两个矩形是否相交（只判有没有，不要交集本身）。
+fn overlaps(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// 任务栏（主屏 / 副屏各一扇）。
+fn is_taskbar(hwnd: HWND) -> bool {
+    let mut buffer = [0u16; 64];
+    let length = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    if length <= 0 {
+        return false;
+    }
+    let class = String::from_utf16_lossy(&buffer[..length as usize]);
+    matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+/// 提示条（OSD）进入展示阶段：提到 TOPMOST 组**最前**，压过所有置顶窗口。
+///
+/// 和 [`place_osd`] 的区别只在非全屏时：那条路把它插到任务栏后面，原本是为了
+/// 「从任务栏背后滑出来」的观感，代价是别的置顶窗口只要排在任务栏前面
+/// （很多播放器、悬浮窗都会抢组首），提示条就落到它们下面、干脆看不见。
+/// 停留期间任务栏和卡片不重叠，提到最前没有任何看得出的副作用。
+pub fn raise_osd(window: &Window) {
+    bring_to_front(window);
 }
 
 /// 整个窗口的不透明度（0.0 ~ 1.0），照搬 QcClip 的 `set_window_opacity`。

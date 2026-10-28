@@ -1042,6 +1042,12 @@ pub struct Osd {
     /// 「全部显示器」时每块屏一扇窗，各自钉在自己那块上；
     /// 「跟随鼠标」时由调用方现算出序号再钉上来。
     monitor: Option<u32>,
+    /// 上一次把窗口提到 TOPMOST 组最前的时间。
+    ///
+    /// 停留期间隔一段重申一次：有些置顶软件（播放器、悬浮窗、游戏内覆盖层）
+    /// 会周期性调 `SetWindowPos(HWND_TOPMOST)` 把自己抢回组首，一被抢走
+    /// 提示条就整块埋在它下面。只动 z 序、不激活，看不出闪烁。
+    last_raise: Instant,
 }
 
 /// 显示阶段：等首帧 / 淡入 / 停留 / 淡出。
@@ -1102,6 +1108,13 @@ fn resolve_hold(hold: &mut OsdHold, real: (f32, bool)) -> bool {
 /// 等首帧的时长：两个 16ms 的 tick，足够 gpui 走完一次绘制。
 const WARMUP: Duration = Duration::from_millis(32);
 
+/// 停留期间多久重申一次「我在最前」。
+///
+/// 间隔取 250ms：够快，抢层级的置顶软件（多数按帧或按几百毫秒重设）
+/// 撑不满两次调整之间的空档；又比每帧重申省得多 —— `SetWindowPos` 只动 z 序、
+/// 不带 `SWP_NOZORDER` 之外的重活，一秒钟四次完全看不出闪烁。
+const RAISE_INTERVAL: Duration = Duration::from_millis(250);
+
 impl Osd {
     pub fn new(
         config: Rc<RefCell<ConfigStore>>,
@@ -1134,6 +1147,7 @@ impl Osd {
             dismissing: false,
             time_text: Vec::new(),
             monitor: None,
+            last_raise: Instant::now(),
         }
     }
 
@@ -1307,9 +1321,9 @@ impl Osd {
                 self.last_offset = f32::NAN;
                 self.alpha = if enters { alpha } else { 1.0 };
                 self.apply_alpha(window, &cfg);
-                // 只能压回「任务栏之后」：`bring_to_front` 会把它插到任务栏前面，
-                // 之后收起（哪怕是淡出）就从任务栏上面过去了。
-                crate::windows::platform::place_osd(window);
+                // 不滑动的这一档没有「被任务栏遮住」的需求，直接提到最前 ——
+                // 压回任务栏之后的话，别的置顶窗口会把它盖掉。
+                crate::windows::platform::raise_osd(window);
             }
         } else {
             // 位置和透明度这一轮归滑动线程管，`place` 先按目标位置摆好。
@@ -1347,10 +1361,10 @@ impl Osd {
                     0.0,
                 );
             } else {
-                // 连续调节（卡片已经在屏幕上）：只压回任务栏之后。
-                // 以前这里是 `bring_to_front`，第二次调节就把它顶到任务栏前面，
-                // 收起时整张卡从任务栏上面滑下去。
-                crate::windows::platform::place_osd(window);
+                // 连续调节（卡片已经在屏幕上）：没在滑动，直接提到最前。
+                // 出场前（`Phase::Hold` 结束时）会重新压回任务栏之后，
+                // 所以「滑下去那一段被任务栏挡住」照样成立。
+                crate::windows::platform::raise_osd(window);
             }
             self.apply_alpha(window, &cfg);
         }
@@ -1827,10 +1841,10 @@ impl Osd {
                         self.phase = Phase::Hold {
                             until: now + Duration::from_millis(cfg.hold_ms as u64),
                         };
-                        // 滑到位了：留在任务栏之后（topmost 组里仅次于任务栏）。
-                        // 别在这里提回最上层 —— 一提就压到任务栏前面，之后出场那一段
-                        // 就变成「从任务栏上面消失」。
-                        crate::windows::platform::place_osd(window);
+                        // 滑到位了：这一轮「被任务栏挡住」的需求结束，提到最前。
+                        // 出场前 `Phase::Hold` 结束时会再压回任务栏之后，
+                        // 所以收起来那一段照样是「从任务栏背后滑下去」。
+                        crate::windows::platform::raise_osd(window);
                     }
                 } else {
                     self.offset = 0.0;
@@ -1848,6 +1862,12 @@ impl Osd {
             Phase::Hold { until } => {
                 self.offset = 0.0;
                 self.alpha = 1.0;
+                // 停留期间守住组首：会有置顶软件周期性把自己抢回最前，
+                // 被抢走的话提示条就整块埋在它下面（用户：「置顶的软件就抢不过了」）。
+                if self.last_raise.elapsed() >= RAISE_INTERVAL {
+                    crate::windows::platform::raise_osd(window);
+                    self.last_raise = now;
+                }
                 if now >= until {
                     // 出场前再压一次：整段动画里只有这一步会「从任务栏前面滑下去」，
                     // 谁在这之前把它提上去了（首帧 resize、激活、系统重排）在这儿兜住。
@@ -2088,8 +2108,8 @@ impl Osd {
                 self.state = self.build_state(&OsdRequest::device(OsdFunction::Volume), &cfg);
                 self.place(window, cx, &cfg);
                 crate::windows::platform::set_visible(window, true);
-                // 预览也一样：排任务栏之后，别顶到它前面去。
-                crate::windows::platform::place_osd(window);
+                // 预览也一样要压在设置窗上面（设置窗自己也是置顶的）。
+                crate::windows::platform::raise_osd(window);
                 self.visible = true;
             }
             self.alpha = 1.0;
