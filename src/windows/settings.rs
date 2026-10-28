@@ -4,13 +4,14 @@
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::Arc,
 };
 
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, ElementId, FocusHandle,
-    IntoElement, KeyDownEvent, Modifiers, MouseButton, Pixels, Render, SharedString, Window, div,
-    px, relative, rgba,
+    IntoElement, KeyDownEvent, Modifiers, MouseButton, Pixels, Render, RenderImage, SharedString,
+    Window, div, img, px, relative, rgba,
 };
 
 use crate::{
@@ -318,6 +319,12 @@ pub struct Settings {
     /// 只活在这一次设置窗里：它记的是「刚才在色轮里调成什么」，不是持久偏好，
     /// 没必要写进配置文件。
     color_memory: std::collections::HashMap<ColorTarget, String>,
+    /// 捐赠浮层是不是开着（「关于」页那行按钮点开的收款码）。
+    ///
+    /// 只是界面状态，不落盘：关掉窗口再打开就该是收着的。
+    donate_open: bool,
+    /// 收款码解码后的图：解一次就留着，浮层重画不用反复解 PNG。
+    donate_image: RefCell<Option<Arc<RenderImage>>>,
 }
 
 /// 往黑名单里加一条的结果。
@@ -1822,6 +1829,8 @@ impl Settings {
             block_notice: None,
             color_wheel: None,
             color_memory: std::collections::HashMap::new(),
+            donate_open: false,
+            donate_image: RefCell::new(None),
         }
     }
 
@@ -13944,7 +13953,7 @@ impl Settings {
         ]
     }
 
-    fn about_page(&self, lang: Lang) -> Vec<AnyElement> {
+    fn about_page(&self, lang: Lang, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let row = |title: &'static str, value: String| -> AnyElement {
             div()
                 .flex()
@@ -14000,6 +14009,24 @@ impl Settings {
                         lang.pick("打开", "Open"),
                         |_, _| crate::platform::shell::open_url(ISSUES_URL),
                     ),
+                    // 捐赠打开的是窗口里的收款码浮层，不是外链 —— 收款码是张图，
+                    // 得在这儿看。闭包拿不到 `self`，走弱引用回实体里翻开关。
+                    self.action_row(
+                        "donate",
+                        lang.pick("捐赠", "Donate"),
+                        lang.pick("微信 / 支付宝", "WeChat Pay / Alipay").to_string(),
+                        lang.pick("查看", "Show"),
+                        {
+                            let this = cx.entity().downgrade();
+                            move |window: &mut Window, cx: &mut App| {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.donate_open = true;
+                                    cx.notify();
+                                });
+                                window.refresh();
+                            }
+                        },
+                    ),
                 ],
             ),
             div()
@@ -14012,6 +14039,142 @@ impl Settings {
                 ))
                 .into_any_element(),
         ]
+    }
+
+    /// 捐赠浮层：整块背板压暗，中间一张收款码卡片。
+    ///
+    /// 图是 367×232 的横图（微信在左、支付宝在右），按原始像素摆出来最清楚 ——
+    /// 缩放插值会让二维码边缘发虚，手机上不一定扫得出来。换图时这张常量要跟着改
+    /// （尺寸由 `assets/donate.png` 决定）。
+    fn donate_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
+        const QR_W: f32 = 367.0;
+        const QR_H: f32 = 232.0;
+
+        if !self.donate_open {
+            return None;
+        }
+        // 首帧解一次就缓存：这张图 51 KB，解码完接近 340 KB，没必要每次重画都解。
+        if self.donate_image.borrow().is_none() {
+            *self.donate_image.borrow_mut() = crate::ui::assets::donate_image();
+        }
+        let qr = self.donate_image.borrow().clone();
+
+        let qr_element: AnyElement = match qr {
+            Some(qr) => img(qr)
+                .w(px(QR_W))
+                .h(px(QR_H))
+                .rounded(px(theme::RADIUS_SMALL))
+                .into_any_element(),
+            // 理论上不会走到（图是编进 exe 的），真解不出来也别留一块空白。
+            None => div()
+                .w(px(QR_W))
+                .h(px(QR_H))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::RADIUS_SMALL))
+                .bg(theme::track())
+                .text_size(theme::fs(11.))
+                .text_color(theme::text_tertiary())
+                .child(lang.pick("收款码加载失败", "Could not load the code"))
+                .into_any_element(),
+        };
+
+        let card = div()
+            .id("donate-card")
+            .flex_none()
+            .w(px(QR_W + 36.))
+            .p(px(18.))
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::surface_elevated())
+            // 卡片上的按下不再往背板传，否则点图也会把浮层关掉。
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(theme::fs(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(lang.pick("捐赠", "Donate")),
+                    )
+                    .child(
+                        div()
+                            .id("donate-close")
+                            .flex_none()
+                            .size(px(20.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_SMALL))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::surface_hover()))
+                            // 浮层里的子元素用 `on_mouse_down`：`on_click` 在浮层里
+                            // 经常收不到（面板的提示条也踩过这个）。
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                                    this.donate_open = false;
+                                    window.refresh();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(icon("close", 12.0, theme::text_tertiary())),
+                    ),
+            )
+            .child(qr_element)
+            .child(
+                div()
+                    .text_size(theme::fs(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick(
+                        "微信或支付宝扫码支持，谢谢。",
+                        "Scan with WeChat Pay or Alipay to support the project. Thank you.",
+                    )),
+            );
+
+        Some(
+            div()
+                .id("donate-backdrop")
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size_full()
+                // 滚轮 / 点击都别漏给后面的页面；点背板（不是卡片）就收起来。
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgb_to_hsla(rgba(0x00000059)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        // 模态：这一下只用来关浮层，不再传给底下被遮住的那一页
+                        // （gpui 的鼠标派发是「所有 listener 都过一遍」，不主动拦就会
+                        // 顺手把下面的按钮也点掉）。
+                        cx.stop_propagation();
+                        if this.donate_open {
+                            this.donate_open = false;
+                            window.refresh();
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(card)
+                .into_any_element(),
+        )
     }
 
     /// 当前页的内容：每页一个滚动区，滚动位置各自记住。
@@ -14038,7 +14201,7 @@ impl Settings {
             Page::Osd => self.osd_page(config, lang, cx),
             Page::Blocklist => self.blocklist_page(config, lang, cx),
             Page::Appearance => self.appearance_page(config, lang, snapshot, cx),
-            Page::About => self.about_page(lang),
+            Page::About => self.about_page(lang, cx),
         };
         let body = div()
             .id("settings-page")
@@ -14120,6 +14283,10 @@ impl Render for Settings {
         if self.page != Page::Devices {
             self.icon_picker = None;
         }
+        // 捐赠浮层开在「关于」页，翻到别页还盖着就成了遮面板的一块黑。
+        if self.page != Page::About {
+            self.donate_open = false;
+        }
         // 设备下拉的两行都挂在开关下面：开关一关，行没了，下拉也得收。
         if let Some((which, _, _)) = self.picker {
             let alive = match which {
@@ -14163,6 +14330,7 @@ impl Render for Settings {
         let device_menu = self.device_menu_overlay(&config, lang, &snapshot, viewport, cx);
         let icon_picker = self.icon_picker_overlay(&config, lang, viewport, cx);
         let tray_menu = self.tray_menu_overlay(&config, lang, viewport, cx);
+        let donate = self.donate_overlay(lang, cx);
 
         div()
             .size_full()
@@ -14359,6 +14527,8 @@ impl Render for Settings {
             .children(tray_menu)
             // 色轮最后挂：它就是当前焦点，别的弹层都该被它盖住。
             .children(color_wheel)
+            // 捐赠浮层是模态，压在所有弹层之上。
+            .children(donate)
     }
 }
 

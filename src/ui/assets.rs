@@ -193,3 +193,26 @@ pub fn load_png_rgba(path: &PathBuf) -> Option<(u32, u32, Vec<u8>)> {
     let (width, height) = image.dimensions();
     Some((width, height, image.into_raw()))
 }
+
+/// 「关于」页里那张捐赠收款码（微信 / 支付宝二合一）。
+///
+/// 和图标一样编进 exe：绿色版只有一个 exe，旁边不摆图片文件。
+/// 换图只换 `assets/donate.png`，尺寸写在设置页的浮层里（367×232 的横图）。
+pub const DONATE_QR_PNG: &[u8] = include_bytes!("../../assets/donate.png");
+
+/// 把内嵌的收款码解成 gpui 能画的图。
+///
+/// `RenderImage` 要的是 BGRA，PNG 解出来是 RGBA，逐像素换一下再交给它
+/// （面板里的应用图标走的是同一套处理）。
+pub fn donate_image() -> Option<std::sync::Arc<gpui::RenderImage>> {
+    let decoded = image::load_from_memory(DONATE_QR_PNG).ok()?.into_rgba8();
+    let (width, height) = decoded.dimensions();
+    let mut rgba = decoded.into_raw();
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
+    Some(std::sync::Arc::new(gpui::RenderImage::new(vec![
+        image::Frame::new(buffer),
+    ])))
+}
