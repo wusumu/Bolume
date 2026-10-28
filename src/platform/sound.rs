@@ -46,9 +46,10 @@ const RATE: u32 = 44_100;
 
 /// 同时在途的缓冲上限。
 ///
-/// 「铃音」这种 300ms 的音效连着来，队列会一路排到天上去，手停下来还在「叮叮」；
-/// 排满就不再收新的。2 层 = 一个在放、一个等着，短音效照样连成串，
-/// 长音效最多拖后一声的时间。
+/// 排满就不再收新的：快拖滑条时缓冲一旦堆积，手停下来还会「叮叮」好几声，
+/// 听感就是「音效跟不上手」。2 层 = 一个在放、一个等着，短音效照样连成串。
+/// 铃音也在这个额度里 —— 它已经从 300ms 收到 150ms（见 `synth`），
+/// 就是为了别把队列占满。
 const MAX_VOICES: usize = 2;
 
 /// 自定义文件最多取这么长（秒）：音效是「一下」，不是播放器。
@@ -243,10 +244,17 @@ fn play(config: &Config) {
         match sink {
             Sink::Wave(player) => {
                 let clip = clip_for(&base, sound, gain, player.rate);
+                // 空 = 自定义文件读不出来，这一下就是不响（见 `build`）。
+                if clip.audio.is_empty() {
+                    return;
+                }
                 player.write(&clip);
             }
             Sink::Legacy => {
                 let bytes = wav_for(&base, sound, gain);
+                if bytes.is_empty() {
+                    return;
+                }
                 // `SND_NOSTOP`：正在响的那一声别被掐，这一发直接算失败。
                 unsafe {
                     PlaySoundW(
@@ -412,15 +420,16 @@ fn gain(percent: u32) -> f32 {
 }
 
 /// 生成一份 WAV：内置音效现算，自定义文件读盘 + 缩放。
+///
+/// 挑过自定义文件但读不出来（被删 / 被挪走 / 不是 WAV）时返回**空**，
+/// 也就是这一下不响 —— 用户选的是自己那一声，拿「轻点」顶包只会让人以为
+/// 「设置没生效」；设置页那边同时会标红提示重新选。
 fn build(sound: &crate::config::VolumeSoundConfig, gain: f32) -> Vec<u8> {
     if sound.uses_custom_file() {
-        if let Some(bytes) = std::fs::read(sound.custom_path())
+        return std::fs::read(sound.custom_path())
             .ok()
             .and_then(|raw| scale_wav(&raw, gain))
-        {
-            return bytes;
-        }
-        // 文件读不出来 / 不是 WAV：退回默认那一声，总比按了没反应好。
+            .unwrap_or_default();
     }
     encode(&synth(sound.style), gain)
 }
@@ -456,8 +465,11 @@ fn synth(style: VolumeSoundStyle) -> Vec<f32> {
         VolumeSoundStyle::Tick => 0.045,
         VolumeSoundStyle::Pop => 0.070,
         VolumeSoundStyle::Wood => 0.080,
+        VolumeSoundStyle::Ratchet => 0.042,
         VolumeSoundStyle::Blip => 0.060,
-        VolumeSoundStyle::Chime => 0.30,
+        // 「铃音」原来有 300ms，快拖时缓冲排到两声之后，手停了还在「叮」。
+        // 收到 150ms：还是那声「叮」，但连着响不会堆起来。
+        VolumeSoundStyle::Chime => 0.15,
         // 自定义没文件时按「轻点」算（和 `source_key` 里那条兜底一致）。
         VolumeSoundStyle::Custom => 0.034,
     };
@@ -495,17 +507,32 @@ fn synth(style: VolumeSoundStyle) -> Vec<f32> {
                 let knock = noise.next() * (-t / 0.002).exp() * 0.35;
                 attack(t, 0.0003) * (body + ring + knock)
             }
+            // 棘轮：一记干硬的金属齿「咔」—— 噪声尖 + 2.6k 的芯 + 一点低频实体，
+            // 9ms 后棘爪回弹一下更轻的「嗒」。比轻点更低、比木鱼更脆。
+            VolumeSoundStyle::Ratchet => {
+                let hit = noise.next() * (-t / 0.0018).exp() * 0.70;
+                let ring = (TAU * 2_650.0 * t).sin() * (-t / 0.0060).exp() * 0.45;
+                let body = (TAU * 820.0 * t).sin() * (-t / 0.0040).exp() * 0.30;
+                let snap = if t > 0.009 {
+                    let back = t - 0.009;
+                    noise.next() * (-back / 0.0012).exp() * 0.32
+                        + (TAU * 2_200.0 * back).sin() * (-back / 0.0030).exp() * 0.18
+                } else {
+                    0.0
+                };
+                attack(t, 0.0002) * (hit + ring + body + snap)
+            }
             // 电子：880Hz 过 tanh 近似方波，尾巴收得快。
             VolumeSoundStyle::Blip => {
                 let square = ((TAU * 880.0 * t).sin() * 3.0).tanh();
                 attack(t, 0.001) * square * (-t / 0.020).exp() * 0.4
             }
-            // 铃音：三个泛音叠一起，收得慢（「叮」）。
+            // 铃音：三个泛音叠一起，收得比早先快一倍（连着响才不拖）。
             VolumeSoundStyle::Chime => {
-                let root = (TAU * 1_046.5 * t).sin() * (-t / 0.10).exp() * 0.35;
-                let third = (TAU * 1_568.0 * t).sin() * (-t / 0.075).exp() * 0.18;
-                let fifth = (TAU * 2_093.0 * t).sin() * (-t / 0.050).exp() * 0.10;
-                attack(t, 0.004) * (root + third + fifth)
+                let root = (TAU * 1_046.5 * t).sin() * (-t / 0.048).exp() * 0.35;
+                let third = (TAU * 1_568.0 * t).sin() * (-t / 0.034).exp() * 0.18;
+                let fifth = (TAU * 2_093.0 * t).sin() * (-t / 0.022).exp() * 0.10;
+                attack(t, 0.003) * (root + third + fifth)
             }
         };
         samples.push(value);
@@ -527,6 +554,7 @@ fn trim_of(style: VolumeSoundStyle) -> f32 {
         VolumeSoundStyle::Tick => 0.48,
         VolumeSoundStyle::Pop => 0.50,
         VolumeSoundStyle::Wood => 0.93,
+        VolumeSoundStyle::Ratchet => 0.50,
         VolumeSoundStyle::Blip => 0.33,
         VolumeSoundStyle::Chime => 0.50,
     }
@@ -551,10 +579,20 @@ fn normalize(samples: &[f32], trim: f32) -> Vec<f32> {
     if peak <= f32::EPSILON {
         return samples.to_vec();
     }
-    samples
+    let mut out: Vec<f32> = samples
         .iter()
         .map(|value| (value / peak * trim).clamp(-1.0, 1.0))
-        .collect()
+        .collect();
+    // 收尾 5ms 淡出：波形在末尾还剩一点幅度时被硬切会「咔」一下，
+    // 铃音这种截短过的尤其明显。这条淡出对所有音效都一样，听不出来。
+    let fade = (RATE as f32 * 0.005) as usize;
+    let len = out.len();
+    if len > fade * 2 {
+        for (index, value) in out[len - fade..].iter_mut().enumerate() {
+            *value *= 1.0 - (index as f32 + 1.0) / fade as f32;
+        }
+    }
+    out
 }
 
 /// 采样 → 16 位单声道 WAV 字节。
@@ -737,6 +775,40 @@ mod tests {
     fn junk_is_rejected() {
         assert!(scale_wav(b"not a wave file at all", 1.0).is_none());
         assert!(scale_wav(&[], 1.0).is_none());
+    }
+
+    /// 自定义文件丢了：标成「找不到」，而且**不出声**（不能拿「轻点」顶包）。
+    #[test]
+    fn missing_custom_file_falls_silent() {
+        let sound = VolumeSoundConfig {
+            enabled: true,
+            style: VolumeSoundStyle::Custom,
+            custom: r"Z:\definitely\not\here\gone.wav".to_string(),
+            ..Default::default()
+        };
+        assert!(sound.uses_custom_file(), "填了路径，就该算「用自定义」");
+        assert!(sound.custom_missing(), "文件不存在要能判出来");
+        assert!(
+            build(&sound, 1.0).is_empty(),
+            "文件读不出来时这一下应该是静音，而不是换成别的音效"
+        );
+        // 没填路径不算「丢了」：那是还没选，界面走「先用轻点」那套。
+        let empty = VolumeSoundConfig {
+            style: VolumeSoundStyle::Custom,
+            ..Default::default()
+        };
+        assert!(!empty.custom_missing());
+        assert!(!build(&empty, 1.0).is_empty());
+    }
+
+    /// 铃音收短了：连着响时排队不会越积越长（早先 300ms，快拖会拖后两声）。
+    #[test]
+    fn chime_is_short_enough_to_keep_up() {
+        let ms = synth(VolumeSoundStyle::Chime).len() as f32 / RATE as f32 * 1000.0;
+        assert!(ms <= 200.0, "铃音 {ms:.0}ms 还是太长，连发会拖后");
+        // 棘轮是「一下」，必须比铃音更短促。
+        let ratchet = synth(VolumeSoundStyle::Ratchet).len() as f32 / RATE as f32 * 1000.0;
+        assert!(ratchet <= 60.0, "棘轮 {ratchet:.0}ms 太长了");
     }
 
     /// 三种手势各自看自己的勾，总开关关掉一律不响。

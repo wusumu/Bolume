@@ -321,6 +321,14 @@ impl VolumeSoundConfig {
         self.style == VolumeSoundStyle::Custom && !self.custom_path().is_empty()
     }
 
+    /// 挑过文件，但那个文件现在不在了。
+    ///
+    /// 这一刻不该拿别的音效顶包 —— 用户选的是自己的那一声，给它换成「轻点」
+    /// 只会让人以为「设置没生效」。设置页拿它标红，播放拿它直接静音。
+    pub fn custom_missing(&self) -> bool {
+        self.uses_custom_file() && std::fs::metadata(self.custom_path()).is_err()
+    }
+
     /// 音源标识（含文件时间戳）：音效缓存拿它当键，换了文件 / 改了文件就会重读。
     pub fn source_key(&self) -> String {
         if self.uses_custom_file() {
@@ -344,7 +352,8 @@ impl VolumeSoundConfig {
 /// 内置音效 + 「自定义」。
 ///
 /// 都是代码里合成的一段短音，各有个性：轻点短促、滴答清亮、气泡上滑、
-/// 木鱼发闷、电子带方波味、铃音拖得长一点。名字就是听感，不用再解释。
+/// 木鱼发闷、棘轮干硬、电子带方波味、铃音收得比早先短（连着响才不拖）。
+/// 名字就是听感，不用再解释。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VolumeSoundStyle {
@@ -357,6 +366,8 @@ pub enum VolumeSoundStyle {
     Pop,
     /// 木鱼：闷一点的木质敲击。
     Wood,
+    /// 棘轮：一记干硬的金属齿「咔」，尾巴带一点回弹。
+    Ratchet,
     /// 电子：方波味的「哔」。
     Blip,
     /// 铃音：拖得长一点的「叮」。
@@ -367,11 +378,12 @@ pub enum VolumeSoundStyle {
 
 impl VolumeSoundStyle {
     /// 界面里的顺序（分段选择按这个排）。
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Click,
         Self::Tick,
         Self::Pop,
         Self::Wood,
+        Self::Ratchet,
         Self::Blip,
         Self::Chime,
         Self::Custom,
@@ -384,6 +396,7 @@ impl VolumeSoundStyle {
             Self::Tick => "tick",
             Self::Pop => "pop",
             Self::Wood => "wood",
+            Self::Ratchet => "ratchet",
             Self::Blip => "blip",
             Self::Chime => "chime",
             Self::Custom => "custom",

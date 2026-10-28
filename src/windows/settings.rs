@@ -4565,6 +4565,7 @@ fn sound_style_label(style: crate::config::VolumeSoundStyle, lang: Lang) -> &'st
         VolumeSoundStyle::Tick => lang.pick("滴答", "Tick"),
         VolumeSoundStyle::Pop => lang.pick("气泡", "Pop"),
         VolumeSoundStyle::Wood => lang.pick("木鱼", "Wood"),
+        VolumeSoundStyle::Ratchet => lang.pick("棘轮", "Ratchet"),
         VolumeSoundStyle::Blip => lang.pick("电子", "Blip"),
         VolumeSoundStyle::Chime => lang.pick("铃音", "Chime"),
         VolumeSoundStyle::Custom => lang.pick("自定义", "Custom"),
@@ -8504,9 +8505,12 @@ impl Settings {
         let segmented = self.segmented("volume-sound-style", options, sound.style.index(), pick_style);
         let preview = {
             let store = self.config.clone();
-            self.preview_button("volume-sound-preview", lang, move || {
-                crate::platform::sound::preview(&store.borrow().get().clone())
-            })
+            self.preview_button(
+                "volume-sound-preview",
+                lang,
+                !sound.custom_missing(),
+                move || crate::platform::sound::preview(&store.borrow().get().clone()),
+            )
         };
         let style_row = div()
             .flex()
@@ -8612,24 +8616,25 @@ impl Settings {
         vec![master, self.sub_group(rows)]
     }
 
-    /// 「自定义音效」那一行：文件名 + 选择…。
+    /// 「自定义音效」那一行：路径 + 选择…。
+    ///
+    /// 路径写全（程序目录下的就写相对那一截，便携版挪文件夹也不至于看不懂）；
+    /// 文件不在了就标红并说明 —— 这时候试听也不出声，见 `sound::build`。
     fn sound_file_row(
         &self,
         sound: &crate::config::VolumeSoundConfig,
         lang: Lang,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let label = sound
-            .custom_path()
-            .rsplit(['\\', '/'])
-            .next()
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                lang.pick("还没选文件，先用「轻点」", "No file yet — using Click")
-                    .to_string()
-            });
+        let missing = sound.custom_missing();
+        let shown = if sound.custom_path().is_empty() {
+            lang.pick("还没选文件，先用「轻点」", "No file yet — using Click")
+                .to_string()
+        } else {
+            crate::app_paths::display_path(sound.custom_path())
+        };
         let store = self.config.clone();
+        let clear_store = self.config.clone();
         div()
             .flex()
             .items_center()
@@ -8646,16 +8651,36 @@ impl Settings {
                     .gap(px(2.))
                     .child(
                         div()
-                            .text_size(theme::fs(13.))
-                            .text_color(theme::text_primary())
-                            .child(lang.pick("自定义音效文件", "Custom sound file")),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme::fs(13.))
+                                    .text_color(theme::text_primary())
+                                    .child(lang.pick("自定义音效文件", "Custom sound file")),
+                            )
+                            .when(missing, |style| {
+                                style.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(theme::fs(10.5))
+                                        .text_color(theme::danger())
+                                        .child(lang.pick("找不到文件", "File not found")),
+                                )
+                            }),
                     )
                     .child(
                         div()
                             .text_size(theme::fs(10.5))
-                            .text_color(theme::text_tertiary())
+                            .text_color(if missing {
+                                theme::danger()
+                            } else {
+                                theme::text_tertiary()
+                            })
                             .truncate()
-                            .child(label),
+                            .child(shown),
                     ),
             )
             .child(
@@ -8702,14 +8727,44 @@ impl Settings {
                     )
                     .child(lang.pick("选择…", "Choose…")),
             )
+            // 移除：只在真的挑了文件时出现。点掉就回到「轻点」并收起这一行。
+            .when(!sound.custom_path().is_empty(), |style| {
+                style.child(
+                    div()
+                        .id("volume-sound-clear")
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(22.))
+                        .rounded(px(theme::RADIUS_SMALL))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                            let _ = clear_store.borrow_mut().update(|config| {
+                                config.volume_sound.custom.clear();
+                                // 留「自定义」的话这一行只会写着「还没选文件」，
+                                // 不如干脆退回去：移除本来就等于「不要这个了」。
+                                config.volume_sound.style =
+                                    crate::config::VolumeSoundStyle::Click;
+                            });
+                            refresh_ui(window, cx);
+                        }))
+                        .child(icon("close", 10.0, theme::text_tertiary())),
+                )
+            })
             .into_any_element()
     }
 
     /// 「试听」按钮（音效那一行右边那个小按钮）。
+    ///
+    /// `enabled = false` 时灰掉、连悬停反馈也没有：自定义文件丢了的那一刻，
+    /// 这一下确实没声，按钮就不该还装作能点。
     fn preview_button(
         &self,
         id: &'static str,
         lang: Lang,
+        enabled: bool,
         on_click: impl Fn() + 'static,
     ) -> AnyElement {
         div()
@@ -8719,10 +8774,17 @@ impl Settings {
             .py(px(2.))
             .rounded(px(4.))
             .text_size(theme::fs(11.))
-            .text_color(theme::text_secondary())
-            .cursor_pointer()
-            .hover(|style| style.bg(theme::surface_hover()))
-            .on_click(move |_, _, _| on_click())
+            .text_color(if enabled {
+                theme::text_secondary()
+            } else {
+                theme::text_tertiary()
+            })
+            .when(enabled, |style| {
+                style
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(move |_, _, _| on_click())
+            })
             .child(lang.pick("试听", "Test"))
             .into_any_element()
     }
