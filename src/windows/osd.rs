@@ -2107,8 +2107,8 @@ impl Osd {
 
     /// 钉住 / 取消钉住。
     ///
-    /// 钉住时提示条一直显示（设置页里对着调外观用）；再点一下回到
-    /// 正常的「停留后淡出」。还没显示过就先按当前音量弹一条。
+    /// 钉住时提示条一直显示（设置页里对着调外观用）；再点一下**立刻**淡出收起 ——
+    /// 不等停留时间，点完就该走。还没显示过就先按当前音量弹一条。
     pub fn set_pinned(&mut self, pinned: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.pinned = pinned;
         // 重新钉住说明用户又要长期看着它，把「收预览」的强制淡出撤掉。
@@ -2127,10 +2127,11 @@ impl Osd {
             self.phase = Phase::Hold {
                 until: Instant::now() + Duration::from_secs(3600),
             };
-        } else {
-            self.phase = Phase::Hold {
-                until: Instant::now() + Duration::from_millis(cfg.hold_ms as u64),
-            };
+        } else if self.visible {
+            // 再点一下是「收起来」：立刻淡出，不再等一轮停留时间。
+            // 用户已经盯着它调完了，多出来的那两秒只像「点了没反应」。
+            self.dismissing = true;
+            self.phase = Phase::Out(Instant::now());
         }
         self.apply_alpha(window, &cfg);
         cx.notify();
