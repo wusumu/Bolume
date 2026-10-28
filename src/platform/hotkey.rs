@@ -1448,7 +1448,8 @@ mod tests {
 
     /// 设置页里那个勾：勾上就参与，去掉就退出；总闸关掉时一律不连发。
     #[test]
-    fn hold_repeat_follows_the_per_key_ticks() {        let mut config = Config::default();
+    fn hold_repeat_follows_the_per_key_ticks() {
+        let mut config = Config::default();
         // 勾上切歌
         config.hotkey_repeat_actions.push("media_next".to_string());
         assert!(repeats_on_hold(&config, Action::MediaNext));
@@ -1458,6 +1459,29 @@ mod tests {
         // 总闸
         config.hotkey_hold_repeat = false;
         assert!(!repeats_on_hold(&config, Action::MediaNext));
+    }
+
+    /// 总闸只管「现在生效不生效」，不许动每个人挑过的键。
+    ///
+    /// 界面上的勾选框是照这份名单画的：关掉总闸再打开，原来勾的必须还在
+    /// （用户：「开启关闭都保存勾选状态不要丢」）。勾选框显示条件与
+    /// `repeats_on_hold` 是两件事 —— 后者含总闸，前者不能含。
+    #[test]
+    fn hold_repeat_switch_keeps_the_ticked_keys() {
+        let mut config = Config::default();
+        let before = config.hotkey_repeat_actions.clone();
+        assert!(!before.is_empty(), "默认就该勾着音量 / 亮度");
+
+        config.hotkey_hold_repeat = false;
+        assert_eq!(config.hotkey_repeat_actions, before, "关总闸抹掉了名单");
+        assert!(
+            Action::all().into_iter().all(|a| !repeats_on_hold(&config, a)),
+            "总闸关着时不该有任何动作连发"
+        );
+
+        config.hotkey_hold_repeat = true;
+        assert_eq!(config.hotkey_repeat_actions, before, "开总闸动了名单");
+        assert!(repeats_on_hold(&config, Action::VolumeUp));
     }
 
     /// 被钩子吞掉的键在系统那边当没按过，连发循环只能看自己的按下表。

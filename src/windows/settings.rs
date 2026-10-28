@@ -190,6 +190,13 @@ pub struct Settings {
     /// `stop_propagation` 了，但 gpui 的 click 是另一条链路，万一还是冒上来，
     /// 清完立刻又被打开录制，看着就像「没清掉」。用 400ms 的时间窗兜一下。
     just_cleared: Option<(HotkeySlot, usize, std::time::Instant)>,
+    /// 光标正停在哪一行的「连续触发」勾选框上（行 id）。
+    ///
+    /// 方框只有 14px、旁边又没字，得靠悬浮气泡说清它管什么。气泡是行里
+    /// **最后**一个子元素 —— 放前面会被后面的标题文字盖住（gpui 没有 z-index，
+    /// 后画的在上），越出行边界的又会被下一行或卡片的 `overflow_hidden` 吃掉。
+    /// 所以只能靠这个状态决定「这一行要不要多画一个气泡」。
+    repeat_tip: Option<&'static str>,
     /// 快捷键页当前在哪一页签：0 = 音频设备，1 = 屏幕设备。
     ///
     /// 只是界面状态，不落盘：下次打开回到第一页，免得一进来就是空的第二页。
@@ -1764,6 +1771,7 @@ impl Settings {
             size_generation: Rc::new(std::cell::Cell::new(0)),
             focus: cx.focus_handle(),
             capturing: None,
+            repeat_tip: None,
             just_cleared: None,
             shortcut_tab: 0,
             appearance_tab: 0,
@@ -4132,6 +4140,10 @@ impl Settings {
         }
 
         // 连发勾选：配置里存的是动作名（`Action::key`），点一下增删一项。
+        //
+        // 「勾没勾」只看名单里有没有这个动作，跟总闸（`hotkey_hold_repeat`）无关 ——
+        // 总闸只是把它暂停，不该顺手把每个人挑过的键清掉；关掉再打开，原来勾的还在。
+        let hold_on = self.config.borrow().get().hotkey_hold_repeat;
         let repeat_on = self
             .config
             .borrow()
@@ -4174,19 +4186,60 @@ impl Settings {
             .cursor_pointer()
             .hover(|style| style.border_color(theme::accent()))
             .on_click(move |_, window, cx| toggle_repeat(window, cx))
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                let next = if *hovered {
+                    Some(id)
+                } else if this.repeat_tip == Some(id) {
+                    None
+                } else {
+                    this.repeat_tip
+                };
+                if this.repeat_tip != next {
+                    this.repeat_tip = next;
+                    cx.notify();
+                }
+            }))
             .when(repeat_on, |style| {
                 style.child(icon("check", 11.0, theme::text_primary()))
             });
 
+        // 悬浮气泡：光标停在方框上才画出来。
+        //
+        // 位置跟着行内坐标走（`left(26)` = 方框右边留 4px），高度顶满整行 ——
+        // 不越界才不会被下一行或卡片的 `overflow_hidden` 盖掉。
+        let tip_on = self.repeat_tip == Some(id);
+        let tip = div()
+            .absolute()
+            .left(px(26.))
+            .top(px(0.))
+            .bottom(px(0.))
+            .pl(px(7.))
+            .pr(px(9.))
+            .flex()
+            .items_center()
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::surface_elevated())
+            .border(px(1.))
+            .border_color(theme::border())
+            .text_size(theme::fs(10.))
+            .text_color(theme::text_secondary())
+            .child(lang.pick(
+                "按住这个键不松手时连续触发",
+                "Repeats while the key is held down",
+            ));
+
         div()
             .id(SharedString::from(id))
+            .relative()
             .flex()
             .items_center()
             .gap(px(8.))
             .px(px(9.))
             .py(px(5.))
             .rounded(px(theme::RADIUS_ROW))
-            .child(check_box)
+            // 勾选这一列只在「按住连续触发」开着时出现：关掉之后整列收起，
+            // 行也回到原来那样紧凑。
+            .when(hold_on, |row| row.child(check_box))
             .child(
                 div()
                     .flex_1()
@@ -4197,6 +4250,8 @@ impl Settings {
                     .child(title),
             )
             .child(chips)
+            // 最后画：压在标题上面，才像一条浮出来的提示。
+            .when(hold_on && tip_on, |row| row.child(tip))
             .into_any_element()
     }
 
@@ -8186,15 +8241,13 @@ impl Settings {
         );
 
         let mut out = vec![tabs];
-        // 「按住连续触发」这张卡并进快捷键卡片：压成一行放在最上面，
-        // 具体哪个键参与看每一行最前面那个勾。
+        // 「按住连续触发」那一行和它管辖的勾选框圈成同一个框：开关在最上面、
+        // 勾在每行最前面，不放到一起看不出「下面这些勾归上面这个开关管」。
         if self.shortcut_tab == 0 {
-            let mut shortcut_rows = vec![self.repeat_bar(config, lang, cx)];
-            shortcut_rows.extend(rows);
             out.push(self.section(
                 lang.pick("快捷键", "Shortcuts"),
                 "keyboard",
-                shortcut_rows,
+                vec![self.repeat_group(config, lang, rows, cx)],
             ));
             out.push(self.section(lang.pick("小键盘", "Numpad"), "keyboard", vec![numpad_raw]));
             out.push(self.section(
@@ -8221,12 +8274,10 @@ impl Settings {
                     .into_any_element(),
             );
         } else {
-            let mut screen_section = vec![self.repeat_bar(config, lang, cx)];
-            screen_section.extend(screen_rows);
             out.push(self.section(
                 lang.pick("亮度快捷键", "Brightness shortcuts"),
                 "keyboard",
-                screen_section,
+                vec![self.repeat_group(config, lang, screen_rows, cx)],
             ));
             out.push(self.section(
                 lang.pick("亮度快捷键设置", "Brightness shortcut settings"),
@@ -8237,10 +8288,36 @@ impl Settings {
         out
     }
 
-    /// 快捷键卡片顶上那一行：「连续触发」总闸 + 间隔 + 忽略系统长按重复。
+    /// 「按住连续触发」那一条 + 它管辖的快捷键行，圈成卡片里的一个小框。
+    ///
+    /// 只并成一张卡还不够：开关在最顶上、勾选框在每一行最前面，中间隔着七八行，
+    /// 看着像两回事。给它们共同的一层边框和下沉底色，一眼就知道
+    /// 「下面这些勾归上面这个开关管」。
+    fn repeat_group(
+        &self,
+        config: &Config,
+        lang: Lang,
+        rows: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(3.))
+            .rounded(px(theme::RADIUS_ROW))
+            .border(px(1.))
+            .border_color(theme::border())
+            .bg(theme::surface_sunken())
+            .child(self.repeat_bar(config, lang, cx))
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// 快捷键卡片顶上那一行：「按住连续触发」总闸 + 间隔 + 忽略系统长按重复。
     ///
     /// 原来这是单独一张卡片（标题一行、开关一行、子项两行），和「快捷键」卡片
-    /// 上下叠着看很碎。并进来之后压成一行 26px，具体哪个键连发交给每一行
+    /// 上下叠着看很碎。并进来之后压成一行，具体哪个键连发交给每一行
     /// 最前面那个勾 —— 总闸只负责「全开 / 全关」。
     fn repeat_bar(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
         let toggle_on = self.bind(|config| {
@@ -8295,7 +8372,7 @@ impl Settings {
                         div()
                             .text_size(theme::fs(12.5))
                             .text_color(theme::text_primary())
-                            .child(lang.pick("连续触发", "Hold to repeat")),
+                            .child(lang.pick("按住连续触发", "Hold to repeat")),
                     )
                     .child(switch),
             )
