@@ -323,6 +323,14 @@ fn default_true() -> bool {
     true
 }
 
+/// 「按住连续触发」的默认勾选集合（音量四个 + 亮度六个）。
+fn default_repeat_actions() -> Vec<String> {
+    DEFAULT_REPEAT_ACTIONS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
 impl TrayMenuNode {
     pub fn action(id: &str) -> Self {
         Self {
@@ -3552,6 +3560,23 @@ pub const DEFAULT_HOTKEY_REPEAT_INTERVAL: u32 = 120;
 /// 连发间隔的可调范围（毫秒）。30ms 以下基本等于一路滑到底，1s 以上按着没感觉。
 pub const HOTKEY_REPEAT_RANGE: (u32, u32) = (30, 1000);
 
+/// 「按住连续触发」默认在哪些动作上生效：音量四个 + 亮度六个。
+///
+/// 名字和 [`crate::platform::hotkey::Action::key`] 一一对应。切歌、静音、播放暂停、
+/// 面板和设置默认不勾 —— 切歌按一下就是一曲，按住连发就把整张专辑跳完了。
+pub const DEFAULT_REPEAT_ACTIONS: [&str; 10] = [
+    "volume_up",
+    "volume_down",
+    "app_volume_up",
+    "app_volume_down",
+    "brightness_up",
+    "brightness_down",
+    "brightness_all_up",
+    "brightness_all_down",
+    "brightness_monitor_up",
+    "brightness_monitor_down",
+];
+
 /// 亮度快捷键的步进可调范围（百分点）。0 = 跟随「亮度步进」，由它自己的行解释。
 pub const BRIGHTNESS_HOTKEY_STEP_RANGE: (u32, u32) = (0, 50);
 
@@ -4055,12 +4080,19 @@ pub struct Config {
 
     /// 按住音量 / 亮度 / 切歌快捷键时连续触发。
     ///
-    /// 低级钩子吞掉按键之后系统自己的「按住重复」不会再来，必须自己做 ——
-    /// 管的是「一档档往下走」的那些动作（音量加减、亮度加减、上一曲 / 下一曲 / 停止），
-    /// 静音和播放暂停是开关、面板和设置是窗口，都按一下是一下。
+    /// 低级钩子吞掉按键之后系统自己的「按住重复」不会再来，必须自己做。
+    /// 这是**总闸**：关掉之后一个键都不连发，具体哪个键参与由
+    /// `hotkey_repeat_actions` 决定（设置页里每个快捷键前面那个勾）。
     pub hotkey_hold_repeat: bool,
     /// 连发间隔（毫秒）。
     pub hotkey_repeat_interval: u32,
+
+    /// 「按住连续触发」在哪些动作上生效：动作名，见 [`crate::platform::hotkey::Action::key`]。
+    ///
+    /// 默认是音量四个 + 亮度六个（[`DEFAULT_REPEAT_ACTIONS`]）。存成名字而不是位图，
+    /// 是为了以后加动作时老配置不至于错位；缺这个键的老配置按默认那十个算。
+    #[serde(default = "default_repeat_actions")]
+    pub hotkey_repeat_actions: Vec<String>,
 
     /// 「按住连续触发」时不理会系统自己的长按重复（默认开）。
     ///
@@ -4272,6 +4304,7 @@ impl Default for Config {
             hotkey_brightness_monitor_down: HotkeySlots::default(),
             hotkey_hold_repeat: true,
             hotkey_repeat_interval: DEFAULT_HOTKEY_REPEAT_INTERVAL,
+            hotkey_repeat_actions: default_repeat_actions(),
             hotkey_ignore_system_repeat: true,
             hotkey_numpad_raw: false,
             theme_follow_system: true,
@@ -5392,6 +5425,42 @@ mod tests {
         assert_eq!(config.brightness.hotkey_monitor, 1);
         // 0 = 跟随面板的亮度步进，默认就是这个。
         assert_eq!(config.brightness.hotkey_step, 0);
+        // 连发默认只勾音量和亮度：十个动作，名字都得能被认出来（写错一个就静默失效）。
+        assert_eq!(
+            config.hotkey_repeat_actions.len(),
+            DEFAULT_REPEAT_ACTIONS.len(),
+            "默认勾选数量"
+        );
+        for name in DEFAULT_REPEAT_ACTIONS {
+            let action = crate::platform::hotkey::Action::from_key(name)
+                .unwrap_or_else(|| panic!("默认动作名要能对应上：{name}"));
+            assert!(
+                crate::platform::hotkey::repeats_on_hold(&config, action),
+                "{name} 默认应当参与连发"
+            );
+        }
+        assert!(
+            !crate::platform::hotkey::repeats_on_hold(
+                &config,
+                crate::platform::hotkey::Action::MediaNext
+            ),
+            "切歌默认不连发"
+        );
+        // 老配置里没有这一项：读进来要按默认那十个算，不能变成空表。
+        let older: Config =
+            serde_json::from_str(r#"{"config_rev": 71}"#).expect("老配置要能解析");
+        assert_eq!(
+            older.hotkey_repeat_actions.len(),
+            DEFAULT_REPEAT_ACTIONS.len(),
+            "缺字段时取默认集合"
+        );
+        // 总闸关掉之后一个都不连发。
+        let mut off = config.clone();
+        off.hotkey_hold_repeat = false;
+        assert!(!crate::platform::hotkey::repeats_on_hold(
+            &off,
+            crate::platform::hotkey::Action::VolumeUp
+        ));
         for slots in [
             config.hotkey_brightness_up,
             config.hotkey_brightness_down,

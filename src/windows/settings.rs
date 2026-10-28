@@ -2479,7 +2479,51 @@ impl Settings {
         lang: Lang,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let current = field.value(config);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .rounded(px(theme::RADIUS_ROW))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(theme::fs(13.))
+                            .text_color(theme::text_primary())
+                            .child(title),
+                    )
+                    .when(!description.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .text_size(theme::fs(10.5))
+                                .text_color(theme::text_tertiary())
+                                .child(description),
+                        )
+                    }),
+            )
+            .child(self.number_stepper(id, field, field.value(config), lang, cx))
+            .into_any_element()
+    }
+
+    /// 一个数字控件（− 值 +），不带标题和说明。
+    ///
+    /// 从 `number_row` 里抽出来给顶部那行「连续触发」用：那行要塞三样东西，
+    /// 用不了「标题一行 + 说明一行 + 控件居右」的两行版式。
+    fn number_stepper(
+        &self,
+        id: &'static str,
+        field: NumberField,
+        current: i32,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let editing = match &self.editing {
             Some((active, buffer)) if *active == field => Some(buffer.as_str()),
             _ => None,
@@ -2537,44 +2581,13 @@ impl Settings {
         div()
             .flex()
             .items_center()
-            .gap(px(10.))
-            .px(px(9.))
-            .py(px(5.))
-            .rounded(px(theme::RADIUS_ROW))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(theme::fs(13.))
-                            .text_color(theme::text_primary())
-                            .child(title),
-                    )
-                    .when(!description.is_empty(), |row| {
-                        row.child(
-                            div()
-                                .text_size(theme::fs(10.5))
-                                .text_color(theme::text_tertiary())
-                                .child(description),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(1.))
-                    .p(px(2.))
-                    .rounded(px(theme::RADIUS_SMALL))
-                    .bg(theme::track())
-                    .child(step(0, "−", -1, cx))
-                    .child(input)
-                    .child(step(1, "+", 1, cx)),
-            )
+            .gap(px(1.))
+            .p(px(2.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::track())
+            .child(step(0, "−", -1, cx))
+            .child(input)
+            .child(step(1, "+", 1, cx))
             .into_any_element()
     }
 
@@ -4025,14 +4038,18 @@ impl Settings {
             .into_any_element()
     }
 
-    /// 快捷键行：标题 + 三组按键框，点哪一组就录哪一组
+    /// 快捷键行：连发勾选 + 标题 + 三组按键框，点哪一组就录哪一组
     /// （Backspace 解除绑定、Esc 放弃；媒体键也认）。
+    ///
+    /// 最前面那个方框管「按住不松手要不要连发」：勾上写进
+    /// `hotkey_repeat_actions`，总闸（`hotkey_hold_repeat`）关着时一律不连发。
     fn hotkey_row(
         &self,
         id: &'static str,
         title: &'static str,
         slots: HotkeySlots,
         slot: HotkeySlot,
+        action: crate::platform::hotkey::Action,
         lang: Lang,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4114,6 +4131,53 @@ impl Settings {
             chips = chips.child(chip);
         }
 
+        // 连发勾选：配置里存的是动作名（`Action::key`），点一下增删一项。
+        let repeat_on = self
+            .config
+            .borrow()
+            .get()
+            .hotkey_repeat_actions
+            .iter()
+            .any(|name| name == action.key());
+        let toggle_repeat = self.bind(move |config| {
+            let name = action.key().to_string();
+            match config
+                .hotkey_repeat_actions
+                .iter()
+                .position(|item| *item == name)
+            {
+                Some(index) => {
+                    config.hotkey_repeat_actions.remove(index);
+                }
+                None => config.hotkey_repeat_actions.push(name),
+            }
+        });
+        let check_box = div()
+            .id(SharedString::from(format!("{id}-repeat")))
+            .flex_none()
+            .size(px(14.))
+            .rounded(px(3.5))
+            .border(px(1.))
+            .border_color(if repeat_on {
+                theme::accent()
+            } else {
+                theme::border_strong()
+            })
+            .bg(if repeat_on {
+                theme::accent()
+            } else {
+                theme::surface_sunken()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.border_color(theme::accent()))
+            .on_click(move |_, window, cx| toggle_repeat(window, cx))
+            .when(repeat_on, |style| {
+                style.child(icon("check", 11.0, theme::text_primary()))
+            });
+
         div()
             .id(SharedString::from(id))
             .flex()
@@ -4122,6 +4186,7 @@ impl Settings {
             .px(px(9.))
             .py(px(5.))
             .rounded(px(theme::RADIUS_ROW))
+            .child(check_box)
             .child(
                 div()
                     .flex_1()
@@ -7899,6 +7964,7 @@ impl Settings {
                 lang.pick("打开 / 收起面板", "Open / close panel"),
                 config.hotkey_flyout,
                 HotkeySlot::Flyout,
+                crate::platform::hotkey::Action::Flyout,
                 lang,
                 cx,
             ),
@@ -7907,6 +7973,7 @@ impl Settings {
                 lang.pick("打开设置", "Open settings"),
                 config.hotkey_settings,
                 HotkeySlot::Settings,
+                crate::platform::hotkey::Action::Settings,
                 lang,
                 cx,
             ),
@@ -7915,6 +7982,7 @@ impl Settings {
                 lang.pick("音量增加[设备]", "Volume up [device]"),
                 config.hotkey_volume_up,
                 HotkeySlot::VolumeUp,
+                crate::platform::hotkey::Action::VolumeUp,
                 lang,
                 cx,
             ),
@@ -7923,6 +7991,7 @@ impl Settings {
                 lang.pick("音量减少[设备]", "Volume down [device]"),
                 config.hotkey_volume_down,
                 HotkeySlot::VolumeDown,
+                crate::platform::hotkey::Action::VolumeDown,
                 lang,
                 cx,
             ),
@@ -7931,6 +8000,7 @@ impl Settings {
                 lang.pick("音量增加[当前应用]", "Volume up [current app]"),
                 config.hotkey_app_volume_up,
                 HotkeySlot::AppVolumeUp,
+                crate::platform::hotkey::Action::AppVolumeUp,
                 lang,
                 cx,
             ),
@@ -7939,6 +8009,7 @@ impl Settings {
                 lang.pick("音量减少[当前应用]", "Volume down [current app]"),
                 config.hotkey_app_volume_down,
                 HotkeySlot::AppVolumeDown,
+                crate::platform::hotkey::Action::AppVolumeDown,
                 lang,
                 cx,
             ),
@@ -7947,6 +8018,7 @@ impl Settings {
                 lang.pick("上一曲", "Previous track"),
                 config.hotkey_media_prev,
                 HotkeySlot::MediaPrev,
+                crate::platform::hotkey::Action::MediaPrev,
                 lang,
                 cx,
             ),
@@ -7955,6 +8027,7 @@ impl Settings {
                 lang.pick("播放 / 暂停", "Play / pause"),
                 config.hotkey_media_play_pause,
                 HotkeySlot::MediaPlayPause,
+                crate::platform::hotkey::Action::MediaPlayPause,
                 lang,
                 cx,
             ),
@@ -7963,6 +8036,7 @@ impl Settings {
                 lang.pick("下一曲", "Next track"),
                 config.hotkey_media_next,
                 HotkeySlot::MediaNext,
+                crate::platform::hotkey::Action::MediaNext,
                 lang,
                 cx,
             ),
@@ -7971,6 +8045,7 @@ impl Settings {
                 lang.pick("停止播放", "Stop"),
                 config.hotkey_media_stop,
                 HotkeySlot::MediaStop,
+                crate::platform::hotkey::Action::MediaStop,
                 lang,
                 cx,
             ),
@@ -7979,6 +8054,7 @@ impl Settings {
                 lang.pick("静音", "Mute"),
                 config.hotkey_media_mute,
                 HotkeySlot::MediaMute,
+                crate::platform::hotkey::Action::MediaMute,
                 lang,
                 cx,
             ),
@@ -7991,6 +8067,7 @@ impl Settings {
                 lang.pick("亮度增加[当前屏幕]", "Brightness up [current screen]"),
                 config.hotkey_brightness_up,
                 HotkeySlot::BrightnessUp,
+                crate::platform::hotkey::Action::BrightnessUp,
                 lang,
                 cx,
             ),
@@ -7999,6 +8076,7 @@ impl Settings {
                 lang.pick("亮度减少[当前屏幕]", "Brightness down [current screen]"),
                 config.hotkey_brightness_down,
                 HotkeySlot::BrightnessDown,
+                crate::platform::hotkey::Action::BrightnessDown,
                 lang,
                 cx,
             ),
@@ -8007,6 +8085,7 @@ impl Settings {
                 lang.pick("亮度增加[全部屏幕]", "Brightness up [all screens]"),
                 config.hotkey_brightness_all_up,
                 HotkeySlot::BrightnessAllUp,
+                crate::platform::hotkey::Action::BrightnessAllUp,
                 lang,
                 cx,
             ),
@@ -8015,6 +8094,7 @@ impl Settings {
                 lang.pick("亮度减少[全部屏幕]", "Brightness down [all screens]"),
                 config.hotkey_brightness_all_down,
                 HotkeySlot::BrightnessAllDown,
+                crate::platform::hotkey::Action::BrightnessAllDown,
                 lang,
                 cx,
             ),
@@ -8023,6 +8103,7 @@ impl Settings {
                 lang.pick("亮度增加[指定屏幕]", "Brightness up [set screen]"),
                 config.hotkey_brightness_monitor_up,
                 HotkeySlot::BrightnessMonitorUp,
+                crate::platform::hotkey::Action::BrightnessMonitorUp,
                 lang,
                 cx,
             ),
@@ -8031,60 +8112,11 @@ impl Settings {
                 lang.pick("亮度减少[指定屏幕]", "Brightness down [set screen]"),
                 config.hotkey_brightness_monitor_down,
                 HotkeySlot::BrightnessMonitorDown,
+                crate::platform::hotkey::Action::BrightnessMonitorDown,
                 lang,
                 cx,
             ),
         ];
-
-        // 「按住连发」：给音量 / 亮度和切歌用，别的动作按一下是一下。
-        // 关掉这一项时系统的长按重复也跟着回来（见下面那条子项），所以改完要
-        // 重新注册一遍热键 —— 注册时带不带 `MOD_NOREPEAT` 就是这一项决定的。
-        let hold_repeat = self.toggle_row(
-            "hotkey-hold-repeat",
-            lang.pick("按住连续触发", "Hold to repeat"),
-            lang.pick(
-                "按住音量、亮度、切歌键不松手就一档档往下走；静音、播放暂停、面板和设置按一下是一下",
-                "Keep stepping while a volume, brightness or track key is held; mute, play/pause, the panel and settings stay one-shot",
-            ),
-            config.hotkey_hold_repeat,
-            self.bind(|config| {
-                config.hotkey_hold_repeat = !config.hotkey_hold_repeat;
-                crate::platform::hotkey::apply_config(config);
-            }),
-        );
-        let mut repeat_rows = vec![hold_repeat];
-        if config.hotkey_hold_repeat {
-            repeat_rows.push(self.sub_group(vec![
-                self.number_row(
-                    "hotkey-repeat-interval",
-                    lang.pick("间隔", "Interval"),
-                    lang.pick(
-                        "两次触发之间隔多久；30~1000 毫秒，点数字可直接填",
-                        "Time between two steps, 30–1000 ms; click the number to type",
-                    ),
-                    NumberField::HotkeyRepeatInterval,
-                    config,
-                    lang,
-                    cx,
-                ),
-                // 子项：默认开。关掉以后按住键既按我们的间隔走、也按系统的重复速率走，
-                // 节奏会变快而且第一档之后有一小段系统的重复延迟 —— 留着当退路。
-                self.compact_toggle_row(
-                    "hotkey-ignore-system-repeat",
-                    lang.pick("不理会系统的长按重复", "Ignore the system key repeat"),
-                    lang.pick(
-                        "只按上面的间隔走，不受键盘重复延迟 / 速率影响",
-                        "Step only at the interval above, not at the Windows repeat rate",
-                    ),
-                    config.hotkey_ignore_system_repeat,
-                    self.bind(|config| {
-                        config.hotkey_ignore_system_repeat =
-                            !config.hotkey_ignore_system_repeat;
-                        crate::platform::hotkey::apply_config(config);
-                    }),
-                ),
-            ]));
-        }
 
         // NumLock 关着的时候小键盘发的是方向 / Ins / Del，`RegisterHotKey` 那一路
         // 认不出来；勾上就由键盘钩子按扫描码把它们认回数字再匹配。
@@ -8154,12 +8186,15 @@ impl Settings {
         );
 
         let mut out = vec![tabs];
+        // 「按住连续触发」这张卡并进快捷键卡片：压成一行放在最上面，
+        // 具体哪个键参与看每一行最前面那个勾。
         if self.shortcut_tab == 0 {
-            out.push(self.section(lang.pick("快捷键", "Shortcuts"), "keyboard", rows));
+            let mut shortcut_rows = vec![self.repeat_bar(config, lang, cx)];
+            shortcut_rows.extend(rows);
             out.push(self.section(
-                lang.pick("按住连续触发", "Hold to repeat"),
-                "chevron-down",
-                repeat_rows,
+                lang.pick("快捷键", "Shortcuts"),
+                "keyboard",
+                shortcut_rows,
             ));
             out.push(self.section(lang.pick("小键盘", "Numpad"), "keyboard", vec![numpad_raw]));
             out.push(self.section(
@@ -8186,29 +8221,121 @@ impl Settings {
                     .into_any_element(),
             );
         } else {
+            let mut screen_section = vec![self.repeat_bar(config, lang, cx)];
+            screen_section.extend(screen_rows);
             out.push(self.section(
                 lang.pick("亮度快捷键", "Brightness shortcuts"),
                 "keyboard",
-                screen_rows,
+                screen_section,
             ));
             out.push(self.section(
                 lang.pick("亮度快捷键设置", "Brightness shortcut settings"),
                 "sun",
                 vec![brightness_step, monitor_index, brightness_hint],
             ));
-            out.push(
-                div()
-                    .px(px(9.))
-                    .text_size(theme::fs(10.5))
-                    .text_color(theme::text_tertiary())
-                    .child(lang.pick(
-                        "「按住连续触发」和间隔在「音频设备」那一页设置，亮度的加减键一样跟着生效。",
-                        "Hold-to-repeat and its interval live on the Audio devices tab; brightness keys follow the same setting.",
-                    ))
-                    .into_any_element(),
-            );
         }
         out
+    }
+
+    /// 快捷键卡片顶上那一行：「连续触发」总闸 + 间隔 + 忽略系统长按重复。
+    ///
+    /// 原来这是单独一张卡片（标题一行、开关一行、子项两行），和「快捷键」卡片
+    /// 上下叠着看很碎。并进来之后压成一行 26px，具体哪个键连发交给每一行
+    /// 最前面那个勾 —— 总闸只负责「全开 / 全关」。
+    fn repeat_bar(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
+        let toggle_on = self.bind(|config| {
+            config.hotkey_hold_repeat = !config.hotkey_hold_repeat;
+            crate::platform::hotkey::apply_config(config);
+        });
+        let toggle_ignore = self.bind(|config| {
+            config.hotkey_ignore_system_repeat = !config.hotkey_ignore_system_repeat;
+            crate::platform::hotkey::apply_config(config);
+        });
+
+        let knob_x = if config.hotkey_hold_repeat { 16.0 } else { 2.0 };
+        let switch = div()
+            .w(px(34.))
+            .h(px(20.))
+            .flex_none()
+            .rounded(px(10.))
+            .bg(if config.hotkey_hold_repeat {
+                theme::accent()
+            } else {
+                theme::track()
+            })
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .left(px(knob_x))
+                    .size(px(16.))
+                    .rounded(px(8.))
+                    .bg(theme::text_primary()),
+            );
+
+        div()
+            .id("hotkey-repeat-bar")
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .px(px(9.))
+            .py(px(3.))
+            .rounded(px(theme::RADIUS_ROW))
+            .child(
+                div()
+                    .id("hotkey-repeat-toggle")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    .on_click(move |_, window, cx| toggle_on(window, cx))
+                    .child(
+                        div()
+                            .text_size(theme::fs(12.5))
+                            .text_color(theme::text_primary())
+                            .child(lang.pick("连续触发", "Hold to repeat")),
+                    )
+                    .child(switch),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_tertiary())
+                            .child(lang.pick("间隔", "Every")),
+                    )
+                    .child(self.number_stepper(
+                        "hotkey-repeat-interval",
+                        NumberField::HotkeyRepeatInterval,
+                        config.hotkey_repeat_interval as i32,
+                        lang,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .id("hotkey-ignore-system-repeat")
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    .on_click(move |_, window, cx| toggle_ignore(window, cx))
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_tertiary())
+                            .child(lang.pick("忽略系统长按重复", "Ignore the system repeat")),
+                    )
+                    .child(self.mini_switch(config.hotkey_ignore_system_repeat)),
+            )
+            .into_any_element()
     }
 
     /// 黑名单页：禁用 Bolume 的应用程序 + 全屏状态禁用。

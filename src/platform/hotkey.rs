@@ -105,6 +105,47 @@ static HOOK: AtomicIsize = AtomicIsize::new(0);
 /// 「按住连续触发」开着，而且用户没勾「理会系统的长按重复」：系统补出来的重复
 /// 一律不理会，重复节奏完全由我们自己掌握。
 static IGNORE_SYSTEM_REPEAT: AtomicBool = AtomicBool::new(false);
+/// 按住会连发的动作（`Action` 的 repr 值）。`apply_config` 里按配置重算。
+///
+/// 钩子拿它判断「系统补出来的重复 keydown」该不该吞：没勾连发的动作按住只该动
+/// 一下，重复必须当场吃掉 —— 光靠 `IGNORE_SYSTEM_REPEAT` 那个总开关不够，
+/// 它一关（用户想「让系统节奏也算数」）就会波及所有键。
+static REPEAT_ACTIONS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+
+fn repeat_actions() -> &'static Mutex<Vec<u32>> {
+    REPEAT_ACTIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 这个动作勾了「按住连发」没有。
+fn repeats_action(action: Action) -> bool {
+    repeat_actions()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&(action as u32))
+}
+
+/// 按注册 id 反查动作是不是勾了连发（`id = action * 8 + slot`）。
+fn repeats_action_id(id: u32) -> bool {
+    repeat_actions()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&(id / 8))
+}
+
+/// 这一发按下来之前就已经按着了（= 系统长按重复补的），要不要吞掉。
+///
+/// 两道闸：总开关开着就一律吞（重复由 `start_hold_repeat` 自己走）；总开关关着时
+/// 只看这个动作有没有勾连发 —— 没勾的按住只该动一下。认不出动作的（比如没配成
+/// 快捷键的键）不额外吞，保持原来的行为。
+fn swallow_system_repeat(already_down: bool, action: Option<Action>) -> bool {
+    if !already_down {
+        return false;
+    }
+    if ignore_system_repeat() {
+        return true;
+    }
+    matches!(action, Some(action) if !repeats_action(action))
+}
 /// 现在按着的键（VK 0..=255 的位图）。keyup 也走低级钩子，靠它分辨
 /// 「第一次按下」和「系统自动重复补出来的 keydown」。
 static DOWN_KEYS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -214,25 +255,34 @@ impl Action {
         ]
     }
 
-    /// 「按住连发」只管一档档往下走的动作：音量、亮度、切歌。
+    /// 动作的稳定名字：写进配置（`hotkey_repeat_actions`），也是设置页里那个勾的键。
     ///
-    /// 静音和播放暂停是**开关**，按住连点只会来回翻（静音图标狂闪、播放暂停
-    /// 反复切），按一下是一下；面板和设置同理。
-    pub fn repeats_while_held(self) -> bool {
-        matches!(
-            self,
-            Action::VolumeUp
-                | Action::VolumeDown
-                | Action::BrightnessUp
-                | Action::BrightnessDown
-                | Action::BrightnessAllUp
-                | Action::BrightnessAllDown
-                | Action::BrightnessMonitorUp
-                | Action::BrightnessMonitorDown
-                | Action::MediaPrev
-                | Action::MediaNext
-                | Action::MediaStop
-        )
+    /// 别跟着枚举变体名改 —— 老配置里存的就是这些字符串。
+    pub fn key(self) -> &'static str {
+        match self {
+            Action::Flyout => "flyout",
+            Action::Settings => "settings",
+            Action::VolumeUp => "volume_up",
+            Action::VolumeDown => "volume_down",
+            Action::AppVolumeUp => "app_volume_up",
+            Action::AppVolumeDown => "app_volume_down",
+            Action::MediaPrev => "media_prev",
+            Action::MediaNext => "media_next",
+            Action::MediaPlayPause => "media_play_pause",
+            Action::MediaMute => "media_mute",
+            Action::MediaStop => "media_stop",
+            Action::BrightnessUp => "brightness_up",
+            Action::BrightnessDown => "brightness_down",
+            Action::BrightnessAllUp => "brightness_all_up",
+            Action::BrightnessAllDown => "brightness_all_down",
+            Action::BrightnessMonitorUp => "brightness_monitor_up",
+            Action::BrightnessMonitorDown => "brightness_monitor_down",
+        }
+    }
+
+    /// 这个名字（[`key`](Self::key)）对应哪个动作。
+    pub fn from_key(name: &str) -> Option<Action> {
+        Action::all().into_iter().find(|action| action.key() == name)
     }
 
     fn slots(self, config: &Config) -> HotkeySlots {
@@ -273,6 +323,18 @@ impl Action {
     fn id(self, slot: usize) -> u32 {
         self as u32 * 8 + slot as u32
     }
+}
+
+/// 这个动作按住不松手时要不要连续触发。
+///
+/// 两道闸都要过：总闸 `hotkey_hold_repeat` 开着，而且这个动作在
+/// `hotkey_repeat_actions` 里（设置页里每个快捷键前面那个勾）。
+pub fn repeats_on_hold(config: &Config, action: Action) -> bool {
+    config.hotkey_hold_repeat
+        && config
+            .hotkey_repeat_actions
+            .iter()
+            .any(|name| name == action.key())
 }
 
 /// 鼠标键在配置里的伪键码。
@@ -573,7 +635,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     // 修饰键在这里也是刻意忽略的：系统那条条不认修饰键，`Ctrl+音量+` 放过去一样弹。
     // 只在主程序活着的时候有效：没有守卫进程，退出 Bolume 系统就恢复原样。
     if block_system_osd() && volume_action(key).is_some() {
-        if system_repeat {
+        if swallow_system_repeat(already_down, volume_action(key)) {
             return LRESULT(1);
         }
         send_hotkey(Hotkey::new(0, key));
@@ -598,7 +660,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         CAPTURING.load(Ordering::SeqCst)
     ));
     if bound {
-        if system_repeat {
+        if swallow_system_repeat(already_down, media_action(key)) {
             return LRESULT(1);
         }
         send_hotkey(hotkey);
@@ -607,7 +669,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     // 没配这个键，但开着「接管媒体键」：一样送给主线程，
     // 由它弹 OSD 再把键转发给播放器。带修饰键的不算（那是用户的组合键）。
     if mods == 0 && takeover_media() && media_action(key).is_some() {
-        if system_repeat {
+        if swallow_system_repeat(already_down, media_action(key)) {
             return LRESULT(1);
         }
         send_hotkey(hotkey);
@@ -899,7 +961,10 @@ unsafe fn apply_desired(hwnd: HWND) {
         // 「忽略系统的长按重复」：按住组合键时只要第一发，后面的重复交给我们
         // 自己的 `start_hold_repeat`。不带这个标志时系统会按键盘的重复延迟 /
         // 速率一直补 `WM_HOTKEY`，两套节奏叠在一起。
-        let api_mods = if ignore_system_repeat() {
+        //
+        // 没勾连发的动作**永远**带这个标志：总开关关着时也不能让系统的重复把它
+        // 继续往下推 —— 那样「这个键不连发」的勾就形同虚设。
+        let api_mods = if ignore_system_repeat() || !repeats_action_id(id) {
             mods | MOD_NOREPEAT
         } else {
             mods
@@ -957,6 +1022,14 @@ pub fn apply_config(config: &Config) {
     // 只有「按住连续触发」开着的时候才谈得上「忽略系统的长按重复」：关掉连发时
     // 我们自己是不会补的，再把系统那一路也关掉，按住音量键就彻底不动了。
     set_ignore_system_repeat(config.hotkey_hold_repeat && config.hotkey_ignore_system_repeat);
+    // 钩子按这张表判断「系统补出来的重复要不要吞」，所以它得先于下面的注册更新。
+    *repeat_actions()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Action::all()
+        .into_iter()
+        .filter(|action| repeats_on_hold(config, *action))
+        .map(|action| action as u32)
+        .collect();
     set_blocklist(&config.app_block);
     let mut bindings: Vec<(Action, usize, Hotkey)> = Vec::new();
     for action in Action::all() {
@@ -1222,10 +1295,25 @@ pub fn vk_for_key_name(name: &str) -> Option<(u32, bool)> {
 mod tests {
     use super::*;
 
+    /// 动作名要能双向对上：写进配置的是它，设置页里那个勾也按它查。
+    #[test]
+    fn action_keys_round_trip() {
+        let mut seen = std::collections::BTreeSet::new();
+        for action in Action::all() {
+            let key = action.key();
+            assert!(seen.insert(key), "动作名不能重复：{key}");
+            assert_eq!(Action::from_key(key), Some(action), "{key} 要能认回来");
+        }
+        assert_eq!(Action::from_key("nonesuch"), None);
+        // 默认勾选的那十个都得是真实动作（写错一个就静默失效）。
+        for name in crate::config::DEFAULT_REPEAT_ACTIONS {
+            assert!(Action::from_key(name).is_some(), "默认动作名写错了：{name}");
+        }
+    }
+
     /// 音量键 → 动作的映射（「禁用 Windows 音量条」用它兜底）。
     #[test]
-    fn volume_keys_map_to_actions() {
-        assert_eq!(volume_action(VK_VOLUME_UP), Some(Action::VolumeUp));
+    fn volume_keys_map_to_actions() {        assert_eq!(volume_action(VK_VOLUME_UP), Some(Action::VolumeUp));
         assert_eq!(volume_action(VK_VOLUME_DOWN), Some(Action::VolumeDown));
         assert_eq!(volume_action(VK_VOLUME_MUTE), Some(Action::MediaMute));
         // 别的键不归它管，免得把媒体键也当成音量。
@@ -1297,31 +1385,79 @@ mod tests {
         assert_eq!(unique.len(), ids.len(), "同一个 id 注册两次会静默失败");
     }
 
-    /// 「按住连发」覆盖音量 / 亮度的加减和切歌，开关类的动作按一下是一下。
+    /// 「这个键不连发」的勾要真管住系统的长按重复：总开关关着时也不能让它往下推。
     #[test]
-    fn hold_repeat_covers_steps_but_not_toggles() {
+    fn repeat_is_swallowed_for_actions_without_the_tick() {
+        let previous_ignore = ignore_system_repeat();
+        let previous_list = repeat_actions()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        *repeat_actions()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = vec![Action::VolumeUp as u32];
+
+        set_ignore_system_repeat(false);
+        assert!(
+            !swallow_system_repeat(false, Some(Action::VolumeUp)),
+            "第一发按下要放行"
+        );
+        assert!(
+            !swallow_system_repeat(true, Some(Action::VolumeUp)),
+            "勾了的重复交给自己的连发循环"
+        );
+        assert!(
+            swallow_system_repeat(true, Some(Action::MediaNext)),
+            "没勾的重复要当场吞掉，按一下是一下"
+        );
+        assert!(!swallow_system_repeat(true, None), "认不出的不额外吞");
+
+        set_ignore_system_repeat(true);
+        assert!(
+            swallow_system_repeat(true, Some(Action::VolumeUp)),
+            "总开关开着就一律吞"
+        );
+
+        set_ignore_system_repeat(previous_ignore);
+        *repeat_actions()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = previous_list;
+    }
+
+    /// 默认勾选：音量四个 + 亮度六个，切歌 / 静音 / 播放暂停 / 面板 / 设置都不连发。
+    #[test]
+    fn hold_repeat_defaults_to_volume_and_brightness() {
+        let config = Config::default();
         for action in Action::all() {
             let expected = matches!(
                 action,
                 Action::VolumeUp
                     | Action::VolumeDown
+                    | Action::AppVolumeUp
+                    | Action::AppVolumeDown
                     | Action::BrightnessUp
                     | Action::BrightnessDown
                     | Action::BrightnessAllUp
                     | Action::BrightnessAllDown
                     | Action::BrightnessMonitorUp
                     | Action::BrightnessMonitorDown
-                    | Action::MediaPrev
-                    | Action::MediaNext
-                    | Action::MediaStop
             );
-            assert_eq!(action.repeats_while_held(), expected, "{action:?}");
+            assert_eq!(repeats_on_hold(&config, action), expected, "{action:?}");
         }
-        // 应用音量不在此列：它和「正在响的是谁」绑在一起，连发容易在不同应用间乱跳。
-        assert!(!Action::AppVolumeUp.repeats_while_held());
-        // 静音 / 播放暂停是开关：按住连点只会来回翻。
-        assert!(!Action::MediaMute.repeats_while_held());
-        assert!(!Action::MediaPlayPause.repeats_while_held());
+    }
+
+    /// 设置页里那个勾：勾上就参与，去掉就退出；总闸关掉时一律不连发。
+    #[test]
+    fn hold_repeat_follows_the_per_key_ticks() {        let mut config = Config::default();
+        // 勾上切歌
+        config.hotkey_repeat_actions.push("media_next".to_string());
+        assert!(repeats_on_hold(&config, Action::MediaNext));
+        // 去掉音量
+        config.hotkey_repeat_actions.retain(|name| name != "volume_up");
+        assert!(!repeats_on_hold(&config, Action::VolumeUp));
+        // 总闸
+        config.hotkey_hold_repeat = false;
+        assert!(!repeats_on_hold(&config, Action::MediaNext));
     }
 
     /// 被钩子吞掉的键在系统那边当没按过，连发循环只能看自己的按下表。

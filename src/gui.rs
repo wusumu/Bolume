@@ -1925,6 +1925,7 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
 
     // 音量 / 亮度 / 切歌可以按住连发；静音、播放暂停、面板、设置按一下是一下。
     //
+    // 具体哪些动作连发由配置决定（设置页里每个快捷键前面那个勾），这里只问一句。
     // 没配快捷键的媒体键走的是上面那条 `None` 分支（`action` 是空的），要按
     // 「这颗键本来是哪个动作」再判一次 —— 否则同一颗切歌键，配了快捷键能连发、
     // 只靠「接管媒体键」时不能，用户只会觉得按快了才灵。
@@ -1935,7 +1936,15 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
             None
         }
     });
-    if !from_repeat && repeat.map(Action::repeats_while_held).unwrap_or(false) {
+    let repeats = match repeat {
+        Some(action) => {
+            let state = cx.global::<AppState>();
+            let config = state.config.borrow();
+            crate::platform::hotkey::repeats_on_hold(config.get(), action)
+        }
+        None => false,
+    };
+    if !from_repeat && repeats {
         start_hold_repeat(cx, hotkey);
     }
 }
