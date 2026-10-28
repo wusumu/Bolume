@@ -1439,7 +1439,15 @@ impl Flyout {
             min_db,
         );
         let label = volume_readout(display, log, min_db);
-        let play_sound = self.cfg().release_sound;
+        // 开了「拖拽音效」的话这声就不补了：末一格已经响过，
+        // 再叠一声系统提示音只是吵。
+        let play_sound = {
+            let cfg = self.cfg();
+            cfg.release_sound
+                && !cfg
+                    .volume_sound
+                    .covers(crate::config::VolumeGesture::Drag)
+        };
         // 面板内的滚轮由「面板内滚动滚轮调节音量」控制，步进取设置里的滚轮步进。
         let scroll_cfg = self.cfg();
         let scroll_enabled = scroll_cfg.use_global_mouse_wheel_hook;
@@ -1505,6 +1513,10 @@ impl Flyout {
                 volume: raw,
                 unmute,
             });
+            // 声卡真正写进去之前先响一声：耳朵听到的和看到的是同一格。
+            if previous.map_or(true, |was| (was - value).abs() > 0.0001) {
+                crate::platform::sound::step(&drag_cfg, crate::config::VolumeGesture::Drag);
+            }
         })
         .on_release(move |window, _cx| {
             // 松手别马上交还真实值：写入要过音频线程那 30Hz 的快照才回读得到，
@@ -1613,6 +1625,12 @@ impl Flyout {
                     volume: raw,
                     unmute,
                 });
+                if (next - base).abs() > 0.0001 {
+                    crate::platform::sound::step(
+                        &scroll_cfg,
+                        crate::config::VolumeGesture::HoverScroll,
+                    );
+                }
             })
             .child(
                 div()
@@ -1872,7 +1890,15 @@ impl Flyout {
         let log = self.cfg().use_logarithmic_volume;
         let min_db = self.cfg().logarithmic_min_db as f32;
         let label = volume_readout(display, log, min_db);
-        let play_sound = self.cfg().release_sound;
+        // 开了「拖拽音效」的话这声就不补了：末一格已经响过，
+        // 再叠一声系统提示音只是吵。
+        let play_sound = {
+            let cfg = self.cfg();
+            cfg.release_sound
+                && !cfg
+                    .volume_sound
+                    .covers(crate::config::VolumeGesture::Drag)
+        };
         let playing = app.state == 1;
 
         let engine = self.engine.clone();
@@ -1964,6 +1990,10 @@ impl Flyout {
                 volume: raw,
                 unmute,
             });
+            // 和主音量那根一样：真的变了才响。
+            if previous.map_or(true, |was| (was - value).abs() > 0.0001) {
+                crate::platform::sound::step(&drag_cfg, crate::config::VolumeGesture::AppDrag);
+            }
         })
         .on_release(move |window, _cx| {
             // 松手别马上交还真实值：写入要过音频线程那 30Hz 的快照才回读得到，
@@ -2387,7 +2417,15 @@ impl Flyout {
         );
         // 列太窄，读数只写一个量（对数模式下写 dB，不并百分比）。
         let label = volume_label(display, log, min_db);
-        let play_sound = self.cfg().release_sound;
+        // 开了「拖拽音效」的话这声就不补了：末一格已经响过，
+        // 再叠一声系统提示音只是吵。
+        let play_sound = {
+            let cfg = self.cfg();
+            cfg.release_sound
+                && !cfg
+                    .volume_sound
+                    .covers(crate::config::VolumeGesture::Drag)
+        };
         let scroll_cfg = self.cfg();
         let scroll_enabled = scroll_cfg.use_global_mouse_wheel_hook;
 
@@ -2451,6 +2489,10 @@ impl Flyout {
                 volume: raw,
                 unmute,
             });
+            // 声卡真正写进去之前先响一声：耳朵听到的和看到的是同一格。
+            if previous.map_or(true, |was| (was - value).abs() > 0.0001) {
+                crate::platform::sound::step(&drag_cfg, crate::config::VolumeGesture::Drag);
+            }
         })
         .on_release(move |window, _cx| {
             // 松手别马上交还真实值：写入要过音频线程那 30Hz 的快照才回读得到，
@@ -2551,6 +2593,12 @@ impl Flyout {
                     volume: raw,
                     unmute,
                 });
+                if (next - base).abs() > 0.0001 {
+                    crate::platform::sound::step(
+                        &scroll_cfg,
+                        crate::config::VolumeGesture::HoverScroll,
+                    );
+                }
             })
             .child(self.channel_shell(
                 "device-channel-shell".to_string(),
@@ -2590,7 +2638,15 @@ impl Flyout {
         let log = self.cfg().use_logarithmic_volume;
         let min_db = self.cfg().logarithmic_min_db as f32;
         let label = volume_label(display, log, min_db);
-        let play_sound = self.cfg().release_sound;
+        // 开了「拖拽音效」的话这声就不补了：末一格已经响过，
+        // 再叠一声系统提示音只是吵。
+        let play_sound = {
+            let cfg = self.cfg();
+            cfg.release_sound
+                && !cfg
+                    .volume_sound
+                    .covers(crate::config::VolumeGesture::Drag)
+        };
         let scroll_cfg = self.cfg();
         let scroll_enabled = scroll_cfg.use_global_mouse_wheel_hook;
         let lang = self.cfg().language;
@@ -2656,6 +2712,10 @@ impl Flyout {
                 volume: raw,
                 unmute,
             });
+            // 和主音量那根一样：真的变了才响。
+            if previous.map_or(true, |was| (was - value).abs() > 0.0001) {
+                crate::platform::sound::step(&drag_cfg, crate::config::VolumeGesture::AppDrag);
+            }
         })
         .on_release(move |window, _cx| {
             // 松手别马上交还真实值：写入要过音频线程那 30Hz 的快照才回读得到，
@@ -2790,6 +2850,12 @@ impl Flyout {
                     volume: raw,
                     unmute,
                 });
+                if (next - base).abs() > 0.0001 {
+                    crate::platform::sound::step(
+                        &scroll_cfg,
+                        crate::config::VolumeGesture::AppHoverScroll,
+                    );
+                }
             })
             .child(self.channel_shell(
                 format!("app-channel-shell-{key}"),

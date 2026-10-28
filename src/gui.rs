@@ -2042,6 +2042,10 @@ fn absolute_volume(cx: &mut App, direction: f32) {
         request = request.muted(false);
     }
     show_osd(cx, request);
+    // 音效在「真的变了一档」时才响：到顶 / 到底那几下按了也是同一个值。
+    if (predicted - display).abs() > 0.0001 {
+        crate::platform::sound::step(&cfg, crate::config::VolumeGesture::Hotkey);
+    }
 }
 
 /// 亮度快捷键管哪几台屏。
@@ -2219,6 +2223,9 @@ fn adjust_app_volume(cx: &mut App, direction: f32) {
         }
         request
     });
+    if (next - display).abs() > 0.0001 {
+        crate::platform::sound::step(&cfg, crate::config::VolumeGesture::AppHotkey);
+    }
 }
 
 /// 托盘菜单里点了某台设备：切换默认播放设备。
@@ -2306,6 +2313,9 @@ fn adjust_device_volume(cx: &mut App, step: i32) {
         }
         request
     });
+    if (next - display).abs() > 0.0001 {
+        crate::platform::sound::step(&cfg, crate::config::VolumeGesture::TrayScroll);
+    }
 }
 
 /// 托盘右键菜单。

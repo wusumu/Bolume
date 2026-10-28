@@ -938,6 +938,8 @@ enum NumberField {
     LoudnessLevel,
     /// 响度均衡：音量变化级别（1–10）。
     LoudnessSmooth,
+    /// 音量音效自己的响度（百分比）。
+    VolumeSound,
 }
 
 impl NumberField {
@@ -1012,6 +1014,7 @@ impl NumberField {
             // 两个都是整数百分比 / 级别，直接就是显示值。
             Self::LoudnessLevel => config.loudness.level.clamp(1, 100),
             Self::LoudnessSmooth => config.loudness.smoothness.clamp(1, 10),
+            Self::VolumeSound => config.volume_sound.volume,
         }
     }
 
@@ -1106,6 +1109,8 @@ impl NumberField {
             // 再大就是「所有内容一样响」的死压，听感会喘。
             // 1 = 一块走 50%，10 = 一块走千分之一。
             Self::LoudnessSmooth => (1, 10),
+            // 0 就是「开了但不出声」，容易让人以为坏了，最低给 5%。
+            Self::VolumeSound => (5, 100),
             // 参考实现默认 3000ms；少于 100ms 窗口里连一块都攒不满。
 
             // 0 dB = 不提升（参考实现的行为）；+18 dB（8 倍）再往上就没意义了。
@@ -1177,6 +1182,7 @@ impl NumberField {
             Self::BrightnessHotkeyStep => config.brightness.hotkey_step = value,
             Self::LoudnessLevel => config.loudness.level = value.clamp(1, 100),
             Self::LoudnessSmooth => config.loudness.smoothness = value.clamp(1, 10),
+            Self::VolumeSound => config.volume_sound.volume = value.clamp(5, 100),
         }
     }
 
@@ -1212,6 +1218,7 @@ impl NumberField {
             | Self::WheelStep
             | Self::StartupVolume
             | Self::VolumeCap
+            | Self::VolumeSound
             | Self::BrightnessStep => format!("{value}%"),
             Self::HotkeyStepDb | Self::AppHotkeyStepDb => format!("{value} dB"),
             Self::AppHotkeyStep => format!("{value}%"),
@@ -2164,19 +2171,17 @@ impl Settings {
         self.choice_row_owned(id, title, description, options, value, on_pick)
     }
 
-    /// 分段选择（选项是运行时拼出来的，例如设备列表）。
+    /// 分段选择控件本身（不带标题那一列）。
     ///
-    /// 选项多了会自动折行——设备数量不固定，硬挤在一行会把标题压没。
-    fn choice_row_owned(
+    /// 抽出来给「音效」那一行用：它要在分段选择**右边**再挂一个「试听」按钮，
+    /// 两行列不下，只能自己排。
+    fn segmented(
         &self,
         id: &'static str,
-        title: &'static str,
-        description: &str,
         options: Vec<(u32, String)>,
         value: u32,
         on_pick: impl Fn(u32, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
-        let desc = description.to_string();
         let on_pick = Rc::new(on_pick);
         let mut group = div()
             .flex()
@@ -2208,6 +2213,23 @@ impl Settings {
                     .child(label.clone()),
             );
         }
+        group.into_any_element()
+    }
+
+    /// 分段选择（选项是运行时拼出来的，例如设备列表）。
+    ///
+    /// 选项多了会自动折行——设备数量不固定，硬挤在一行会把标题压没。
+    fn choice_row_owned(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        description: &str,
+        options: Vec<(u32, String)>,
+        value: u32,
+        on_pick: impl Fn(u32, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let desc = description.to_string();
+        let group = self.segmented(id, options, value, on_pick);
 
         div()
             .flex()
@@ -4533,6 +4555,20 @@ fn modifiers_bits(modifiers: &Modifiers) -> u32 {
 fn refresh_ui(window: &mut Window, cx: &mut App) {
     cx.refresh_windows();
     crate::windows::platform::post_repaint(window);
+}
+
+/// 内置音效的名字：就是听感，不用再解释。
+fn sound_style_label(style: crate::config::VolumeSoundStyle, lang: Lang) -> &'static str {
+    use crate::config::VolumeSoundStyle;
+    match style {
+        VolumeSoundStyle::Click => lang.pick("轻点", "Click"),
+        VolumeSoundStyle::Tick => lang.pick("滴答", "Tick"),
+        VolumeSoundStyle::Pop => lang.pick("气泡", "Pop"),
+        VolumeSoundStyle::Wood => lang.pick("木鱼", "Wood"),
+        VolumeSoundStyle::Blip => lang.pick("电子", "Blip"),
+        VolumeSoundStyle::Chime => lang.pick("铃音", "Chime"),
+        VolumeSoundStyle::Custom => lang.pick("自定义", "Custom"),
+    }
 }
 
 /// 会话 key → 能看的短名字。
@@ -7683,6 +7719,7 @@ impl Settings {
             unmute_rows.push(self.sub_group(matrix));
         }
 
+        let sound = self.sound_rows(config, lang, cx);
         vec![
             self.section(lang.pick("音量", "Volume"), "volume-high", {
                 let mut rows = vec![logarithmic, min_db, release_sound];
@@ -7691,6 +7728,12 @@ impl Settings {
                 }
                 rows
             }),
+            // 音效紧跟在「音量」后面：它管的就是调音量时的那一下反馈。
+            self.section(
+                lang.pick("音效", "Sound effects"),
+                "volume-arc-high",
+                sound,
+            ),
             self.section(lang.pick("最大音量", "Volume cap"), "volume-off", {
                 let mut rows = vec![cap_enabled];
                 let mut expanded = Vec::new();
@@ -8415,10 +8458,332 @@ impl Settings {
             .into_any_element()
     }
 
-    /// 黑名单页：禁用 Bolume 的应用程序 + 全屏状态禁用。
+    // -----------------------------------------------------------------------
+    // 音量音效
+    // -----------------------------------------------------------------------
+
+    /// 音量音效那张卡：总开关 + 音效选择 / 试听 / 自定义文件 / 响度 / 生效范围。
+    ///
+    /// 思路照 Volume2：每变化一档响一下。默认关 —— 这是个「想要的人才会开」的
+    /// 功能，新装就让它出声太主动；打开后三种手势默认全勾（那才是它的卖点）。
+    fn sound_rows(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let sound = &config.volume_sound;
+        let master = self.toggle_row(
+            "toggle-volume-sound",
+            lang.pick(
+                "调节音量时播放音效",
+                "Play a sound on every volume step",
+            ),
+            lang.pick(
+                "每变化一档响一下，调的时候不用盯着卡片",
+                "A short tick for every step, so you can hear where you are",
+            ),
+            sound.enabled,
+            self.bind(|config| config.volume_sound.enabled = !config.volume_sound.enabled),
+        );
+        if !sound.enabled {
+            return vec![master];
+        }
+
+        // 音效：分段选择 + 右边的「试听」。选一下当场听一下 ——
+        // 这一行的全部意义就是「哪个顺耳」，听完再选才叫选。
+        let options: Vec<(u32, String)> = crate::config::VolumeSoundStyle::ALL
+            .iter()
+            .map(|style| (style.index(), sound_style_label(*style, lang).to_string()))
+            .collect();
+        let pick_style = {
+            let store = self.config.clone();
+            move |value: u32, window: &mut Window, cx: &mut App| {
+                let _ = store.borrow_mut().update(|config| {
+                    config.volume_sound.style = crate::config::VolumeSoundStyle::from_index(value)
+                });
+                crate::platform::sound::preview(&store.borrow().get().clone());
+                refresh_ui(window, cx);
+            }
+        };
+        let segmented = self.segmented("volume-sound-style", options, sound.style.index(), pick_style);
+        let preview = {
+            let store = self.config.clone();
+            self.preview_button("volume-sound-preview", lang, move || {
+                crate::platform::sound::preview(&store.borrow().get().clone())
+            })
+        };
+        let style_row = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .rounded(px(theme::RADIUS_ROW))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::fs(13.))
+                    .text_color(theme::text_primary())
+                    .child(lang.pick("音效", "Sound")),
+            )
+            .child(segmented)
+            .child(preview)
+            .into_any_element();
+
+        let mut rows: Vec<AnyElement> = vec![style_row];
+
+        // 自定义文件：只在选了「自定义」时冒出来，不然这一行永远是空的。
+        if sound.style == crate::config::VolumeSoundStyle::Custom {
+            rows.push(self.sound_file_row(sound, lang, cx));
+        }
+
+        rows.push(self.number_row(
+            "volume-sound-gain",
+            lang.pick("音效音量", "Sound volume"),
+            lang.pick(
+                "音效本身有多响（设备音量照旧由音量决定）",
+                "How loud the tick itself is; the device volume still does its own job",
+            ),
+            NumberField::VolumeSound,
+            config,
+            lang,
+            cx,
+        ));
+
+        // 生效范围：三种手势并排，一行放下。
+        let scope = |id: &'static str, label: &'static str, value: bool, toggle: fn(&mut Config)| {
+            let store = self.config.clone();
+            self.tick_chip(
+                id,
+                label,
+                value,
+                move |window: &mut Window, cx: &mut App| {
+                    let _ = store.borrow_mut().update(toggle);
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+        let scope_row = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .rounded(px(theme::RADIUS_ROW))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::fs(13.))
+                    .text_color(theme::text_primary())
+                    .child(lang.pick("生效范围", "Where it plays")),
+            )
+            .child(scope(
+                "volume-sound-hotkey",
+                lang.pick("快捷键", "Hotkey"),
+                sound.on_hotkey,
+                |config| config.volume_sound.on_hotkey = !config.volume_sound.on_hotkey,
+            ))
+            .child(scope(
+                "volume-sound-wheel",
+                lang.pick("滚轮", "Wheel"),
+                sound.on_wheel,
+                |config| config.volume_sound.on_wheel = !config.volume_sound.on_wheel,
+            ))
+            .child(scope(
+                "volume-sound-drag",
+                lang.pick("拖拽", "Drag"),
+                sound.on_drag,
+                |config| config.volume_sound.on_drag = !config.volume_sound.on_drag,
+            ))
+            .into_any_element();
+        rows.push(scope_row);
+
+        rows.push(
+            div()
+                .px(px(9.))
+                .py(px(2.))
+                .text_size(theme::fs(10.5))
+                .text_color(theme::text_tertiary())
+                .child(lang.pick(
+                    "到顶 / 到底那几下不响；连续拖动时最快 25 下 / 秒，不会糊成一片。",
+                    "Nothing at 0% or 100%. While dragging it fires at most 25 ticks a second.",
+                ))
+                .into_any_element(),
+        );
+
+        vec![master, self.sub_group(rows)]
+    }
+
+    /// 「自定义音效」那一行：文件名 + 选择…。
+    fn sound_file_row(
+        &self,
+        sound: &crate::config::VolumeSoundConfig,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = sound
+            .custom_path()
+            .rsplit(['\\', '/'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                lang.pick("还没选文件，先用「轻点」", "No file yet — using Click")
+                    .to_string()
+            });
+        let store = self.config.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .rounded(px(theme::RADIUS_ROW))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(theme::fs(13.))
+                            .text_color(theme::text_primary())
+                            .child(lang.pick("自定义音效文件", "Custom sound file")),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_tertiary())
+                            .truncate()
+                            .child(label),
+                    ),
+            )
+            .child(
+                div()
+                    .id("volume-sound-pick")
+                    .flex_none()
+                    .px(px(10.))
+                    .py(px(4.))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(theme::track())
+                    .text_size(theme::fs(11.))
+                    .text_color(theme::text_primary())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    // 和托盘图标那个「选择…」一样：模态框必须在别的线程上开，
+                    // 而且要用 mouse_down 先拦住「点别处」那一层（见 app_pick）。
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let store = store.clone();
+                            let owner = crate::windows::platform::hwnd_of(window)
+                                .map(|hwnd| hwnd.0 as isize)
+                                .unwrap_or(0);
+                            let receiver = crate::platform::app_pick::pick_sound_async(owner);
+                            cx.spawn(async move |this, cx| {
+                                let Ok(path) = receiver.recv().await else {
+                                    return;
+                                };
+                                let Some(path) = path else {
+                                    return;
+                                };
+                                let _ = store.borrow_mut().update(|config| {
+                                    config.volume_sound.custom = path;
+                                    config.volume_sound.style =
+                                        crate::config::VolumeSoundStyle::Custom;
+                                });
+                                // 挑完先放一声：不用再点「试听」确认选对了。
+                                crate::platform::sound::preview(&store.borrow().get().clone());
+                                let _ = this.update_in(cx, |_, window, cx| refresh_ui(window, cx));
+                            })
+                            .detach();
+                        }),
+                    )
+                    .child(lang.pick("选择…", "Choose…")),
+            )
+            .into_any_element()
+    }
+
+    /// 「试听」按钮（音效那一行右边那个小按钮）。
+    fn preview_button(
+        &self,
+        id: &'static str,
+        lang: Lang,
+        on_click: impl Fn() + 'static,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(id))
+            .flex_none()
+            .px(px(9.))
+            .py(px(2.))
+            .rounded(px(4.))
+            .text_size(theme::fs(11.))
+            .text_color(theme::text_secondary())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(move |_, _, _| on_click())
+            .child(lang.pick("试听", "Test"))
+            .into_any_element()
+    }
+
+    /// 一行里并排的小勾选（音效的生效范围就是这么排的三个）。
+    fn tick_chip(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        on: bool,
+        on_click: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .px(px(4.))
+            .py(px(2.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(move |_, window, cx| on_click(window, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(14.))
+                    .rounded(px(3.5))
+                    .border(px(1.))
+                    .border_color(if on {
+                        theme::accent()
+                    } else {
+                        theme::border_strong()
+                    })
+                    .bg(if on {
+                        theme::accent()
+                    } else {
+                        theme::surface_sunken()
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(on, |style| style.child(icon("check", 11.0, theme::text_primary()))),
+            )
+            .child(
+                div()
+                    .text_size(theme::fs(11.5))
+                    .text_color(if on {
+                        theme::text_primary()
+                    } else {
+                        theme::text_tertiary()
+                    })
+                    .child(label),
+            )
+            .into_any_element()
+    }
+
+    /// 黑名单页：禁用 Bolume 的应用程序 + 全屏。
     ///
     /// 版式照 Quicker 的黑名单：一张卡片，上面一排动作（拖到窗口 / 添加程序 / 添加目录），
-    /// 下面是一条条卡片式的名单，最后是「全屏状态禁用」。
+    /// 下面是一条条卡片式的名单。全屏单独一张：开关 + 它管的例外名单。
     fn blocklist_page(
         &self,
         config: &Config,
@@ -8476,34 +8841,51 @@ impl Settings {
                 },
             )
         };
-        rows.push(fullscreen);
 
-        // 「全屏例外」：单独一份名单，和上面的让路名单互不相干。
+        // 全屏这一张卡：上面一个「全屏状态禁用」，下面的例外名单归它管。
         //
-        // 只有开了「全屏状态禁用」它才有意义，所以摆在那个开关后面 —— 不看全屏开关
-        // 的人不会先撞上这一块。两份名单共用同一套行 / 输入框 / 拾取按钮。
-        let mut exempt_rows = vec![
-            self.block_actions(BlockList::Exempt, lang, cx),
-            self.block_name_input(BlockList::Exempt, lang, cx),
-        ];
-        exempt_rows.push(
-            div()
-                .px(px(9.))
-                .py(px(2.))
-                .text_size(theme::fs(10.5))
-                .text_color(theme::text_tertiary())
-                .child(lang.pick(
-                    "这些应用就算全屏也照常启用 Bolume：「全屏状态禁用」对它们不生效（上面那份让路名单仍然算数）。",
-                    "These apps keep Bolume working even in fullscreen — the fullscreen switch above does not apply to them (the block list still does).",
-                ))
-                .into_any_element(),
-        );
-        exempt_rows.push(self.block_entry_rows(
-            BlockList::Exempt,
-            &block.fullscreen_exempt,
-            lang,
-            cx,
-        ));
+        // 原来是两张卡（开关塞在让路名单末尾、例外另起一张），读起来像两件不相干的
+        // 事 —— 其实「这几个例外」说的就是上面那个开关。合并之后开关和它管的名单
+        // 圈进同一个框，和快捷键页「按住连续触发」那套版式一致。
+        //
+        // 例外名单只在开关打开时出现：关着的时候它不生效，摊在那儿只会让人以为
+        // 例外名单自己就能让 Bolume 工作。名单数据不动，再打开还在。
+        let mut fullscreen_rows = vec![fullscreen];
+        if block.fullscreen {
+            let mut exempt_rows = vec![
+                div()
+                    .px(px(9.))
+                    .pt(px(2.))
+                    .text_size(theme::fs(11.5))
+                    .text_color(theme::text_secondary())
+                    .child(lang.pick(
+                        "以下应用全屏时照常启用",
+                        "These apps keep working in fullscreen",
+                    ))
+                    .into_any_element(),
+                self.block_actions(BlockList::Exempt, lang, cx),
+                self.block_name_input(BlockList::Exempt, lang, cx),
+            ];
+            exempt_rows.push(
+                div()
+                    .px(px(9.))
+                    .py(px(2.))
+                    .text_size(theme::fs(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick(
+                        "这些应用就算全屏也照常启用 Bolume：「全屏状态禁用」对它们不生效（上面那份让路名单仍然算数）。",
+                        "These apps keep Bolume working even in fullscreen — the fullscreen switch above does not apply to them (the block list still does).",
+                    ))
+                    .into_any_element(),
+            );
+            exempt_rows.push(self.block_entry_rows(
+                BlockList::Exempt,
+                &block.fullscreen_exempt,
+                lang,
+                cx,
+            ));
+            fullscreen_rows.push(self.sub_group(exempt_rows));
+        }
 
         vec![
             self.section(
@@ -8515,9 +8897,9 @@ impl Settings {
                 rows,
             ),
             self.section(
-                lang.pick("全屏时照常启用", "Keep working in fullscreen"),
+                lang.pick("全屏", "Fullscreen"),
                 "maximize",
-                exempt_rows,
+                fullscreen_rows,
             ),
             div()
                 .px(px(9.))

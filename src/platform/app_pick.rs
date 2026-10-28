@@ -104,7 +104,8 @@ fn is_cloaked(hwnd: HWND) -> bool {
 pub fn pick_path_async(folder: bool) -> async_channel::Receiver<Option<String>> {
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let path = unsafe { show_dialog(folder, false) };
+        let kind = if folder { PickKind::Folder } else { PickKind::App };
+        let path = unsafe { show_dialog_owned(kind, 0) };
         let _ = sender.send_blocking(path);
     });
     receiver
@@ -117,21 +118,39 @@ pub fn pick_path_async(folder: bool) -> async_channel::Receiver<Option<String>> 
 /// 消息灌进 gpui 的 WndProc，而这时鼠标事件那一层的状态还借在手上 —— 一借就是
 /// `BorrowMutError`，release 是 `panic = "abort"`，表现是「点一下程序直接没了」。
 pub fn pick_icon_async(owner: isize) -> async_channel::Receiver<Option<String>> {
+    pick_async(PickKind::Icon, owner)
+}
+
+/// 选一个音效文件（`.wav`）：音量音效「自定义」用的。
+pub fn pick_sound_async(owner: isize) -> async_channel::Receiver<Option<String>> {
+    pick_async(PickKind::Sound, owner)
+}
+
+fn pick_async(kind: PickKind, owner: isize) -> async_channel::Receiver<Option<String>> {
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let path = unsafe { show_dialog_owned(false, true, owner) };
+        let path = unsafe { show_dialog_owned(kind, owner) };
         let _ = sender.send_blocking(path);
     });
     receiver
 }
 
-unsafe fn show_dialog(folder: bool, icon: bool) -> Option<String> {
-    unsafe { show_dialog_owned(folder, icon, 0) }
+/// 选择框要挑什么（标题与过滤器都跟着它走）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickKind {
+    /// 一个可执行文件（黑名单）。
+    App,
+    /// 一个目录（黑名单）。
+    Folder,
+    /// 一个 `.ico`（托盘图标）。
+    Icon,
+    /// 一个 `.wav`（音量音效）。
+    Sound,
 }
 
 /// `owner` 是设置窗的 HWND（0 = 不认主）。给了主，对话框就是**模态**：
 /// 一直是设置窗的前面那一层，也不会被再点一下「选择…」叠出第二个。
-unsafe fn show_dialog_owned(folder: bool, icon: bool, owner: isize) -> Option<String> {
+unsafe fn show_dialog_owned(kind: PickKind, owner: isize) -> Option<String> {
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
         CoTaskMemFree, CoUninitialize,
@@ -164,29 +183,35 @@ unsafe fn show_dialog_owned(folder: bool, icon: bool, owner: isize) -> Option<St
         }
     };
     options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
-    options = if folder {
+    options = if kind == PickKind::Folder {
         options | FOS_PICKFOLDERS
     } else {
         options | FOS_FILEMUSTEXIST
     };
     let _ = unsafe { dialog.SetOptions(options) };
-    if icon {
-        // 只让选 .ico：手打路径或者挑错格式，最后都读不出一张图。
-        let spec = [windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC {
+    // 手打路径或者挑错格式，最后都读不出一张图 / 一段音效，不如一开始就只让选对的。
+    let filter = match kind {
+        PickKind::Icon => Some(windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC {
             pszName: w!("图标文件 (*.ico)"),
             pszSpec: w!("*.ico"),
-        }];
+        }),
+        PickKind::Sound => Some(windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC {
+            pszName: w!("音效文件 (*.wav)"),
+            pszSpec: w!("*.wav"),
+        }),
+        _ => None,
+    };
+    if let Some(filter) = filter {
+        let spec = [filter];
         let _ = unsafe { dialog.SetFileTypes(&spec) };
     }
-    let _ = unsafe {
-        dialog.SetTitle(if icon {
-            w!("选择托盘图标")
-        } else if folder {
-            w!("Select the folder to disable Bolume in")
-        } else {
-            w!("Select the app to disable Bolume in")
-        })
+    let title = match kind {
+        PickKind::Icon => w!("选择托盘图标"),
+        PickKind::Sound => w!("选择音效文件"),
+        PickKind::Folder => w!("Select the folder to disable Bolume in"),
+        PickKind::App => w!("Select the app to disable Bolume in"),
     };
+    let _ = unsafe { dialog.SetTitle(title) };
 
     // 用户取消会返回 HRESULT(0x800704C7)，这里一律当「没选」。
     let parent = (owner != 0).then(|| unsafe { HWND(owner as *mut _) });

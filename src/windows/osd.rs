@@ -1985,6 +1985,12 @@ impl Osd {
                 });
             }
         }
+        if (next - display).abs() > 0.0001 {
+            crate::platform::sound::step(
+                &config,
+                crate::config::VolumeGesture::HoverScroll,
+            );
+        }
         let (percent, db) = readouts(next, config.use_logarithmic_volume, min_db);
         self.state.percent = percent;
         self.state.db = db;
@@ -2047,6 +2053,9 @@ impl Osd {
                 });
             }
         }
+        if (display - self.state.fraction).abs() > 0.0001 {
+            crate::platform::sound::step(&config, crate::config::VolumeGesture::Drag);
+        }
         let (percent, db) = readouts(display, config.use_logarithmic_volume, min_db);
         self.state.percent = percent;
         self.state.db = db;
@@ -2087,6 +2096,8 @@ impl Osd {
         let sound = self.config.borrow().get().clone();
         if sound.release_sound
             && sound.release_sound_osd
+            // 同上：拖拽音效管着这根滑条，末一格已经响过。
+            && !sound.volume_sound.covers(crate::config::VolumeGesture::Drag)
             && matches!(self.state.function, OsdFunction::Volume | OsdFunction::Mute)
         {
             crate::platform::sound::tick(window);

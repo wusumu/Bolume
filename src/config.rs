@@ -256,6 +256,150 @@ impl Default for UnmuteOnChange {
     }
 }
 
+/// 调音量时的音效：每变化一档响一下。
+///
+/// 思路照 Volume2 —— 调的时候耳朵有个准信儿，不用一直盯着卡片。音源分两类：
+/// 代码里合成的内置音效（不占体积、不依赖采样率）和用户自选的本地 WAV。
+/// 生效范围按**手势**分开勾：很多人只想要键盘那一下，拖滑条时宁可安静。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VolumeSoundConfig {
+    /// 总开关。
+    pub enabled: bool,
+    /// 用哪个音源。
+    pub style: VolumeSoundStyle,
+    /// 自定义音效文件（WAV）；空 = 没选（这时退回「轻点」）。
+    pub custom: String,
+    /// 音效本身有多响（0..=100，相对满幅）。设备音量照旧由音量决定。
+    pub volume: u32,
+    /// 快捷键（含硬件音量键、调当前应用的快捷键）也响。
+    pub on_hotkey: bool,
+    /// 滚轮（面板悬停滚动 / 托盘图标滚动 / 应用音量条滚动）也响。
+    pub on_wheel: bool,
+    /// 拖滑条（主音量 / 应用音量 / 屏幕提示里那根）也响。
+    pub on_drag: bool,
+}
+
+impl Default for VolumeSoundConfig {
+    fn default() -> Self {
+        // 默认关：这是个「想要的人才会开」的功能，新装就让它出声音太主动。
+        // 范围默认三种全勾 —— 打开总开关就是「调什么都响」，这才是它的卖点。
+        Self {
+            enabled: false,
+            style: VolumeSoundStyle::Click,
+            custom: String::new(),
+            volume: 60,
+            on_hotkey: true,
+            on_wheel: true,
+            on_drag: true,
+        }
+    }
+}
+
+impl VolumeSoundConfig {
+    /// 这次操作该不该响：总开关 + 手势范围。
+    pub fn covers(&self, gesture: VolumeGesture) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match gesture {
+            VolumeGesture::Hotkey | VolumeGesture::AppHotkey => self.on_hotkey,
+            VolumeGesture::HoverScroll
+            | VolumeGesture::TrayScroll
+            | VolumeGesture::AppHoverScroll => self.on_wheel,
+            VolumeGesture::Drag | VolumeGesture::AppDrag => self.on_drag,
+        }
+    }
+
+    /// 自定义文件的路径（没选就空串）。
+    pub fn custom_path(&self) -> &str {
+        self.custom.trim()
+    }
+
+    /// 要不要用自定义文件：选了「自定义」并且真的挑了一个文件。
+    pub fn uses_custom_file(&self) -> bool {
+        self.style == VolumeSoundStyle::Custom && !self.custom_path().is_empty()
+    }
+
+    /// 音源标识（含文件时间戳）：音效缓存拿它当键，换了文件 / 改了文件就会重读。
+    pub fn source_key(&self) -> String {
+        if self.uses_custom_file() {
+            let path = self.custom_path();
+            let stamp = std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            format!("file:{path}:{stamp}")
+        } else if self.style == VolumeSoundStyle::Custom {
+            // 选了「自定义」但还没挑文件：退回默认那一声，总比按了没反应好。
+            format!("builtin:{}", VolumeSoundStyle::Click.key())
+        } else {
+            format!("builtin:{}", self.style.key())
+        }
+    }
+}
+
+/// 内置音效 + 「自定义」。
+///
+/// 都是代码里合成的一段短音，各有个性：轻点短促、滴答清亮、气泡上滑、
+/// 木鱼发闷、电子带方波味、铃音拖得长一点。名字就是听感，不用再解释。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VolumeSoundStyle {
+    /// 轻点：最短促的一下「嗒」。
+    #[default]
+    Click,
+    /// 滴答：高一点的「滴」。
+    Tick,
+    /// 气泡：「啵」，带点上滑。
+    Pop,
+    /// 木鱼：闷一点的木质敲击。
+    Wood,
+    /// 电子：方波味的「哔」。
+    Blip,
+    /// 铃音：拖得长一点的「叮」。
+    Chime,
+    /// 自定义：播 `custom` 指的那个文件。
+    Custom,
+}
+
+impl VolumeSoundStyle {
+    /// 界面里的顺序（分段选择按这个排）。
+    pub const ALL: [Self; 7] = [
+        Self::Click,
+        Self::Tick,
+        Self::Pop,
+        Self::Wood,
+        Self::Blip,
+        Self::Chime,
+        Self::Custom,
+    ];
+
+    /// 配置里认的那个名字（也当音效缓存的键）。
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::Tick => "tick",
+            Self::Pop => "pop",
+            Self::Wood => "wood",
+            Self::Blip => "blip",
+            Self::Chime => "chime",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// 分段选择控件用的序号。
+    pub fn index(self) -> u32 {
+        Self::ALL.iter().position(|item| *item == self).unwrap_or(0) as u32
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        Self::ALL.get(index as usize).copied().unwrap_or_default()
+    }
+}
+
 /// 一次调音量的操作来自哪里。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VolumeGesture {
@@ -1301,7 +1445,9 @@ impl StartupProfile {
 /// 字段一起删），打底只剩深色 / 浅色两套模板，外观全由底色 + 强调色决定。
 /// 亮暗两档的底色给了默认值（浅色档倒数第一个、深色档第四个），老配置里空着
 /// 的那两格一并填上 —— 空着的话亮色档会落到深色模板上。
-const CONFIG_REV: u32 = 72;
+/// rev 73：调音量的音效（`volume_sound`）是新字段，默认关 —— serde 默认就是
+/// 「关 + 轻点 + 三种手势全勾」，老配置读进来什么都不用搬，这里只留个记号。
+const CONFIG_REV: u32 = 73;
 
 /// 面板弹出动画的风格。
 ///
@@ -3964,6 +4110,10 @@ pub struct Config {
     /// 调音量时解除静音（方向 × 操作方式，每种调法各调各的）。
     pub unmute: UnmuteOnChange,
 
+    /// 调音量时的音效（每变化一档响一下，范围按手势勾）。
+    #[serde(default)]
+    pub volume_sound: VolumeSoundConfig,
+
     /// 托盘悬浮提示的自定义内容。
     pub tooltip: TooltipConfig,
 
@@ -4260,6 +4410,7 @@ impl Default for Config {
             device_icons: Vec::new(),
             volume_cap: VolumeCap::default(),
             unmute: UnmuteOnChange::default(),
+            volume_sound: VolumeSoundConfig::default(),
             tooltip: TooltipConfig::default(),
             brightness: BrightnessConfig::default(),
             osd: OsdConfig::default(),
@@ -7177,6 +7328,66 @@ mod tests {
         assert_eq!(config.flyout_width(), FLYOUT_WIDTH_RANGE.1 as f32);
         config.brightness.width = 1;
         assert_eq!(config.brightness_width(), 120.0);
+    }
+
+    /// 音量音效：老配置里没有这一节时读成「关 + 轻点 + 三手势全勾」，
+    /// 存一轮名字也不丢（枚举按 kebab-case 写盘）。
+    #[test]
+    fn volume_sound_defaults_and_round_trips() {
+        let legacy: Config = serde_json::from_str(r#"{"config_rev": 72}"#).expect("老配置要能读");
+        let sound = &legacy.volume_sound;
+        assert!(!sound.enabled, "新装 / 老配置一律不开");
+        assert_eq!(sound.style, VolumeSoundStyle::Click);
+        assert_eq!(sound.volume, 60);
+        assert!(sound.on_hotkey && sound.on_wheel && sound.on_drag);
+        assert!(sound.custom.is_empty());
+
+        // 存一轮再读回来，选择与范围都得原样。
+        let mut config = Config::default();
+        config.volume_sound.enabled = true;
+        config.volume_sound.style = VolumeSoundStyle::Chime;
+        config.volume_sound.on_wheel = false;
+        config.volume_sound.custom = "C:////sounds////tick.wav".to_string();
+        let text = serde_json::to_string(&config).expect("要能写");
+        let back: Config = serde_json::from_str(&text).expect("要能读回来");
+        assert!(back.volume_sound.enabled);
+        assert_eq!(back.volume_sound.style, VolumeSoundStyle::Chime);
+        assert!(!back.volume_sound.on_wheel);
+        assert_eq!(back.volume_sound.custom, "C:////sounds////tick.wav");
+
+        // 分段选择按序号来回：顺序和 `ALL` 一致，超出范围落到第一个。
+        for style in VolumeSoundStyle::ALL {
+            assert_eq!(VolumeSoundStyle::from_index(style.index()), style);
+        }
+        assert_eq!(VolumeSoundStyle::from_index(99), VolumeSoundStyle::Click);
+    }
+
+    /// 三种手势的范围映射：快捷键 / 滚轮 / 拖拽各管各的，应用那几种跟主设备同类。
+    #[test]
+    fn volume_sound_scope_maps_every_gesture() {
+        let mut sound = VolumeSoundConfig {
+            enabled: true,
+            on_hotkey: true,
+            on_wheel: false,
+            on_drag: false,
+            ..Default::default()
+        };
+        assert!(sound.covers(VolumeGesture::Hotkey));
+        assert!(sound.covers(VolumeGesture::AppHotkey));
+        assert!(!sound.covers(VolumeGesture::HoverScroll));
+        assert!(!sound.covers(VolumeGesture::AppDrag));
+
+        sound.on_wheel = true;
+        assert!(sound.covers(VolumeGesture::TrayScroll));
+        assert!(sound.covers(VolumeGesture::AppHoverScroll));
+        assert!(!sound.covers(VolumeGesture::Drag));
+
+        sound.on_drag = true;
+        assert!(sound.covers(VolumeGesture::Drag));
+        assert!(sound.covers(VolumeGesture::AppDrag));
+
+        sound.enabled = false;
+        assert!(!sound.covers(VolumeGesture::Hotkey));
     }
 
     #[test]

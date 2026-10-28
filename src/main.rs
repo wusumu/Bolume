@@ -127,6 +127,25 @@ fn main() {
         return;
     }
 
+    if let Some(index) = args.iter().position(|arg| arg == "--probe-sound-watch") {
+        let seconds = args
+            .get(index + 1)
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(5.0);
+        probe::run_sound_watch(seconds);
+        return;
+    }
+
+    if let Some(index) = args.iter().position(|arg| arg == "--probe-sound") {
+        // 用法：--probe-sound [音效名] [音量%]，例如 --probe-sound chime 90
+        let style = args.get(index + 1).map(|value| value.as_str());
+        let volume = args
+            .get(index + 2)
+            .and_then(|value| value.parse::<u32>().ok());
+        probe::run_sound(style, volume);
+        return;
+    }
+
     if let Some(index) = args.iter().position(|arg| arg == "--probe-appvol") {
         // 用法：--probe-appvol <pid> <0~100>
         // 走的就是面板滑块那条命令，用来查「单独调应用音量没反应」。

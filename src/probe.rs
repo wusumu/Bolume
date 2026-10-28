@@ -352,6 +352,111 @@ pub fn run_display(write: Option<(&str, u32)>, rounds: u32) {
 /// 用来回答「把应用指到别的设备之后拖它的音量没反应」这类问题：
 /// 会先确认这个 pid 在不在会话名单里 —— 会话是挂在设备上的，应用跑去别台设备之后
 /// 如果只枚举默认设备就找不到它，命令会被直接丢掉。
+/// 默认播放端点的电平表（探针专用：直接读，不经过引擎快照）。
+fn open_meter() -> Option<windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation> {
+    use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
+    use windows::Win32::Media::Audio::{
+        ERole, IMMDeviceEnumerator, MMDeviceEnumerator, eRender,
+    };
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, ERole(1)).ok()?;
+        device.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None).ok()
+    }
+}
+
+/// 探针：盯一段时间的端点电平，每 100ms 打一个峰值。
+///
+/// 用来回答「按音量键到底响没响」：另一头按键，这头看哪一格跳起来。
+/// 用法：`--probe-sound-watch <秒>`（默认 5 秒）。
+pub fn run_sound_watch(seconds: f32) {
+    let _apartment = crate::audio::com::ComApartment::init_mta();
+    let Some(meter) = open_meter() else {
+        println!("读不到默认端点的电平表");
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs_f32(seconds.max(1.0));
+    print!("每 100ms 的峰值：");
+    while Instant::now() < deadline {
+        let mut peak = 0.0f32;
+        let bucket = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < bucket {
+            if let Ok(value) = unsafe { meter.GetPeakValue() } {
+                peak = peak.max(value);
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        print!("{peak:.2} ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+}
+
+/// 探针：音量音效到底有没有声音。
+///
+/// 播指定音效，同时**直接**（不经引擎快照）每 3ms 读一次默认端点的电平表：
+/// 静息 → 播放期间峰值抬起来了，就说明 `PlaySoundW` 那条路真把声音送进了端点。
+/// WAV 头写错、`SND_MEMORY` 那块内存被提前释放、设备静音，都会表现成「一动不动」。
+///
+/// 为什么不信引擎快照：空闲时快照是慢节奏的（一秒几份），而音效只有 20~300ms，
+/// 短的那几种正好落在两次采样中间 —— 拿快照判断会把「有声音」判成「没声音」。
+///
+/// 用法：`--probe-sound [轻点名] [音量%]`，例如 `--probe-sound chime 90`。
+pub fn run_sound(style: Option<&str>, volume: Option<u32>) {
+    let _apartment = crate::audio::com::ComApartment::init_mta();
+    let Some(meter) = open_meter() else {
+        println!("读不到默认端点的电平表，这个探针在这台机器上用不了");
+        return;
+    };
+
+    let mut config = crate::config::Config::default();
+    config.volume_sound.enabled = true;
+    config.volume_sound.volume = volume.unwrap_or(80).clamp(5, 100);
+    if let Some(name) = style {
+        config.volume_sound.style = crate::config::VolumeSoundStyle::ALL
+            .into_iter()
+            .find(|item| item.key() == name)
+            .unwrap_or_default();
+    }
+    println!(
+        "音效 {:?}（{}）音量 {}%",
+        config.volume_sound.style,
+        config.volume_sound.style.key(),
+        config.volume_sound.volume
+    );
+
+    let read = |window: Duration| {
+        let deadline = Instant::now() + window;
+        let mut peak = 0.0f32;
+        while Instant::now() < deadline {
+            if let Ok(value) = unsafe { meter.GetPeakValue() } {
+                peak = peak.max(value);
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        peak
+    };
+
+    // 先量一段静息当基线：机器上正在放歌时这个值本来就高，要跟播放期间分开看。
+    let baseline = read(Duration::from_millis(300));
+    let mut loudest = 0.0f32;
+    for _ in 0..3 {
+        crate::platform::sound::preview(&config);
+        loudest = loudest.max(read(Duration::from_millis(350)));
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    println!("静息峰值 {baseline:.3} → 播放期间 {loudest:.3}");
+    if loudest > baseline + 0.01 {
+        println!("结论：有声音");
+    } else {
+        println!("结论：没听到 —— 检查设备是否静音 / 音量为 0");
+    }
+}
+
 pub fn run_appvol(pid: u32, percent: f32) {
     let paths = AppPaths::discover();
     let engine = AudioEngine::spawn(paths.icons_dir(), 64, app_name_capitalize());
