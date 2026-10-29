@@ -2680,6 +2680,11 @@ pub struct OsdCard {
     /// 背景色（`#rrggbb`）；空 = 跟随主题。
     #[serde(default)]
     pub color: String,
+    /// 整张卡片的旋转角度（度，顺时针，-180..180）。0 = 不转。
+    ///
+    /// 和元素旋转一样绕自己中心转；连投影一起转，窗口会按转后的包围盒撑开。
+    #[serde(default)]
+    pub rotation: i32,
 }
 
 /// OSD 卡片的自定义配色。空串 = 跟随当前主题。
@@ -2982,6 +2987,9 @@ pub struct OsdConfig {
     pub bar_round: u32,
     /// 不透明度（30..100）。
     pub opacity: u32,
+    /// 当前模板的卡片旋转角度（度，顺时针）。和尺寸一样由 `view()` 铺开。
+    #[serde(default)]
+    pub rotation: i32,
 
     /// 贴哪儿。
     pub anchor: OsdAnchor,
@@ -3262,6 +3270,7 @@ impl Default for OsdConfig {
             corner: 10,
             bar_round: 100,
             opacity: 100,
+            rotation: 0,
             anchor: OsdAnchor::BottomCenter,
             custom_x: 60,
             custom_y: 60,
@@ -3368,6 +3377,7 @@ impl OsdConfig {
             corner: self.corner,
             opacity: self.opacity,
             color: self.colors.card.clone(),
+            rotation: self.rotation,
         }
     }
 
@@ -3390,6 +3400,9 @@ impl OsdConfig {
     pub fn set_card(&mut self, edit: impl FnOnce(&mut OsdCard)) {
         let mut card = self.card();
         edit(&mut card);
+        // 角度存规范值（-180..180）：不然连按 + 会一路涨到几千度，
+        // 存进配置里看着也莫名其妙。
+        card.rotation = normalize_rotation(card.rotation as f32).round() as i32;
         match self.template() {
             OsdTemplate::Volume => {
                 self.width = card.width;
@@ -3397,6 +3410,7 @@ impl OsdConfig {
                 self.corner = card.corner;
                 self.opacity = card.opacity;
                 self.colors.card = card.color;
+                self.rotation = card.rotation;
             }
             OsdTemplate::Media => self.media_card = Some(card),
             OsdTemplate::Brightness => self.brightness_card = Some(card),
@@ -3409,6 +3423,8 @@ impl OsdConfig {
     /// `colors.card` 这几个字段，在入口处铺一次比让每个调用点都去问模板简单得多，
     /// 也不会漏掉某一处（比如阴影和尺寸手柄）。
     pub fn view(mut self) -> OsdConfig {
+        // 手改过的配置里可能存着 195° 这种，读的时候就摆正（等于 -165°）。
+        self.rotation = normalize_rotation(self.rotation as f32).round() as i32;
         let card = match self.template() {
             OsdTemplate::Volume => None,
             OsdTemplate::Media => self.media_card.clone(),
@@ -3420,6 +3436,7 @@ impl OsdConfig {
             self.corner = card.corner;
             self.opacity = card.opacity;
             self.colors.card = card.color;
+            self.rotation = card.rotation;
         }
         self
     }
@@ -3813,6 +3830,7 @@ impl OsdConfig {
             corner: defaults.corner,
             opacity: defaults.opacity,
             color: defaults.colors.card.clone(),
+            rotation: defaults.rotation,
         };
         match self.template() {
             OsdTemplate::Volume => {
@@ -3820,6 +3838,7 @@ impl OsdConfig {
                 self.height = factory.height;
                 self.corner = factory.corner;
                 self.opacity = factory.opacity;
+                self.rotation = factory.rotation;
             }
             // 媒体键 / 亮度模板：音量模板的背景色原样还回去，只动自己那份。
             OsdTemplate::Media => {

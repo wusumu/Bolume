@@ -770,6 +770,9 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// Bolume patch: 插入时所在元素的旋转变换（设备像素；单位矩阵 = 没转）。
+    /// 判命中前先把光标点按它的逆矩阵转回元素自己的坐标，斜着的元素才点得准。
+    pub transformation: TransformationMatrix,
 }
 
 impl Hitbox {
@@ -802,6 +805,21 @@ impl Hitbox {
     pub fn should_handle_scroll(&self, window: &Window) -> bool {
         self.id.should_handle_scroll(window)
     }
+}
+
+/// Bolume patch: 把设备像素坐标点按 `matrix` 的逆变换转回去。
+///
+/// 我们只写「纯旋转 + 平移」，2x2 那块是正交矩阵，所以逆就是转置：
+/// `p = Rᵀ · (out - t)`。
+fn unrotate_point(matrix: TransformationMatrix, point: Point<Pixels>) -> Point<Pixels> {
+    let r = matrix.rotation_scale;
+    let t = matrix.translation;
+    let x = point.x.0 - t[0];
+    let y = point.y.0 - t[1];
+    Point::new(
+        Pixels(r[0][0] * x + r[1][0] * y),
+        Pixels(r[0][1] * x + r[1][1] * y),
+    )
 }
 
 /// How the hitbox affects mouse behavior.
@@ -1020,10 +1038,43 @@ impl Frame {
             .into_inner()
     }
 
-    pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
+    pub(crate) fn hit_test(&self, position: Point<Pixels>, scale_factor: f32) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
+            // Bolume patch: 转过的东西按「按逆矩阵转回去之后」的位置判包含，
+            // 否则斜着的卡片 / 元素点上去永远偏差一个角度。
+            let rotated = hitbox.transformation != TransformationMatrix::unit();
+            let local = if rotated {
+                let scaled = Point::new(
+                    Pixels(position.x.0 * scale_factor),
+                    Pixels(position.y.0 * scale_factor),
+                );
+                let local = unrotate_point(hitbox.transformation, scaled);
+                Point::new(
+                    Pixels(local.x.0 / scale_factor),
+                    Pixels(local.y.0 / scale_factor),
+                )
+            } else {
+                position
+            };
+            // 转过的话 content_mask 还是窗口坐标，和局部坐标不是一套，
+            // 混着求交会误判；这类元素只在编辑画布里出现，直接用自身矩形判。
+            if rotated {
+                if hitbox.bounds.contains(&local) {
+                    hit_test.ids.push(hitbox.id);
+                    if !set_hover_hitbox_count
+                        && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
+                    {
+                        hit_test.hover_hitbox_count = hit_test.ids.len();
+                        set_hover_hitbox_count = true;
+                    }
+                    if hitbox.behavior == HitboxBehavior::BlockMouse {
+                        break;
+                    }
+                }
+                continue;
+            }
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -3056,7 +3107,9 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self
+            .next_frame
+            .hit_test(self.mouse_position, self.scale_factor);
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
@@ -4836,6 +4889,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            transformation: self.element_transformation(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -5279,7 +5333,9 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self
+            .rendered_frame
+            .hit_test(self.mouse_position(), self.scale_factor);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);

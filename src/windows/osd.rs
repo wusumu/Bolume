@@ -217,6 +217,22 @@ pub fn card_size(cfg: &OsdConfig) -> (f32, f32) {
     )
 }
 
+/// 卡片旋转之后的包围盒（逻辑像素）。
+///
+/// 窗口、预览框、贴边都按这个尺寸算 —— 按原尺寸算的话，转个 90° 卡片两侧就被裁掉了。
+pub fn rotated_bounds(cfg: &OsdConfig) -> (f32, f32) {
+    let (width, height) = card_size(cfg);
+    let angle = cfg.rotation as f32;
+    if angle == 0.0 {
+        return (width, height);
+    }
+    let (sin, cos) = angle.to_radians().sin_cos();
+    (
+        (width * cos).abs() + (height * sin).abs(),
+        (width * sin).abs() + (height * cos).abs(),
+    )
+}
+
 /// 元素高度与它自己的 `size` 之间的倍数。
 ///
 /// 图标 / 音量条的 `size` 就是高度本身；标题是两行（标题 + 副标题），
@@ -980,6 +996,9 @@ pub fn card_visual(
 
     // 投影画在卡片外面，所以套一层不裁剪的外壳：外壳给阴影留位置，
     // 卡片自己继续 `overflow_hidden` 管圆角。
+    //
+    // 这里**不负责整体旋转**：要转的调用方拿 `card_frame` 套一层，
+    // 这样阴影、卡片、编辑器里的元素框能一起转，转轴也不会各算各的。
     let mut shell = div()
         .relative()
         .flex_none()
@@ -989,6 +1008,35 @@ pub fn card_visual(
         shell = shell.child(shadow);
     }
     shell.child(card)
+}
+
+/// 把整张卡片（含投影）按 `cfg.rotation` 转一圈，外面留出转后的包围盒。
+///
+/// 转轴是卡片自己的中心：包围盒中心 = 卡片中心，所以卡片在盒子里居中摆即可。
+/// 只画不转的东西（比如元素框）也能塞进 `content` 里一起转 —— 编辑器和窗口共用这一套，
+/// 免得两边各算一遍转轴。
+pub fn card_frame(cfg: &OsdConfig, scale: f32, content: impl IntoElement) -> Div {
+    let (width, height) = card_size(cfg);
+    let (box_w, box_h) = rotated_bounds(cfg);
+    let core = div()
+        .relative()
+        .flex_none()
+        .w(px(width * scale))
+        .h(px(height * scale))
+        .rotate(cfg.rotation as f32)
+        .child(content);
+    div()
+        .relative()
+        .flex_none()
+        .w(px(box_w * scale))
+        .h(px(box_h * scale))
+        .child(
+            div()
+                .absolute()
+                .left(px((box_w - width) * 0.5 * scale))
+                .top(px((box_h - height) * 0.5 * scale))
+                .child(core),
+        )
 }
 
 /// 屏幕上的提示条窗口。
@@ -1534,7 +1582,9 @@ impl Osd {
     fn place(&mut self, window: &mut Window, cx: &mut Context<Self>, cfg: &OsdConfig) {
         // 窗口比卡片大一圈：投影要画到卡片外面去，窗口正好等于卡片的话会被裁掉。
         let pad = shadow_margin(cfg);
-        let (card_w, card_h) = card_size(cfg);
+        // 贴边与夹取都按**转后的包围盒**算：转 90° 之后卡片是竖着的，
+        // 按原尺寸贴边会让它一半跑到屏幕外面去。
+        let (card_w, card_h) = rotated_bounds(cfg);
         let (width, height) = (card_w + pad * 2.0, card_h + pad * 2.0);
         let area = target_area(self.monitor.unwrap_or(cfg.monitor));
         let margin = 24.0;
@@ -2315,6 +2365,8 @@ impl Render for Osd {
             );
         }
 
+        // 窗口按转后的包围盒摆放，卡片本体在这里转 —— 阴影跟着一起转。
+        let card = card_frame(&cfg, 1.0, card);
         div()
             .size_full()
             .flex()

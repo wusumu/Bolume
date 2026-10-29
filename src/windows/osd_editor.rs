@@ -76,6 +76,18 @@ const BAR_TRACK_COLORS: &[&str] = &["", "#000000", "#151519", "#2b2b2f", "#fffff
 /// 静音时的填充色：空 = 主题那层淡色（灰），其余给几档更醒目的提示色。
 const BAR_MUTED_COLORS: &[&str] = &["", "#6b7280", "#9aa3b2", "#d1d5db", "#f87171"];
 
+/// 按住元素边框角上的手柄转圈。
+#[derive(Clone, Copy)]
+struct RotateDrag {
+    target: RotationTarget,
+    /// 转轴（元素中心，窗口坐标）。
+    center: Point<Pixels>,
+    /// 按下时光标相对转轴的方向（弧度）。
+    start_angle: f32,
+    /// 按下那一刻的角度。
+    origin: f32,
+}
+
 #[derive(Clone, Copy)]
 struct MoveDrag {
     part: OsdPart,
@@ -296,7 +308,29 @@ impl TextEdit {
 /// 数值项一共几项：`index()` 的最大值 + 1，数组长度也跟着它走。
 ///
 /// 加一项就改这里 —— 忘了改会在 `slider_bounds[index]` 上直接 panic（len 8 / index 8）。
-const NUM_FIELDS: usize = 9;
+const NUM_FIELDS: usize = 11;
+
+/// 转角度的是谁：整张卡片（背景）还是某个元素。
+///
+/// 元素各自存一份角度、卡片自己一份，两边的 ±、滑条、手打都是同一套控件，
+/// 所以统一成这一个「目标」再分发。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RotationTarget {
+    /// 整张卡片（背景）。
+    Card,
+    /// 某个元素（绕自己的中心）。
+    Part(OsdPart),
+}
+
+impl RotationTarget {
+    /// 两条角度滑条各自的那一格矩形。
+    fn slot(self) -> usize {
+        match self {
+            RotationTarget::Card => 0,
+            RotationTarget::Part(_) => 1,
+        }
+    }
+}
 
 /// 右侧面板里可以手打数值的那几项。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +345,8 @@ enum NumField {
     ShadowY,
     ShadowBlur,
     ShadowOpacity,
+    /// 角度（元素自己或背景），手打时可以是负数。
+    Rotation(RotationTarget),
 }
 
 impl NumField {
@@ -331,12 +367,14 @@ impl NumField {
                 crate::config::OSD_SHADOW_OPACITY_RANGE.0 as i32,
                 crate::config::OSD_SHADOW_OPACITY_RANGE.1 as i32,
             ),
+            NumField::Rotation(_) => crate::config::OSD_ROTATION_RANGE,
         }
     }
 
     fn unit(self) -> &'static str {
         match self {
             NumField::Opacity | NumField::ShadowOpacity | NumField::BarCorner => "%",
+            NumField::Rotation(_) => "°",
             _ => "px",
         }
     }
@@ -352,6 +390,10 @@ impl NumField {
             NumField::ShadowY => 6,
             NumField::ShadowBlur => 7,
             NumField::ShadowOpacity => 8,
+            // 角度两条各有自己的格：背景和元素可能同时展开，
+            // 共用一个下标会让两格滑条抢同一个矩形。
+            NumField::Rotation(RotationTarget::Card) => 9,
+            NumField::Rotation(RotationTarget::Part(_)) => 10,
         }
     }
 
@@ -368,12 +410,21 @@ impl NumField {
             NumField::ShadowY => osd.shadow.offset_y,
             NumField::ShadowBlur => osd.shadow.blur as i32,
             NumField::ShadowOpacity => osd.shadow.opacity as i32,
+            NumField::Rotation(RotationTarget::Card) => osd.rotation,
+            NumField::Rotation(RotationTarget::Part(part)) => {
+                osd.rotation_of(part).round() as i32
+            }
         }
     }
 
     fn set(self, osd: &mut crate::config::OsdConfig, value: i32) {
         let (low, high) = self.range();
-        let value = value.clamp(low, high);
+        // 角度是**绕回来**的，不是夹住的：转到 195° 等于 -165°，
+        // 夹成 180° 的话按十下 + 就卡死了。
+        let value = match self {
+            NumField::Rotation(_) => value,
+            _ => value.clamp(low, high),
+        };
         match self {
             NumField::Width => osd.set_card(|card| card.width = value as u32),
             NumField::Height => osd.set_card(|card| card.height = value as u32),
@@ -384,6 +435,12 @@ impl NumField {
             NumField::ShadowY => osd.shadow.offset_y = value,
             NumField::ShadowBlur => osd.shadow.blur = value.max(0) as u32,
             NumField::ShadowOpacity => osd.shadow.opacity = value.clamp(0, 100) as u32,
+            NumField::Rotation(RotationTarget::Card) => {
+                osd.set_card(|card| card.rotation = value);
+            }
+            NumField::Rotation(RotationTarget::Part(part)) => {
+                osd.set_part_rotation(part, value as f32);
+            }
         }
     }
 }
@@ -540,10 +597,17 @@ pub struct OsdEditor {
     slider_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; NUM_FIELDS],
     /// 正在拖哪个滑条。
     slider_drag: Option<NumField>,
-    /// 元素「角度」那条小滑条的矩形（只量当前展开的那一个）。
-    rotation_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// 正在拖哪个元素的角度滑条。
-    rotation_drag: Option<OsdPart>,
+    /// 两条「角度」小滑条的矩形（0 = 背景，1 = 元素；只量当前展开的那两个）。
+    rotation_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 2],
+    /// 正在拖谁的角度滑条。
+    rotation_drag: Option<RotationTarget>,
+    /// 正按着元素边框角上的手柄转圈：记下转轴和按下那一刻的角度。
+    rotate_drag: Option<RotateDrag>,
+    /// 画布那块区域在窗口里的矩形（由 canvas 每帧写回）。
+    ///
+    /// 画布里所有坐标都是「相对画布左上角」的，而鼠标事件是窗口坐标 ——
+    /// 转角度要按「光标相对元素中心」的方向算，得先把两套坐标对上。
+    canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// 画布要不要按「已静音」画。
     ///
     /// 只有正在调「静音时音量条」那一段颜色时打开：不然那条颜色调完完全看不到效果。
@@ -606,8 +670,10 @@ impl OsdEditor {
             layer_rows: Rc::new(RefCell::new(Vec::new())),
             slider_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             slider_drag: None,
-            rotation_bounds: Rc::new(Cell::new(None)),
+            rotation_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             rotation_drag: None,
+            rotate_drag: None,
+            canvas_bounds: Rc::new(Cell::new(None)),
             preview_muted: false,
             preview: None,
             menu: None,
@@ -698,6 +764,7 @@ impl OsdEditor {
             || self.card_resize.is_some()
             || self.slider_drag.is_some()
             || self.rotation_drag.is_some()
+            || self.rotate_drag.is_some()
             || self.layer_drag.is_some()
             || self
                 .picker
@@ -739,6 +806,7 @@ impl OsdEditor {
         self.card_resize = None;
         self.slider_drag = None;
         self.rotation_drag = None;
+        self.rotate_drag = None;
         self.layer_drag = None;
         if let Some(part) = self.selected {
             if !self.cfg().shows_part(part) {
@@ -955,7 +1023,8 @@ impl OsdEditor {
                         edit.buffer.clear();
                         edit.fresh = false;
                     }
-                    if edit.buffer.chars().count() < 3 {
+                    // 最多 4 位：`-180`（角度）这种就是最长的了。
+                    if edit.buffer.chars().count() < 4 {
                         edit.buffer.push_str(&text);
                     }
                 }
@@ -1365,6 +1434,32 @@ const ICON_CHOICES: &[(&str, usize)] = &[
 ///
 /// 元素列表要按行数换算拖拽落点、滑条要按 x 换算数值，都得知道自己的矩形。
 /// 自绘元素拿不到「自己的 bounds」，用 canvas 的 prepaint 每帧写一次最省事。
+/// 把 `point` 绕 `center` 转 `degrees`（顺时针，和屏幕上的正角度一致）。
+fn rotate_about(center: (f32, f32), point: (f32, f32), degrees: f32) -> (f32, f32) {
+    if degrees == 0.0 {
+        return point;
+    }
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    let dx = point.0 - center.0;
+    let dy = point.1 - center.1;
+    (
+        center.0 + dx * cos - dy * sin,
+        center.1 + dx * sin + dy * cos,
+    )
+}
+
+/// 把屏幕上的位移按 `degrees` 反向转回去。
+///
+/// 卡片转着的时候，往右拖元素在屏幕上看起来是斜的 —— 得把位移换回卡片自己的
+/// 坐标系里，元素才跟着光标走，而不是斜着跑。
+fn unrotate_delta(dx: f32, dy: f32, degrees: f32) -> (f32, f32) {
+    if degrees == 0.0 {
+        return (dx, dy);
+    }
+    let (sin, cos) = (-degrees).to_radians().sin_cos();
+    (dx * cos - dy * sin, dx * sin + dy * cos)
+}
+
 fn measure_canvas(cell: Rc<Cell<Option<Bounds<Pixels>>>>) -> AnyElement {
     gpui::canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
         .absolute()
@@ -1596,6 +1691,9 @@ impl Render for OsdEditor {
         };
         let lang = self.lang();
         let (card_w, card_h) = osd::card_size(view);
+        // 卡片转了之后占的地方是**转后的包围盒**：画布按它缩放、按它居中，
+        // 45° 时才不会有一角被画布边缘切掉。
+        let (box_w, box_h) = osd::rotated_bounds(view);
         let viewport = window.viewport_size();
         let vw = viewport.width.as_f32();
         let vh = viewport.height.as_f32();
@@ -1607,13 +1705,19 @@ impl Render for OsdEditor {
         // 投影算进画面尺寸：扩散调大时影子往外长，如果只按卡片本体缩放，
         // 影子就会被画布边缘切掉一块（看起来像外面套了个框）。
         let shadow_pad = osd::shadow_margin(view);
-        let mut scale = (avail_w / (card_w + shadow_pad * 2.0))
-            .min(avail_h / (card_h + shadow_pad * 2.0))
+        let mut scale = (avail_w / (box_w + shadow_pad * 2.0))
+            .min(avail_h / (box_h + shadow_pad * 2.0))
             .clamp(0.2, 6.0);
+        // `pixel_w/h` 是**卡片本体**的显示尺寸（元素框、尺寸手柄都按它算），
+        // `box_*` 是转后包围盒 —— 外面那层盒子按包围盒摆。
         let mut pixel_w = card_w * scale;
         let mut pixel_h = card_h * scale;
-        let mut left = 44.0 + ((canvas_w - 88.0) - pixel_w).max(0.0) / 2.0;
-        let mut top = 44.0 + 40.0 + ((canvas_h - 80.0) - pixel_h).max(0.0) / 2.0;
+        // `left` / `top` 是**卡片本体**的左上角：元素框、尺寸手柄都按它算。
+        // 外面那层包围盒按包围盒居中，本体再往里缩半个差。
+        let mut left = 44.0 + ((canvas_w - 88.0) - box_w * scale).max(0.0) / 2.0
+            + (box_w * scale - pixel_w) * 0.5;
+        let mut top = 44.0 + 40.0 + ((canvas_h - 80.0) - box_h * scale).max(0.0) / 2.0
+            + (box_h * scale - pixel_h) * 0.5;
 
         // 拖卡片边缘改尺寸时把显示倍数和左上角冻住：否则卡一变宽、自动适配倍数就变小，
         // 手柄会从光标底下「跑掉」，越拖越偏 —— 这正是之前手感不对劲的原因。
@@ -1652,10 +1756,11 @@ impl Render for OsdEditor {
             }
         }
         let measure = osd::TextMeasure::new(window);
-        let mut card = osd::card_visual(&draft, &sample, scale, None, &measure, lang)
-            .absolute()
-            .left(px(left))
-            .top(px(top));
+        // 卡片本体不再自己摆绝对位置：整块（含旋转）交给后面的 `card_frame`，
+        // 元素框还是按「卡片自己的坐标」摆 —— 卡片一转，它们跟着一起转。
+        let mut card = osd::card_visual(&draft, &sample, scale, None, &measure, lang);
+        // 元素框那套坐标是相对卡片左上角的，角手柄算转轴时要加回来。
+        let card_origin = (left, top);
 
         // 元素框会互相重叠（标题底下往往压着若干额外文字），后画的盖住先画的。
         // 选中的那个排到最后画，它才永远在最上层：在右侧列表里点一下标题，
@@ -1878,6 +1983,84 @@ impl Render for OsdEditor {
                 );
             }
 
+            // 选中的元素在四角外再挂一个「转角度」的手柄：角上的方柄是改尺寸的，
+            // 转圈的放到框外面去，两个不抢位置。
+            if selected {
+                let rotate_cursor = gpui::CursorStyle::Crosshair;
+                for (ix, iy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                    let size = 11.0;
+                    let gap = 6.0;
+                    let kx = if ix < 0.0 {
+                        -gap - size
+                    } else {
+                        box_w + gap
+                    };
+                    let ky = if iy < 0.0 {
+                        -gap - size
+                    } else {
+                        box_h + gap
+                    };
+                    let pivot = (
+                        card_origin.0 + left + box_w / 2.0,
+                        card_origin.1 + y * scale + box_h / 2.0,
+                    );
+                    frame = frame.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "ed-rot-knob-{}-{}",
+                                part.index(),
+                                ((ix > 0.0) as u8) * 2 + (iy > 0.0) as u8
+                            )))
+                            .absolute()
+                            .left(px(kx))
+                            .top(px(ky))
+                            .w(px(size))
+                            .h(px(size))
+                            .rounded_full()
+                            .bg(theme::accent_soft())
+                            .border_1()
+                            .border_color(theme::accent())
+                            .cursor(rotate_cursor)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                    let origin = this
+                                        .canvas_bounds
+                                        .get()
+                                        .map(|bounds| {
+                                            (
+                                                bounds.origin.x.as_f32(),
+                                                bounds.origin.y.as_f32(),
+                                            )
+                                        })
+                                        .unwrap_or((0.0, 0.0));
+                                    let center = Point::new(
+                                        px(origin.0 + pivot.0),
+                                        px(origin.1 + pivot.1),
+                                    );
+                                    this.selected = Some(part);
+                                    this.dragging = None;
+                                    this.resizing = None;
+                                    this.guide = None;
+                                    this.rotate_drag = Some(RotateDrag {
+                                        target: RotationTarget::Part(part),
+                                        center,
+                                        start_angle: (event.position.y.as_f32()
+                                            - center.y.as_f32())
+                                        .atan2(
+                                            event.position.x.as_f32() - center.x.as_f32(),
+                                        ),
+                                        origin: this.cfg().rotation_of(part),
+                                    });
+                                    this.focus.focus(window, cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                }
+            }
+
             card = card.child(frame);
         }
 
@@ -2022,6 +2205,10 @@ impl Render for OsdEditor {
 
         // 卡片自身的尺寸手柄：右边中点、下边中点、右下角。
         // 手柄**跨在边线上**（一半在外），命中区比视觉大一圈，抓起来才跟手。
+        // 卡片转了之后，手柄要跟着转到**转后的边上**去（方块本身还是正的，
+        // 和 PS 里转一下物件、角上的把手仍旧横平竖直一个道理）。
+        let card_rot = cfg.rotation as f32;
+        let card_center = (left + pixel_w / 2.0, top + pixel_h / 2.0);
         let mut card_knobs = div()
             .absolute()
             .left(px(left))
@@ -2047,12 +2234,17 @@ impl Render for OsdEditor {
         ];
         for (edge, x, y, w, h) in edges {
             let corner = edge == CardEdge::Corner;
+            let (kx, ky) = rotate_about(
+                card_center,
+                (left + x + w / 2.0, top + y + h / 2.0),
+                card_rot,
+            );
             card_knobs = card_knobs.child(
                 div()
                     .id(SharedString::from(format!("ed-card-{}", corner as u8)))
                     .absolute()
-                    .left(px(x.max(0.0)))
-                    .top(px(y.max(0.0)))
+                    .left(px((kx - w / 2.0 - left).max(0.0)))
+                    .top(px((ky - h / 2.0 - top).max(0.0)))
                     .w(px(w))
                     .h(px(h))
                     .rounded(px(if corner { 3. } else { 2. }))
@@ -2088,6 +2280,56 @@ impl Render for OsdEditor {
             );
         }
 
+        // 背景转角度：上边中点外面挂一个圆柄，拖着整张卡片转（阴影一起转）。
+        // 卡片自己转着的时候，它也转到「转后的上边」外面去。
+        {
+            let knob_size = 13.0;
+            let (kx, ky) = rotate_about(
+                card_center,
+                (left + pixel_w / 2.0, top - 24.0),
+                card_rot,
+            );
+            card_knobs = card_knobs.child(
+                div()
+                    .id("ed-card-rotate")
+                    .absolute()
+                    .left(px(kx - knob_size / 2.0 - left))
+                    .top(px(ky - knob_size / 2.0 - top))
+                    .w(px(knob_size))
+                    .h(px(knob_size))
+                    .rounded_full()
+                    .bg(theme::accent_soft())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .cursor(gpui::CursorStyle::Crosshair)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            let origin = this
+                                .canvas_bounds
+                                .get()
+                                .map(|bounds| (bounds.origin.x.as_f32(), bounds.origin.y.as_f32()))
+                                .unwrap_or((0.0, 0.0));
+                            let center =
+                                Point::new(px(origin.0 + card_center.0), px(origin.1 + card_center.1));
+                            this.dragging = None;
+                            this.resizing = None;
+                            this.guide = None;
+                            this.rotate_drag = Some(RotateDrag {
+                                target: RotationTarget::Card,
+                                center,
+                                start_angle: (event.position.y.as_f32() - center.y.as_f32())
+                                    .atan2(event.position.x.as_f32() - center.x.as_f32()),
+                                origin: this.cfg().rotation as f32,
+                            });
+                            this.focus.focus(window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
         // 拖动时贴在手柄上的一行尺寸读数，实时看得到改到多少。
         if self.card_resize.is_some() {
             card_knobs = card_knobs.child(
@@ -2109,6 +2351,15 @@ impl Render for OsdEditor {
             );
         }
 
+        // 整块（卡片 + 阴影 + 元素框 + 手柄）绕卡片中心转一圈：元素框跟着一起转，
+        // 手柄本身还是正的（和 PS 里转物件一样）。
+        let box_left = left - (box_w * scale - pixel_w) * 0.5;
+        let box_top = top - (box_h * scale - pixel_h) * 0.5;
+        let card = osd::card_frame(&draft, scale, card)
+            .absolute()
+            .left(px(box_left))
+            .top(px(box_top));
+
         let panel = self.panel(&cfg, lang, cx);
         let picker = self.picker_overlay(lang, cx);
         let confirm = self.confirm_overlay(lang, cx);
@@ -2119,8 +2370,8 @@ impl Render for OsdEditor {
         // 右上角 1:1 预览：设计画布是放大过的，字号到底多大得看这个。
         // 开了投影的话框要留出影子的位置，不然会被切掉。
         let shadow_pad = osd::shadow_margin(view);
-        let preview_w = (card_w + shadow_pad * 2.0).min((canvas_w - 28.0).max(60.0));
-        let preview_h = (card_h + shadow_pad * 2.0).min((canvas_h - 56.0).max(24.0));
+        let preview_w = (box_w + shadow_pad * 2.0).min((canvas_w - 28.0).max(60.0));
+        let preview_h = (box_h + shadow_pad * 2.0).min((canvas_h - 56.0).max(24.0));
         let preview_left = (canvas_w - preview_w - 14.0).max(8.0);
         let preview = div()
             .absolute()
@@ -2151,11 +2402,11 @@ impl Render for OsdEditor {
                     .rounded(px(4.))
                     // 不透明度是真的会作用在整扇窗上的（文字、图标、影子一起淡），
                     // 所以这里也整块淡，看着才是「实际大小」。
-                    .child(
-                        div()
-                            .opacity(view.alpha())
-                            .child(osd::card_visual(view, &sample, 1.0, None, &measure, lang)),
-                    ),
+                    .child(div().opacity(view.alpha()).child(osd::card_frame(
+                        view,
+                        1.0,
+                        osd::card_visual(view, &sample, 1.0, None, &measure, lang),
+                    ))),
             );
 
         div()
@@ -2413,6 +2664,17 @@ impl Render for OsdEditor {
                         return;
                     }
 
+                    // 按住角手柄转圈（元素 / 背景）。
+                    if this.rotate_drag.is_some() {
+                        if pressed {
+                            this.drag_rotate(event.position, event.modifiers.shift, cx);
+                        } else {
+                            this.rotate_drag = None;
+                            cx.notify();
+                        }
+                        return;
+                    }
+
                     // 拖元素角度滑条。
                     if this.rotation_drag.is_some() {
                         if pressed {
@@ -2442,10 +2704,11 @@ impl Render for OsdEditor {
                             cx.notify();
                             return;
                         }
-                        let dx =
-                            (event.position.x - resize.start.x).as_f32() / resize.scale.max(0.1);
-                        let dy =
-                            (event.position.y - resize.start.y).as_f32() / resize.scale.max(0.1);
+                        let (dx, dy) = unrotate_delta(
+                            (event.position.x - resize.start.x).as_f32() / resize.scale.max(0.1),
+                            (event.position.y - resize.start.y).as_f32() / resize.scale.max(0.1),
+                            this.cfg().rotation as f32,
+                        );
                         let mut width = resize.width;
                         let mut height = resize.height;
                         if matches!(resize.edge, CardEdge::Right | CardEdge::Corner) {
@@ -2470,10 +2733,11 @@ impl Render for OsdEditor {
                             cx.notify();
                             return;
                         }
-                        let dx =
-                            (event.position.x - resize.start.x).as_f32() / resize.scale.max(0.1);
-                        let dy =
-                            (event.position.y - resize.start.y).as_f32() / resize.scale.max(0.1);
+                        let (dx, dy) = unrotate_delta(
+                            (event.position.x - resize.start.x).as_f32() / resize.scale.max(0.1),
+                            (event.position.y - resize.start.y).as_f32() / resize.scale.max(0.1),
+                            this.cfg().rotation as f32,
+                        );
                         this.apply_resize(resize, dx, dy, cx);
                         return;
                     }
@@ -2498,6 +2762,10 @@ impl Render for OsdEditor {
                     if moved_x.abs() < 3.0 && moved_y.abs() < 3.0 {
                         return;
                     }
+                    // 卡片转着的时候，光标往右推在卡片自己的坐标系里是斜的 ——
+                    // 位移先转回去，元素才跟着光标走。
+                    let (moved_x, moved_y) =
+                        unrotate_delta(moved_x, moved_y, this.cfg().rotation as f32);
                     let dx = moved_x / drag.scale.max(0.1);
                     let dy = moved_y / drag.scale.max(0.1);
                     // 和左边对称：最多贴到卡片右边缘（宽度已经在 part_rect 里按这个上限夹过）。
@@ -2537,6 +2805,8 @@ impl Render for OsdEditor {
                             // 画布底色是可选的：同一张卡片摆在深底 / 浅底上好不好看
                             // 完全是两回事，调背景色的时候得能当场换一个桌面看。
                             .bg(self.canvas_bg())
+                            // 画布自己的矩形（画布坐标 → 窗口坐标要用）。
+                            .child(measure_canvas(self.canvas_bounds.clone()))
                             .child(card)
                             .child(preview)
                             .child(card_knobs)
@@ -4469,6 +4739,8 @@ impl OsdEditor {
                     NumField::Opacity,
                     cx,
                 ),
+                // 背景也能转：画布右上那个圆柄拖一下就转，这里可以手打精确值。
+                self.rotation_row(RotationTarget::Card, lang, cx),
             ],
         ));
         column = column.child(self.group(
@@ -4660,7 +4932,7 @@ impl OsdEditor {
         }
 
         // 旋转：绕元素自己的中心，±180°，所有元素都有。
-        body = body.child(self.rotation_row(part, lang, cx));
+        body = body.child(self.rotation_row(RotationTarget::Part(part), lang, cx));
 
         // 自定义文字：变量按钮（只有自定义文字能写内容，状态不算）。
         if matches!(part, OsdPart::Text(_)) {
@@ -4946,12 +5218,21 @@ impl OsdEditor {
         row.into_any_element()
     }
 
-    /// 一行「角度 − 数值 + 滑条」：绕元素自己的中心转，±180°。
+    /// 一行「角度 − 数值 + 滑条」：绕自己的中心转，±180°。
     ///
-    /// 角度是每个元素各存一份，所以不走 `NumField` 那套全局字段。
-    fn rotation_row(&self, part: OsdPart, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
-        let value = self.cfg().rotation_of(part);
-        let (low, high) = crate::config::OSD_ROTATION_RANGE;
+    /// 元素和背景共用这一行（`RotationTarget` 区分）。三个入口给同一件事：
+    /// 边框角上的手柄拖着转、这条滑条、数值双击手打。
+    fn rotation_row(
+        &self,
+        target: RotationTarget,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let field = NumField::Rotation(target);
+        let value = field.get(&self.cfg());
+        let (low, high) = field.range();
+        let editing = self.num.as_ref().map(|edit| edit.field) == Some(field);
+        let id = SharedString::from(format!("ed-rot-{}", field.index()));
         let mut row = div().flex().items_center().gap(px(4.)).child(
             div()
                 .flex_1()
@@ -4962,13 +5243,11 @@ impl OsdEditor {
                 .child(lang.pick("角度", "Angle")),
         );
         // − / + 各走 15°：够粗也够细，真要精确还有滑条和手打。
-        for (suffix, delta) in [("-", -15.0f32), ("+", 15.0)] {
+        for (suffix, delta) in [("-", -15i32), ("+", 15)] {
+            let store = self.config.clone();
             row = row.child(
                 div()
-                    .id(SharedString::from(format!(
-                        "ed-rot-{suffix}-{}",
-                        part.index()
-                    )))
+                    .id(SharedString::from(format!("{id}-{suffix}")))
                     .w(px(18.))
                     .h(px(16.))
                     .flex_none()
@@ -4982,41 +5261,73 @@ impl OsdEditor {
                     .text_color(theme::text_secondary())
                     .hover(|style| style.bg(theme::surface_hover()))
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _window, cx| {
-                        let current = this.cfg().rotation_of(part);
-                        this.update(|osd| osd.set_part_rotation(part, current + delta));
+                        // 手打没提交就先按当前缓冲算，别让 ± 把输入吃掉。
+                        if this.num.as_ref().map(|edit| edit.field) == Some(field) {
+                            this.commit_num(cx);
+                        }
+                        let next = field.get(&this.cfg()).saturating_add(delta);
+                        let _ = store
+                            .borrow_mut()
+                            .update(|config| field.set(&mut config.osd, next));
                         cx.notify();
                     }))
                     .child(suffix),
             );
         }
-        // 数值：双击归零 —— 转歪了想摆正，不用一路拖回中间。
-        row = row.child(
+        // 数值：双击手打（可以是负数），回车提交、Esc 放弃。
+        let value_view: AnyElement = if editing {
+            let buffer = self
+                .num
+                .as_ref()
+                .map(|edit| edit.buffer.clone())
+                .unwrap_or_default();
             div()
-                .id(SharedString::from(format!("ed-rot-num-{}", part.index())))
-                .w(px(34.))
+                .id(SharedString::from(format!("{id}-num")))
+                .w(px(38.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(1.))
+                .text_size(px(11.))
+                .text_color(theme::text_primary())
+                .child(if buffer.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{buffer}°")
+                })
+                .child(div().w(px(1.5)).h(px(11.)).flex_none().bg(theme::accent()))
+                .into_any_element()
+        } else {
+            div()
+                .id(SharedString::from(format!("{id}-num")))
+                .w(px(38.))
                 .flex_none()
                 .text_align(gpui::TextAlign::Right)
                 .text_size(px(11.))
-                .text_color(if value == 0.0 {
+                .text_color(if value == 0 {
                     theme::text_secondary()
                 } else {
                     theme::text_primary()
                 })
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
-                    if event.click_count() >= 2 {
-                        this.update(|osd| osd.set_part_rotation(part, 0.0));
-                        cx.notify();
-                    }
-                }))
-                .child(format!("{}°", value.round() as i32)),
-        );
+                .child(format!("{value}°"))
+                .on_click(
+                    cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        if event.click_count() >= 2 {
+                            this.begin_num(field, window, cx);
+                        }
+                    }),
+                )
+                .into_any_element()
+        };
+        row = row.child(value_view);
         // 滑条：填充从中点（0°）往两边长，一眼看出是正是负。
-        let ratio = ((value - low as f32) / (high - low).max(1) as f32).clamp(0.0, 1.0);
-        let bounds = self.rotation_bounds.clone();
+        let ratio = ((value - low) as f32 / (high - low).max(1) as f32).clamp(0.0, 1.0);
+        let bounds = self.rotation_bounds[target.slot()].clone();
         row = row.child(
             div()
-                .id(SharedString::from(format!("ed-rot-track-{}", part.index())))
+                .id(SharedString::from(format!("{id}-track")))
                 .w(px(52.))
                 .h(px(11.))
                 .flex_none()
@@ -5048,7 +5359,7 @@ impl OsdEditor {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        this.rotation_drag = Some(part);
+                        this.rotation_drag = Some(target);
                         this.drag_rotation(event.position, cx);
                     }),
                 ),
@@ -5074,18 +5385,51 @@ impl OsdEditor {
 
     /// 拖角度滑条：按光标在轨道里的 x 比例换算成角度。
     fn drag_rotation(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(part) = self.rotation_drag else {
+        let Some(target) = self.rotation_drag else {
             return;
         };
-        let Some(bounds) = self.rotation_bounds.get() else {
+        let Some(bounds) = self.rotation_bounds[target.slot()].get() else {
             return;
         };
         let width = bounds.size.width.as_f32().max(1.0);
         let ratio = ((position.x.as_f32() - bounds.origin.x.as_f32()) / width).clamp(0.0, 1.0);
         let (low, high) = crate::config::OSD_ROTATION_RANGE;
-        let value = (low as f32 + ratio * (high - low) as f32).round();
-        self.update(|osd| osd.set_part_rotation(part, value));
+        let value = (low as f32 + ratio * (high - low) as f32).round() as i32;
+        self.set_rotation(target, value);
         cx.notify();
+    }
+
+    /// 按住角手柄转圈：按「光标相对转轴的方向」转了多少，元素就跟着转多少。
+    ///
+    /// 按住 Shift 吸附到 90° 的整数倍 —— 摆正 / 摆竖差一点点最难对，
+    /// 给一个能一下对准的档。
+    fn drag_rotate(&mut self, position: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
+        let Some(drag) = self.rotate_drag else {
+            return;
+        };
+        let dx = position.x.as_f32() - drag.center.x.as_f32();
+        let dy = position.y.as_f32() - drag.center.y.as_f32();
+        // 光标正好压在转轴上时方向没有意义，保持原样别乱跳。
+        if dx.abs() < 0.5 && dy.abs() < 0.5 {
+            return;
+        }
+        let angle = dy.atan2(dx);
+        let delta = (angle - drag.start_angle).to_degrees();
+        let mut value = drag.origin + delta;
+        if shift {
+            value = (value / 90.0).round() * 90.0;
+        }
+        self.set_rotation(drag.target, value.round() as i32);
+        cx.notify();
+    }
+
+    /// 把角度写进配置（元素 / 背景各一套入口，这里统一）。
+    fn set_rotation(&mut self, target: RotationTarget, degrees: i32) {
+        let degrees = crate::config::normalize_rotation(degrees as f32);
+        self.update(|osd| match target {
+            RotationTarget::Card => osd.set_card(|card| card.rotation = degrees.round() as i32),
+            RotationTarget::Part(part) => osd.set_part_rotation(part, degrees),
+        });
     }
 
     /// 拖元素列表的行：按光标压在哪一行上，决定挪到第几层。
@@ -5295,12 +5639,37 @@ mod tests {
             NumField::ShadowY,
             NumField::ShadowBlur,
             NumField::ShadowOpacity,
+            NumField::Rotation(RotationTarget::Card),
+            NumField::Rotation(RotationTarget::Part(OsdPart::Bar)),
         ]
         .iter()
         .map(|field| field.index())
         .max()
         .unwrap();
         assert_eq!(max, NUM_FIELDS - 1, "NUM_FIELDS 要等于最大的下标 + 1");
+    }
+
+    /// 背景和元素的角度都走 `NumField`：读回来要跟写进去的一样（含正负）。
+    #[test]
+    fn rotation_field_round_trips() {
+        let mut osd = crate::config::OsdConfig::default();
+
+        let card = NumField::Rotation(RotationTarget::Card);
+        card.set(&mut osd, 45);
+        assert_eq!(card.get(&osd), 45);
+        card.set(&mut osd, -90);
+        assert_eq!(card.get(&osd), -90);
+        // 越界的绕回来：195° 就是 -165°。
+        card.set(&mut osd, 195);
+        assert_eq!(card.get(&osd), -165);
+
+        let part = NumField::Rotation(RotationTarget::Part(OsdPart::Icon));
+        part.set(&mut osd, 30);
+        assert_eq!(part.get(&osd), 30);
+        part.set(&mut osd, -30);
+        assert_eq!(part.get(&osd), -30);
+        // 两个目标互不干扰。
+        assert_eq!(card.get(&osd), -165);
     }
 
     #[test]

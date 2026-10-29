@@ -1960,43 +1960,56 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
-        self.interactivity.prepaint(
-            global_id,
-            inspector_id,
-            bounds,
-            content_size,
-            window,
-            cx,
-            |style, scroll_offset, hitbox, window, cx| {
-                // skip children
-                if style.display == Display::None {
-                    return hitbox;
-                }
+        // Bolume patch: 命中框也要带旋转 —— prepaint 期间子元素的 `insert_hitbox`
+        // 会把这个变换记进 Hitbox，判命中时再按逆矩阵转回去。少了这一步，
+        // 斜着的卡片画对了但点不准。包住整个 prepaint：自己的命中框也要跟着转。
+        let rotation = self.rotation;
+        let prepaint = |div: &mut Div, window: &mut Window, cx: &mut App| {
+            div.interactivity.prepaint(
+                global_id,
+                inspector_id,
+                bounds,
+                content_size,
+                window,
+                cx,
+                |style, scroll_offset, hitbox, window, cx| {
+                    // skip children
+                    if style.display == Display::None {
+                        return hitbox;
+                    }
 
-                window.with_image_cache(image_cache, |window| {
-                    window.with_element_offset(scroll_offset, |window| {
-                        if let Some(order_fn) = &self.prepaint_order_fn {
-                            let order = order_fn(window, cx);
-                            for idx in order {
-                                if let Some(child) = self.children.get_mut(idx) {
+                    window.with_image_cache(image_cache, |window| {
+                        window.with_element_offset(scroll_offset, |window| {
+                            if let Some(order_fn) = &div.prepaint_order_fn {
+                                let order = order_fn(window, cx);
+                                for idx in order {
+                                    if let Some(child) = div.children.get_mut(idx) {
+                                        child.prepaint(window, cx);
+                                    }
+                                }
+                            } else {
+                                for child in &mut div.children {
                                     child.prepaint(window, cx);
                                 }
                             }
-                        } else {
-                            for child in &mut self.children {
-                                child.prepaint(window, cx);
-                            }
+                        });
+
+                        if let Some(listener) = div.prepaint_listener.as_ref() {
+                            listener(children_bounds, window, cx);
                         }
                     });
 
-                    if let Some(listener) = self.prepaint_listener.as_ref() {
-                        listener(children_bounds, window, cx);
-                    }
-                });
-
-                hitbox
-            },
-        )
+                    hitbox
+                },
+            )
+        };
+        if rotation == 0.0 {
+            prepaint(self, window, cx)
+        } else {
+            window.with_element_rotation(bounds.center(), radians(rotation.to_radians()), |window| {
+                prepaint(self, window, cx)
+            })
+        }
     }
 
     #[stacksafe]
