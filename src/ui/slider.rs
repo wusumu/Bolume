@@ -135,6 +135,9 @@ pub struct VolumeSlider {
     touch_height: f32,
     /// 竖向推子：轨道从下往上长，拖动按 y 换算。
     vertical: bool,
+    /// 整根条被画成转了多少度（度，顺时针）。拖动时要把鼠标位置转回来再换算，
+    /// 不然条竖起来之后还是左右拖。
+    rotation: f32,
     on_change: Option<Rc<dyn Fn(f32, &mut Window, &mut App)>>,
     on_release: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     drag: SliderDragState,
@@ -161,6 +164,7 @@ impl VolumeSlider {
             thickness: TRACK_HEIGHT,
             touch_height: TOUCH_HEIGHT,
             vertical: false,
+            rotation: 0.0,
             on_change: None,
             on_release: None,
             drag,
@@ -244,6 +248,12 @@ impl VolumeSlider {
     ///
     /// 竖向时滑条自己不再要高度（`height` 那两个参数就不管了），
     /// 宽高都由外面的通道列给：列多宽、推子多长，都听调用方的。
+    /// 整根条被画成转了多少度（顺时针）。只影响拖动换算，画由调用方转。
+    pub fn rotation(mut self, degrees: f32) -> Self {
+        self.rotation = degrees;
+        self
+    }
+
     pub fn vertical(mut self, value: bool) -> Self {
         self.vertical = value;
         self
@@ -277,6 +287,23 @@ fn ratio(x: Pixels, bounds: &Bounds<Pixels>) -> f32 {
 }
 
 /// 竖向推子：底部是 0、顶部是 1。
+/// 把屏幕上的鼠标位置转回元素自己的坐标系（元素整体顺时针转了 `degrees` 度）。
+///
+/// 转轴是元素矩形的中心，和渲染时 `Div::rotate` 的轴一致。
+fn to_unrotated(position: gpui::Point<Pixels>, bounds: &Bounds<Pixels>, degrees: f32) -> gpui::Point<Pixels> {
+    if degrees == 0.0 {
+        return position;
+    }
+    let center = bounds.center();
+    let dx = position.x - center.x;
+    let dy = position.y - center.y;
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    gpui::point(
+        center.x + dx * cos + dy * sin,
+        center.y - dx * sin + dy * cos,
+    )
+}
+
 fn ratio_vertical(y: Pixels, bounds: &Bounds<Pixels>) -> f32 {
     if bounds.size.height <= px(0.) {
         return 0.0;
@@ -658,7 +685,11 @@ impl VolumeSlider {
         let limit = self.limit;
         // 竖向时按 y 换算（底 0 顶 1），横向按 x。
         let vertical = self.vertical;
+        let rotation = self.rotation;
         let ratio_at = move |position: gpui::Point<Pixels>| -> f32 {
+            // 条是转着画的：先把鼠标位置转回条自己的坐标系，否则竖起来之后
+            // 还是按左右拖（拖起来跟视觉方向对不上）。
+            let position = to_unrotated(position, &bounds, rotation);
             if vertical {
                 ratio_vertical(position.y, &bounds)
             } else {

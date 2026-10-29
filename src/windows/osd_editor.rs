@@ -540,6 +540,10 @@ pub struct OsdEditor {
     slider_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; NUM_FIELDS],
     /// 正在拖哪个滑条。
     slider_drag: Option<NumField>,
+    /// 元素「角度」那条小滑条的矩形（只量当前展开的那一个）。
+    rotation_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// 正在拖哪个元素的角度滑条。
+    rotation_drag: Option<OsdPart>,
     /// 画布要不要按「已静音」画。
     ///
     /// 只有正在调「静音时音量条」那一段颜色时打开：不然那条颜色调完完全看不到效果。
@@ -602,6 +606,8 @@ impl OsdEditor {
             layer_rows: Rc::new(RefCell::new(Vec::new())),
             slider_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             slider_drag: None,
+            rotation_bounds: Rc::new(Cell::new(None)),
+            rotation_drag: None,
             preview_muted: false,
             preview: None,
             menu: None,
@@ -691,6 +697,7 @@ impl OsdEditor {
             || self.resizing.is_some()
             || self.card_resize.is_some()
             || self.slider_drag.is_some()
+            || self.rotation_drag.is_some()
             || self.layer_drag.is_some()
             || self
                 .picker
@@ -731,6 +738,7 @@ impl OsdEditor {
         self.resizing = None;
         self.card_resize = None;
         self.slider_drag = None;
+        self.rotation_drag = None;
         self.layer_drag = None;
         if let Some(part) = self.selected {
             if !self.cfg().shows_part(part) {
@@ -2400,6 +2408,17 @@ impl Render for OsdEditor {
                             this.drag_slider(event.position, cx);
                         } else {
                             this.slider_drag = None;
+                            cx.notify();
+                        }
+                        return;
+                    }
+
+                    // 拖元素角度滑条。
+                    if this.rotation_drag.is_some() {
+                        if pressed {
+                            this.drag_rotation(event.position, cx);
+                        } else {
+                            this.rotation_drag = None;
                             cx.notify();
                         }
                         return;
@@ -4640,6 +4659,9 @@ impl OsdEditor {
             body = body.child(align_row);
         }
 
+        // 旋转：绕元素自己的中心，±180°，所有元素都有。
+        body = body.child(self.rotation_row(part, lang, cx));
+
         // 自定义文字：变量按钮（只有自定义文字能写内容，状态不算）。
         if matches!(part, OsdPart::Text(_)) {
             body = body.child(self.text_chips(lang, cx));
@@ -4924,6 +4946,116 @@ impl OsdEditor {
         row.into_any_element()
     }
 
+    /// 一行「角度 − 数值 + 滑条」：绕元素自己的中心转，±180°。
+    ///
+    /// 角度是每个元素各存一份，所以不走 `NumField` 那套全局字段。
+    fn rotation_row(&self, part: OsdPart, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
+        let value = self.cfg().rotation_of(part);
+        let (low, high) = crate::config::OSD_ROTATION_RANGE;
+        let mut row = div().flex().items_center().gap(px(4.)).child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_size(px(11.5))
+                .text_color(theme::text_secondary())
+                .child(lang.pick("角度", "Angle")),
+        );
+        // − / + 各走 15°：够粗也够细，真要精确还有滑条和手打。
+        for (suffix, delta) in [("-", -15.0f32), ("+", 15.0)] {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "ed-rot-{suffix}-{}",
+                        part.index()
+                    )))
+                    .w(px(18.))
+                    .h(px(16.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .bg(theme::track())
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(theme::text_secondary())
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _window, cx| {
+                        let current = this.cfg().rotation_of(part);
+                        this.update(|osd| osd.set_part_rotation(part, current + delta));
+                        cx.notify();
+                    }))
+                    .child(suffix),
+            );
+        }
+        // 数值：双击归零 —— 转歪了想摆正，不用一路拖回中间。
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("ed-rot-num-{}", part.index())))
+                .w(px(34.))
+                .flex_none()
+                .text_align(gpui::TextAlign::Right)
+                .text_size(px(11.))
+                .text_color(if value == 0.0 {
+                    theme::text_secondary()
+                } else {
+                    theme::text_primary()
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+                    if event.click_count() >= 2 {
+                        this.update(|osd| osd.set_part_rotation(part, 0.0));
+                        cx.notify();
+                    }
+                }))
+                .child(format!("{}°", value.round() as i32)),
+        );
+        // 滑条：填充从中点（0°）往两边长，一眼看出是正是负。
+        let ratio = ((value - low as f32) / (high - low).max(1) as f32).clamp(0.0, 1.0);
+        let bounds = self.rotation_bounds.clone();
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("ed-rot-track-{}", part.index())))
+                .w(px(52.))
+                .h(px(11.))
+                .flex_none()
+                .relative()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(3.5))
+                        .h(px(4.))
+                        .rounded(px(2.))
+                        .bg(theme::track()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(gpui::relative(ratio.min(0.5)))
+                        .top(px(3.5))
+                        .w(gpui::relative((ratio - 0.5).abs()))
+                        .h(px(4.))
+                        .rounded(px(2.))
+                        .bg(theme::accent()),
+                )
+                .child(measure_canvas(bounds))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.rotation_drag = Some(part);
+                        this.drag_rotation(event.position, cx);
+                    }),
+                ),
+        );
+        row.into_any_element()
+    }
+
     /// 拖尺寸滑条：按光标在轨道里的 x 比例换算成数值。
     fn drag_slider(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(field) = self.slider_drag else {
@@ -4937,6 +5069,22 @@ impl OsdEditor {
         let (low, high) = field.range();
         let value = (low as f32 + ratio * (high - low) as f32).round() as i32;
         self.update(|osd| field.set(osd, value));
+        cx.notify();
+    }
+
+    /// 拖角度滑条：按光标在轨道里的 x 比例换算成角度。
+    fn drag_rotation(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(part) = self.rotation_drag else {
+            return;
+        };
+        let Some(bounds) = self.rotation_bounds.get() else {
+            return;
+        };
+        let width = bounds.size.width.as_f32().max(1.0);
+        let ratio = ((position.x.as_f32() - bounds.origin.x.as_f32()) / width).clamp(0.0, 1.0);
+        let (low, high) = crate::config::OSD_ROTATION_RANGE;
+        let value = (low as f32 + ratio * (high - low) as f32).round();
+        self.update(|osd| osd.set_part_rotation(part, value));
         cx.notify();
     }
 

@@ -1,0 +1,7 @@
+{
+  "git": {
+    "sha1": "99109e3a77ddadbcb46cba8567e779a651600608",
+    "dirty": true
+  },
+  "path_in_vcs": "crates/gpui"
+}

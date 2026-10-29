@@ -2749,6 +2749,24 @@ pub const OSD_SHADOW_OFFSET_RANGE: (i32, i32) = (-40, 40);
 pub const OSD_SHADOW_BLUR_RANGE: (u32, u32) = (0, 200);
 pub const OSD_SHADOW_OPACITY_RANGE: (u32, u32) = (0, 100);
 
+/// 元素旋转的可调范围（度）。
+pub const OSD_ROTATION_RANGE: (i32, i32) = (-180, 180);
+
+/// 把角度绕回 -180..180：界面上不该出现「370°」这种写法。
+///
+/// 正负 180 是同一个角度，统一记成 180 —— 否则滑块拖到头会跳符号。
+pub fn normalize_rotation(degrees: f32) -> f32 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    let wrapped = (degrees + 180.0).rem_euclid(360.0) - 180.0;
+    if wrapped <= -180.0 {
+        180.0
+    } else {
+        wrapped
+    }
+}
+
 /// 一个元素在卡片里的位置、尺寸与显隐。
 ///
 /// 位置存比例而不是像素：卡片宽高可以改，元素跟着一起动，不用重排。
@@ -2774,6 +2792,12 @@ pub struct OsdPartPos {
     /// 关掉 = 这个元素不画（模块化「删掉」它）。
     #[serde(default = "default_true")]
     pub visible: bool,
+    /// 旋转角度（度，顺时针，-180..180）。0 = 不转。
+    ///
+    /// 绕元素**自己的中心**转，和 CSS 的 `transform: rotate()` 一样：位置、尺寸、
+    /// 对齐都不动，只是画出来是歪的（命中与吸附还是按原来那块矩形算）。
+    #[serde(default)]
+    pub rotation: f32,
 }
 
 /// 某个元素自己的颜色。
@@ -2800,6 +2824,7 @@ fn default_media_layout() -> Vec<OsdPartPos> {
             size: 19,
             width: 0,
             visible: true,
+            rotation: 0.0,
             align: None,
         },
         OsdPartPos {
@@ -2809,6 +2834,7 @@ fn default_media_layout() -> Vec<OsdPartPos> {
             size: 14,
             width: 64,
             visible: true,
+            rotation: 0.0,
             align: Some(OsdAlign::Center),
         },
         OsdPartPos {
@@ -2818,6 +2844,7 @@ fn default_media_layout() -> Vec<OsdPartPos> {
             size: 13,
             width: 36,
             visible: false,
+            rotation: 0.0,
             align: None,
         },
         OsdPartPos {
@@ -2827,6 +2854,7 @@ fn default_media_layout() -> Vec<OsdPartPos> {
             size: 13,
             width: 60,
             visible: false,
+            rotation: 0.0,
             align: None,
         },
         OsdPartPos {
@@ -2836,6 +2864,7 @@ fn default_media_layout() -> Vec<OsdPartPos> {
             size: 4,
             width: 234,
             visible: false,
+            rotation: 0.0,
             align: None,
         },
     ]
@@ -3098,6 +3127,7 @@ fn default_osd_layout() -> Vec<OsdPartPos> {
             size: 19,
             width: 0,
             visible: true,
+            rotation: 0.0,
             align: None,
         },
         OsdPartPos {
@@ -3107,6 +3137,7 @@ fn default_osd_layout() -> Vec<OsdPartPos> {
             size: 17,
             width: 85,
             visible: false,
+            rotation: 0.0,
             align: None,
         },
         OsdPartPos {
@@ -3116,6 +3147,7 @@ fn default_osd_layout() -> Vec<OsdPartPos> {
             size: 13,
             width: 37,
             visible: true,
+            rotation: 0.0,
             align: None,
         },
         OsdPartPos {
@@ -3125,6 +3157,7 @@ fn default_osd_layout() -> Vec<OsdPartPos> {
             size: 13,
             width: 60,
             visible: false,
+            rotation: 0.0,
             align: Some(OsdAlign::Left),
         },
         OsdPartPos {
@@ -3134,6 +3167,7 @@ fn default_osd_layout() -> Vec<OsdPartPos> {
             size: 4,
             width: 93,
             visible: true,
+            rotation: 0.0,
             align: None,
         },
         // 自定义文字不放默认排布里：编辑器里点「＋ 文字」才新建一条（条数不限）。
@@ -3430,6 +3464,7 @@ impl OsdConfig {
                 width: 0,
                 align: None,
                 visible: true,
+                rotation: 0.0,
             });
         let mut position = self
             .active()
@@ -3442,6 +3477,7 @@ impl OsdConfig {
         }
         let (low, high) = part.size_range();
         position.size = position.size.clamp(low, high);
+        position.rotation = normalize_rotation(position.rotation);
         position
     }
 
@@ -3559,6 +3595,7 @@ impl OsdConfig {
             width: 0,
             align: None,
             visible: true,
+            rotation: 0.0,
         };
         for layout in [&mut self.layout, &mut self.media_layout] {
             if !layout.iter().any(|slot| slot.part == part) {
@@ -3705,6 +3742,26 @@ impl OsdConfig {
     /// 改一个元素的宽度（逻辑像素）；传 0 回到「自动铺到右边距」。
     pub fn set_part_width(&mut self, part: OsdPart, width: u32) {
         self.entry_mut(part).width = width.min(4000);
+    }
+
+    /// 改一个元素的旋转角度（度，顺时针）。超出 ±180 会绕回来。
+    ///
+    /// 这里不走 `entry_mut`：那个会顺手把元素设成可见，而调角度不该让
+    /// 一个被删掉的元素自己冒出来。
+    pub fn set_part_rotation(&mut self, part: OsdPart, degrees: f32) {
+        let rotation = normalize_rotation(degrees);
+        if let Some(slot) = self.active_mut().iter_mut().find(|slot| slot.part == part) {
+            slot.rotation = rotation;
+            return;
+        }
+        let mut slot = self.part(part);
+        slot.rotation = rotation;
+        self.active_mut().push(slot);
+    }
+
+    /// 这个元素转多少度（已经夹好范围）。
+    pub fn rotation_of(&self, part: OsdPart) -> f32 {
+        self.part(part).rotation
     }
 
     /// 把当前模板恢复成默认（两个模板各恢复各的），卡片外观一起回到出厂。
@@ -7421,6 +7478,38 @@ mod tests {
             osd.for_function(OsdFunction::Volume).active()[0].x,
             osd.for_function(OsdFunction::Brightness).active()[0].x
         );
+    }
+
+    /// 每个元素都有自己的角度，超范围绕回 ±180，三套模板各存各的。
+    #[test]
+    fn parts_can_be_rotated() {
+        let mut osd = OsdConfig::default();
+        osd.set_part_rotation(OsdPart::Icon, 30.0);
+        assert!((osd.rotation_of(OsdPart::Icon) - 30.0).abs() < 0.001);
+        // 只动它自己。
+        assert_eq!(osd.rotation_of(OsdPart::Percent), 0.0);
+
+        // 370° 就是 10°，-190° 就是 170°。
+        osd.set_part_rotation(OsdPart::Icon, 370.0);
+        assert!((osd.rotation_of(OsdPart::Icon) - 10.0).abs() < 0.001);
+        osd.set_part_rotation(OsdPart::Icon, -190.0);
+        assert!((osd.rotation_of(OsdPart::Icon) - 170.0).abs() < 0.001);
+
+        // 三套模板各存一份：切到媒体键模板是 0°，切回来还是 170°。
+        osd.set_template(OsdTemplate::Media);
+        assert_eq!(osd.rotation_of(OsdPart::Icon), 0.0);
+        osd.set_part_rotation(OsdPart::Icon, -45.0);
+        osd.set_template(OsdTemplate::Volume);
+        assert!((osd.rotation_of(OsdPart::Icon) - 170.0).abs() < 0.001);
+    }
+
+    /// 调角度不该把删掉的元素重新弄出来。
+    #[test]
+    fn rotating_keeps_hidden_parts_hidden() {
+        let mut osd = OsdConfig::default();
+        osd.set_part_visible(OsdPart::Db, false);
+        osd.set_part_rotation(OsdPart::Db, 30.0);
+        assert!(!osd.shows_part(OsdPart::Db), "调角度不该让分贝重新出现");
     }
 
     /// 亮度提示默认开着，也可以在屏幕提示页单独关掉。

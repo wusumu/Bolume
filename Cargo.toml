@@ -30,8 +30,11 @@ ddc-winapi = "0.2.2"
 # 本地打过补丁的 Windows 平台层：vsync 线程跳过隐藏窗口，否则托盘常驻时空烧
 # 约 80% 单核 CPU（详见 vendor/gpui_ce_windows/src/platform.rs 里的 Bolume patch）。
 # 升级 gpui-ce 时要把 patch 重新打到新版 gpui_ce_windows 上。
+# 本地打过补丁的 gpui 本体：屏幕提示的元素要能各自旋转，而 gpui 只给 svg 做了
+# 变换矩阵。详见 vendor/gpui-ce/src/window.rs 里的「Bolume patch」注释。
 [patch.crates-io]
 gpui_ce_windows = { path = "vendor/gpui_ce_windows" }
+gpui-ce = { path = "vendor/gpui-ce" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62.2", features = [

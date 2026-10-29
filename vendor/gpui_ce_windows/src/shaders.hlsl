@@ -90,6 +90,21 @@ struct TransformationMatrix {
     float2 translation;
 };
 
+// Bolume patch: 元素旋转后片元拿到的还是屏幕坐标，而圆角半径、边框宽度、渐变方向
+// 都是 quad 自己坐标系里的量 —— 先按逆矩阵转回去再算。
+float2x2 invert_rotation_scale(float2x2 m) {
+    float det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    if (abs(det) < 1e-6) {
+        return float2x2(1.0, 0.0, 0.0, 1.0);
+    }
+    return float2x2(m[1][1], -m[0][1], -m[1][0], m[0][0]) / det;
+}
+
+float2 unrotate_position(float2 position, TransformationMatrix transformation) {
+    float2x2 inverse_rotation = invert_rotation_scale(transformation.rotation_scale);
+    return mul(position - transformation.translation, inverse_rotation);
+}
+
 static const float M_PI_F = 3.141592653f;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
 
@@ -502,6 +517,7 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    TransformationMatrix transformation;
 };
 
 struct QuadVertexOutput {
@@ -528,7 +544,7 @@ StructuredBuffer<Quad> quads: register(t1);
 QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     Quad quad = quads[quad_id];
-    float4 device_position = to_device_position(unit_vertex, quad.bounds);
+    float4 device_position = to_device_position_transformed(unit_vertex, quad.bounds, quad.transformation);
 
     GradientColor gradient = prepare_gradient_color(
         quad.background.tag,
@@ -536,7 +552,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_Insta
         quad.background.solid,
         quad.background.colors
     );
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, quad.bounds, quad.content_mask, quad.transformation);
     float4 border_color = hsla_to_rgba(quad.border_color);
 
     QuadVertexOutput output;
@@ -552,7 +568,8 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_Insta
 
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
-    float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+    float2 local_position = unrotate_position(input.position.xy, quad.transformation);
+    float4 background_color = gradient_color(quad.background, local_position, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
@@ -571,7 +588,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     float2 size = quad.bounds.size;
     float2 half_size = size / 2.;
-    float2 the_point = input.position.xy - quad.bounds.origin;
+    float2 the_point = local_position - quad.bounds.origin;
     float2 center_to_point = the_point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the

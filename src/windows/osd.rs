@@ -541,6 +541,8 @@ fn positioned(part: OsdPart, cfg: &OsdConfig, scale: f32, child: AnyElement) -> 
         .top(px(y * scale))
         .w(px(w * scale))
         .h(px(h * scale))
+        // 角度绕这一块的中心转（位置与占位不动，和 CSS 的 rotate 一样）。
+        .rotate(cfg.rotation_of(part))
         .child(child)
         .into_any_element()
 }
@@ -696,6 +698,7 @@ fn anchored_text(
         .top(px(y * scale))
         .w(px(width))
         .h(px(h * scale))
+        .rotate(cfg.rotation_of(part))
         .child(child)
         .into_any_element()
 }
@@ -913,6 +916,8 @@ pub fn card_visual(
                     .top(px(top * scale))
                     .w(px(bar_w * scale))
                     .h(px(touch * scale))
+                    // 条转了，滑条自己也要知道：拖动时得把鼠标位置转回条的方向。
+                    .rotate(cfg.rotation_of(OsdPart::Bar))
                     .child(
                         VolumeSlider::new("osd-volume-bar", state.fraction.clamp(0.0, 1.0), drag)
                             // 提示条只是「顺手一调」，不画电平特效：那会让卡片闪。
@@ -922,6 +927,7 @@ pub fn card_visual(
                             .muted_color(bar_muted)
                             .corner(bar_corner)
                             .thickness(bar_h)
+                            .rotation(cfg.rotation_of(OsdPart::Bar))
                             .muted(state.muted)
                             .enabled(cfg.interactive)
                             .on_change(move |value, window, cx| change(value, window, cx))
