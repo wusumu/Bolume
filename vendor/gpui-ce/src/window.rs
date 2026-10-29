@@ -822,6 +822,14 @@ fn unrotate_point(matrix: TransformationMatrix, point: Point<Pixels>) -> Point<P
     )
 }
 
+/// Bolume patch: 这个变换是不是「不改变像素网格」的那种 —— 只有平移，或者
+/// 旋转 90° 的整数倍。此时字形位图转过来仍然逐像素对齐，重采样是无损的。
+fn is_axis_aligned(matrix: &TransformationMatrix) -> bool {
+    let is_axis = |v: f32| v.abs() < 1e-4 || (v.abs() - 1.0).abs() < 1e-4;
+    let r = matrix.rotation_scale;
+    is_axis(r[0][0]) && is_axis(r[0][1]) && is_axis(r[1][0]) && is_axis(r[1][1])
+}
+
 /// How the hitbox affects mouse behavior.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum HitboxBehavior {
@@ -4404,7 +4412,14 @@ impl Window {
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
         // Bolume patch: 元素被旋转时不用子像素抗锯齿 —— 斜着采样的字
         // 子像素前提不成立，还会因为色边在旋转后变得更明显。
-        let unrotated = self.element_transformation() == TransformationMatrix::unit();
+        let element_transformation = self.element_transformation();
+        let unrotated = element_transformation == TransformationMatrix::unit();
+        // Bolume patch: 转着画的字按 2 倍尺寸栅格化，绘制时再缩回原大小 ——
+        // 字形位图翻倍 = 超采样。不然 1x 的位图被插值重采样，笔画必然糊成一团。
+        // 正常（没转）的字还是 1:1，一点不受影响；转 90° 整数倍时位图逐像素对齐，
+        // 重采样本来就是无损的，也不用白花这笔内存。
+        let axis_aligned = is_axis_aligned(&element_transformation);
+        let raster_scale = if axis_aligned { 1.0 } else { 2.0 };
         let subpixel_rendering = unrotated && self.should_use_subpixel_rendering(font_id, font_size);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
@@ -4412,7 +4427,7 @@ impl Window {
             glyph_id,
             font_size,
             subpixel_variant,
-            scale_factor,
+            scale_factor: scale_factor * raster_scale,
             is_emoji: false,
             subpixel_rendering,
             dilation,
@@ -4428,8 +4443,16 @@ impl Window {
                 })?
                 .expect("Callback above only errors or returns Some");
             let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
+                origin: integer_origin
+                    + raster_bounds
+                        .origin
+                        .map(|p| ScaledPixels((p.0 as f32 / raster_scale).round()))
+                        .map(Into::into),
+                size: tile
+                    .bounds
+                    .size
+                    .map(|size| ScaledPixels((size.0 as f32 / raster_scale).round()))
+                    .map(Into::into),
             };
             let content_mask = self.snapped_content_mask();
 

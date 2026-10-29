@@ -138,6 +138,11 @@ pub struct VolumeSlider {
     /// 整根条被画成转了多少度（度，顺时针）。拖动时要把鼠标位置转回来再换算，
     /// 不然条竖起来之后还是左右拖。
     rotation: f32,
+    /// 外层容器（OSD 整张卡片）的旋转：`(轴心相对本元素左上角的偏移, 度数)`。
+    ///
+    /// 条是**两级**旋转叠出来的：先绕自己中心转，再连着整张卡片绕卡片中心转。
+    /// 只把自己那级转回去的话，卡片一转，按下的位置和拖出来的值就全偏了。
+    parent_rotation: Option<((f32, f32), f32)>,
     on_change: Option<Rc<dyn Fn(f32, &mut Window, &mut App)>>,
     on_release: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     drag: SliderDragState,
@@ -165,6 +170,7 @@ impl VolumeSlider {
             touch_height: TOUCH_HEIGHT,
             vertical: false,
             rotation: 0.0,
+            parent_rotation: None,
             on_change: None,
             on_release: None,
             drag,
@@ -254,6 +260,15 @@ impl VolumeSlider {
         self
     }
 
+    /// 外层容器（OSD 卡片）的旋转，`offset` 是轴心相对本元素左上角的偏移。
+    ///
+    /// 卡片自己转的时候，条连位置带方向都跟着转；换算鼠标位置得先绕轴心转回去，
+    /// 再按条自己的角度转回去。
+    pub fn parent_rotation(mut self, offset: (f32, f32), degrees: f32) -> Self {
+        self.parent_rotation = Some((offset, degrees));
+        self
+    }
+
     pub fn vertical(mut self, value: bool) -> Self {
         self.vertical = value;
         self
@@ -291,10 +306,18 @@ fn ratio(x: Pixels, bounds: &Bounds<Pixels>) -> f32 {
 ///
 /// 转轴是元素矩形的中心，和渲染时 `Div::rotate` 的轴一致。
 fn to_unrotated(position: gpui::Point<Pixels>, bounds: &Bounds<Pixels>, degrees: f32) -> gpui::Point<Pixels> {
+    to_unrotated_about(position, bounds.center(), degrees)
+}
+
+/// 同上，但轴心由调用方给（外层容器的旋转轴心不是本元素的中心）。
+fn to_unrotated_about(
+    position: gpui::Point<Pixels>,
+    center: gpui::Point<Pixels>,
+    degrees: f32,
+) -> gpui::Point<Pixels> {
     if degrees == 0.0 {
         return position;
     }
-    let center = bounds.center();
     let dx = position.x - center.x;
     let dy = position.y - center.y;
     let (sin, cos) = degrees.to_radians().sin_cos();
@@ -686,10 +709,24 @@ impl VolumeSlider {
         // 竖向时按 y 换算（底 0 顶 1），横向按 x。
         let vertical = self.vertical;
         let rotation = self.rotation;
+        let parent = self.parent_rotation;
+        // 先逆「外层容器」那一级、再逆自己这一级：屏幕上看到的点是
+        // `卡片旋转(条旋转(局部点))`，反过来就得先摘卡片、再摘条。
+        let local = move |position: gpui::Point<Pixels>| -> gpui::Point<Pixels> {
+            let position = match parent {
+                Some((offset, degrees)) if degrees != 0.0 => to_unrotated_about(
+                    position,
+                    gpui::point(bounds.origin.x + px(offset.0), bounds.origin.y + px(offset.1)),
+                    degrees,
+                ),
+                _ => position,
+            };
+            to_unrotated(position, &bounds, rotation)
+        };
         let ratio_at = move |position: gpui::Point<Pixels>| -> f32 {
             // 条是转着画的：先把鼠标位置转回条自己的坐标系，否则竖起来之后
             // 还是按左右拖（拖起来跟视觉方向对不上）。
-            let position = to_unrotated(position, &bounds, rotation);
+            let position = local(position);
             if vertical {
                 ratio_vertical(position.y, &bounds)
             } else {
@@ -705,7 +742,7 @@ impl VolumeSlider {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                let inside = bounds.contains(&event.position);
+                let inside = bounds.contains(&local(event.position));
                 if hover.is_hovered(token) == inside {
                     return;
                 }
@@ -740,7 +777,7 @@ impl VolumeSlider {
                 if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                     return;
                 }
-                if !bounds.contains(&event.position) {
+                if !bounds.contains(&local(event.position)) {
                     return;
                 }
                 drag.begin(token);

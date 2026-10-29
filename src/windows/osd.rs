@@ -932,9 +932,14 @@ pub fn card_visual(
         let radius = bar_corner * scale;
         // 滑条自己带一段触摸高度，往上让一截让轨道落在原来的位置。
         let touch = (bar_h + 8.0).max(BAR_TOUCH_HEIGHT);
+        // 整张卡片还会转：条在屏幕上就是「先绕自己中心转、再绕卡片中心转」，
+        // 拖动换算得知道卡片中心的轴心在哪儿。轴心相对条左上角的偏移可以直接
+        // 由配置算出来（卡片中心 = 卡片宽高的一半，条的位置是 `part_rect`）。
+        let (card_w, card_h) = card_size(cfg);
         let track = match bar {
             Some(binding) => {
                 let top = (bar_y - (touch - bar_h) / 2.0).max(0.0);
+                let pivot = ((card_w * 0.5 - bar_x) * scale, (card_h * 0.5 - top) * scale);
                 let change = binding.on_change.clone();
                 let release = binding.on_release.clone();
                 let drag = binding.drag.clone();
@@ -956,6 +961,7 @@ pub fn card_visual(
                             .corner(bar_corner)
                             .thickness(bar_h)
                             .rotation(cfg.rotation_of(OsdPart::Bar))
+                            .parent_rotation(pivot, cfg.rotation as f32)
                             .muted(state.muted)
                             .enabled(cfg.interactive)
                             .on_change(move |value, window, cx| change(value, window, cx))

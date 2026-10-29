@@ -271,6 +271,46 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile) {
     return (float2(tile.bounds.origin) + unit_vertex * float2(tile.bounds.size)) / atlas_size;
 }
 
+/*
+**  Bolume patch: 转过来的字要用双三次采样
+**
+**  字形图集是按「屏幕像素」栅格化的，采样器是 POINT（0° 时逐像素对齐，最锐利）。
+**  整块卡片一转，字形就得重采样：点采样出来是断笔和硬阶梯，线性采样又糊成一片。
+**  这里对有变换的字形走 Catmull-Rom 双三次（16 抽头），边缘锐、过渡平，
+**  再把每个抽头钳在 tile 里，免得吃到图集里隔壁字形的像素。
+*/
+void bolume_catmull_rom(float t, out float w[4]) {
+    float t2 = t * t;
+    float t3 = t2 * t;
+    w[0] = -0.5 * t3 + t2 - 0.5 * t;
+    w[1] = 1.5 * t3 - 2.5 * t2 + 1.0;
+    w[2] = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+    w[3] = 0.5 * t3 - 0.5 * t2;
+}
+
+float bolume_sample_glyph(float2 uv, float4 tile_rect, float2 texel) {
+    float2 base = uv / texel - 0.5;
+    float2 f = frac(base);
+    float2 i0 = floor(base);
+    float wx[4];
+    float wy[4];
+    bolume_catmull_rom(f.x, wx);
+    bolume_catmull_rom(f.y, wy);
+
+    float acc = 0.0;
+    [unroll] for (int y = 0; y < 4; ++y) {
+        float row = 0.0;
+        [unroll] for (int x = 0; x < 4; ++x) {
+            float2 coord = (i0 + float2((float)x - 1.0, (float)y - 1.0) + 0.5) * texel;
+            // 钳在 tile 里：图集里 tile 是紧挨着的，越界会取到隔壁字形。
+            coord = clamp(coord, tile_rect.xy, tile_rect.zw);
+            row += t_sprite.SampleLevel(s_sprite, coord, 0).r * wx[x];
+        }
+        acc += row * wy[y];
+    }
+    return saturate(acc);
+}
+
 // Selects corner radius based on quadrant.
 float pick_corner_radius(float2 center_to_point, Corners corner_radii) {
     if (center_to_point.x < 0.) {
@@ -1169,6 +1209,10 @@ struct MonochromeSpriteVertexOutput {
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
     float4 clip_distance: SV_ClipDistance;
+    // Bolume patch: 旋转字形重采样要用的几样东西（tile 的 uv 矩形、图集 texel、有没有变换）。
+    nointerpolation float4 tile_rect: TILE_RECT;
+    nointerpolation float2 glyph_texel: GLYPH_TEXEL;
+    nointerpolation float transformed: TRANSFORMED;
 };
 
 struct MonochromeSpriteFragmentInput {
@@ -1176,6 +1220,9 @@ struct MonochromeSpriteFragmentInput {
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
     float4 clip_distance: SV_ClipDistance;
+    nointerpolation float4 tile_rect: TILE_RECT;
+    nointerpolation float2 glyph_texel: GLYPH_TEXEL;
+    nointerpolation float transformed: TRANSFORMED;
 };
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
@@ -1194,16 +1241,39 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
     float4 color = hsla_to_rgba(sprite.color);
 
+    // Bolume patch: 不改变像素网格的变换（平移 / 转 90° 整数倍）照旧走点采样 ——
+    // 位图逐像素对齐，重采样是无损的；只有斜着转才需要双三次。
+    float2x2 rotation_scale = sprite.transformation.rotation_scale;
+    bool axis_x = abs(rotation_scale[0][0]) < 1e-4 || abs(abs(rotation_scale[0][0]) - 1.0) < 1e-4;
+    bool axis_y = abs(rotation_scale[0][1]) < 1e-4 || abs(abs(rotation_scale[0][1]) - 1.0) < 1e-4;
+    float transformed = (axis_x && axis_y) ? 0.0 : 1.0;
+    float2 atlas_size;
+    t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+
     MonochromeSpriteVertexOutput output;
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
     output.clip_distance = clip_distance;
+    output.tile_rect = float4(
+        float2(sprite.tile.bounds.origin) / atlas_size,
+        float2(sprite.tile.bounds.origin + sprite.tile.bounds.size) / atlas_size
+    );
+    output.glyph_texel = 1.0 / atlas_size;
+    output.transformed = transformed;
     return output;
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
-    float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
+    float sample;
+    if (input.transformed > 0.5) {
+        sample = bolume_sample_glyph(input.tile_position, input.tile_rect, input.glyph_texel);
+        // 重采样一定把边缘抹淡一截（笔画变灰、看着发虚）。压一点 gamma 把笔画找回来，
+        // 只是盖掉插值的稀释，不改字形本身。
+        sample = pow(sample, 0.82);
+    } else {
+        sample = t_sprite.Sample(s_sprite, input.tile_position).r;
+    }
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
     return float4(input.color.rgb, input.color.a * alpha_corrected);
 }
