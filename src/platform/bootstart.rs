@@ -18,7 +18,7 @@
 
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY,
     TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary,
@@ -31,8 +31,9 @@ use windows::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSEnumerateSessionsW, WTSFreeMemory, WTS_SESSION_INFOW, WTSActive,
 };
 use windows::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, OpenProcess, OpenProcessToken,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    CREATE_UNICODE_ENVIRONMENT, CreateMutexW, CreateProcessAsUserW, OpenProcess, OpenProcessToken,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, ReleaseMutex, STARTUPINFOW,
+    PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -43,8 +44,60 @@ const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// 没等到就再问一次的间隔。
 const POLL: Duration = Duration::from_millis(500);
 
+/// explorer 出现之后再多等这么久才送人。
+///
+/// 登录那一刻系统还在铺桌面：显卡上下文、音频端点、通知区域都要时间才就位。
+/// 早一步送进去，程序自己会在一两秒内退出（事件日志里是 `0xc0000409`），
+/// 从外面看就是「开机自启没生效」—— 2026-10-28 / 10-29 两次早上开机都撞在这上面。
+const SETTLE: Duration = Duration::from_millis(3000);
+
+/// 送进去之后盯这么久：还活着就算真起来了。
+const ALIVE_WINDOW: Duration = Duration::from_secs(4);
+
+/// 脱壳副本接力之后，再确认一次它还在。
+const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
+/// 同一个会话最多试几次。
+const ATTEMPTS: u32 = 3;
+
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 交接过程落盘（`boot.log`）。开机那条路没人盯着，只能事后看文件。
+fn log(text: &str) {
+    crate::platform::logfile::append("boot.log", text);
+}
+
+/// 交接用的全局互斥体。
+///
+/// 任务里同时挂了「开机时」和「任何用户登录时」两条触发器，两份进程可能撞在
+/// 一起。用 `Global\` 前缀：这个锁要**跨会话**，会话 0 里创建的东西在用户会话
+/// 里看不见，普通命名空间等于没加锁。
+struct BootGuard(HANDLE);
+
+impl BootGuard {
+    fn acquire() -> Option<Self> {
+        let name = wide(r"Global\Bolume.BootHandoff");
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.ok()?;
+        if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0 {
+            Some(Self(handle))
+        } else {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            None
+        }
+    }
+}
+
+impl Drop for BootGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
 }
 
 /// `--boot-handoff` 的入口：把主程序送进用户会话，然后退场。
@@ -52,26 +105,75 @@ fn wide(text: &str) -> Vec<u16> {
 /// `admin` 来自任务动作里附带的 `--elevate`（就是设置页那个「启动时以管理员运行」），
 /// 不从配置文件读 —— 会话 0 里的 SYSTEM 进程不该去碰用户的配置。
 pub fn handoff(admin: bool) {
-    // 已经有实例在跑（手动先开了、或者「登录时」那条抢在前面）：不叫醒、不弹面板，
-    // 直接退场。开机那一刻弹个面板才是最糟的行为。
-    if crate::platform::SingleInstance::is_running(crate::platform::single_instance::INSTANCE_NAME)
-    {
+    // 另一份交接正在跑：直接退场，别送第二个实例进去（第二个会被单实例挡掉，
+    // 顺手把面板弹出来 —— 开机弹面板是最糟的行为）。
+    let Some(_guard) = BootGuard::acquire() else {
+        log("另一份交接正在跑，退场");
         return;
-    }
+    };
+    log(&format!("开始交接（admin={admin}）"));
+
     let deadline = Instant::now() + WAIT_LIMIT;
+    let mut tries: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    // explorer 第一次出现的时刻 + 稳定期。
+    let mut ready_at: Option<Instant> = None;
+
     loop {
-        for session in active_sessions() {
-            if let Some(token) = session_token(session, admin) {
-                let launched = launch_in_session(token);
-                unsafe {
-                    let _ = CloseHandle(token);
-                }
-                if launched {
-                    return;
-                }
+        let sessions = active_sessions();
+        let mut pending = false;
+        for session in &sessions {
+            let session = *session;
+            // 会话里已经有界面层在跑：什么都不用做。
+            if session_has_app(session) {
+                log(&format!("会话 {session} 已有实例，退场"));
+                return;
             }
+            let count = tries.get(&session).copied().unwrap_or(0);
+            if count >= ATTEMPTS {
+                continue;
+            }
+            // explorer 在了才说明通知区域建好了；没起来就继续等。
+            if shell_pid(session).is_none() {
+                continue;
+            }
+            pending = true;
+            let ready = *ready_at.get_or_insert_with(|| Instant::now() + SETTLE);
+            if Instant::now() < ready {
+                continue;
+            }
+            let Some(token) = session_token(session, admin) else {
+                log(&format!("会话 {session} 拿不到令牌"));
+                continue;
+            };
+            let pid = launch_in_session(token);
+            unsafe {
+                let _ = CloseHandle(token);
+            }
+            let Some(pid) = pid else {
+                log(&format!(
+                    "会话 {session} 第 {} 次送入失败（CreateProcessAsUser）",
+                    count + 1
+                ));
+                tries.insert(session, count + 1);
+                continue;
+            };
+            if launch_succeeded(pid, session, ALIVE_WINDOW) {
+                log(&format!("会话 {session} 起好了（pid {pid}）"));
+                return;
+            }
+            log(&format!(
+                "会话 {session} 第 {} 次送进去的进程（pid {pid}）没撑住，准备重试",
+                count + 1
+            ));
+            tries.insert(session, count + 1);
+        }
+        // 有会话但都试满了：再等下去也没意义。
+        if !pending && !sessions.is_empty() {
+            log("所有会话都试满了，退场");
+            return;
         }
         if Instant::now() >= deadline {
+            log("等到上限也没成功，退场");
             return;
         }
         std::thread::sleep(POLL);
@@ -122,6 +224,76 @@ fn shell_pid(session: u32) -> Option<u32> {
     }
 }
 
+/// 那个会话里是不是已经有界面层在跑。
+///
+/// 不能用 `SingleInstance::is_running`：那个互斥体没有 `Global\` 前缀，在会话 0
+/// 里查的是会话 0 的命名空间，永远查不到用户会话里的实例（这就是「登录时那条
+/// 触发器又送了一份进去」的由来）。这里直接按进程名列，顺便带上会话号比对。
+fn session_has_app(session: u32) -> bool {
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return false;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = false;
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let name = String::from_utf16_lossy(&entry.szExeFile);
+            if name.trim_end_matches('\0').eq_ignore_ascii_case("Bolume.exe") {
+                let mut id = 0u32;
+                if ProcessIdToSessionId(entry.th32ProcessID, &mut id).is_ok() && id == session {
+                    found = true;
+                    break;
+                }
+            }
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+        found
+    }
+}
+
+/// 盯一会儿：还在跑就是真起来了。
+fn wait_alive(pid: u32, window: Duration) -> bool {
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+            return false;
+        };
+        let waited = WaitForSingleObject(process, window.as_millis() as u32);
+        let _ = CloseHandle(process);
+        waited == WAIT_TIMEOUT
+    }
+}
+
+/// 等会话里出现界面层。
+fn wait_app(session: u32, window: Duration) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        if session_has_app(session) {
+            // 刚看到还不够：开机那阵它可能刚起来就退，稳一下再看一眼。
+            std::thread::sleep(Duration::from_millis(600));
+            return session_has_app(session);
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
+/// 送进去的那一份到底起来了没。
+///
+/// 主程序启动时会先脱一层壳（`platform::detach`：父进程不是系统壳就重新拉起一份
+/// 自己、原进程退出）。所以「刚送进去的 pid 马上退出」**不一定是失败**，要看它
+/// 是不是把接力棒交给了 `--detached` 副本 —— 早先直接把退出当失败，日志里那句
+/// 「很快退出，准备重试」其实每次开机都会误报一遍。
+fn launch_succeeded(pid: u32, session: u32, window: Duration) -> bool {
+    wait_alive(pid, window) || wait_app(session, CONFIRM_WINDOW)
+}
+
 /// 用来起进程的令牌。
 ///
 /// * `admin == false`：explorer 的令牌复制一份（= 用户双击的那个权限）。
@@ -170,13 +342,13 @@ fn session_token(session: u32, admin: bool) -> Option<HANDLE> {
     duplicated.then_some(primary)
 }
 
-/// 用那条令牌在它的会话桌面上起一份主程序。
-fn launch_in_session(token: HANDLE) -> bool {
+/// 用那条令牌在它的会话桌面上起一份主程序，返回新进程的 PID。
+fn launch_in_session(token: HANDLE) -> Option<u32> {
     let Ok(exe) = std::env::current_exe() else {
-        return false;
+        return None;
     };
     let app = wide(&exe.display().to_string());
-    let mut command: Vec<u16> = format!("\"{}\"", exe.display())
+    let mut command: Vec<u16> = format!("\"{}\" {}", exe.display(), crate::platform::detach::DETACHED_FLAG)
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -213,10 +385,12 @@ fn launch_in_session(token: HANDLE) -> bool {
             let _ = DestroyEnvironmentBlock(env);
         }
         if created {
+            let pid = process.dwProcessId;
             let _ = CloseHandle(process.hProcess);
             let _ = CloseHandle(process.hThread);
+            return Some(pid);
         }
-        created
+        None
     }
 }
 

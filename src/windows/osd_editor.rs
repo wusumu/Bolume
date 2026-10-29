@@ -144,7 +144,7 @@ impl ColorSlot {
 
     fn get(self, config: &crate::config::Config) -> String {
         match self {
-            Self::Card => config.osd.colors.card.clone(),
+            Self::Card => config.osd.card().color,
             Self::Text => config.osd.colors.text.clone(),
             Self::Accent => config.osd.colors.accent.clone(),
             Self::Shadow => config.osd.shadow.color.clone(),
@@ -157,7 +157,7 @@ impl ColorSlot {
 
     fn set(self, config: &mut crate::config::Config, value: String) {
         match self {
-            Self::Card => config.osd.colors.card = value,
+            Self::Card => config.osd.set_card(|card| card.color = value),
             Self::Text => config.osd.colors.text = value,
             Self::Accent => config.osd.colors.accent = value,
             Self::Shadow => config.osd.shadow.color = value,
@@ -318,7 +318,7 @@ impl NumField {
         match self {
             NumField::Width => (120, 900),
             NumField::Height => (28, 320),
-            NumField::Corner => (0, 32),
+            NumField::Corner => (0, 160),
             NumField::BarCorner => (0, 100),
             NumField::Opacity => (20, 100),
             NumField::ShadowX => crate::config::OSD_SHADOW_OFFSET_RANGE,
@@ -357,11 +357,13 @@ impl NumField {
 
     fn get(self, osd: &crate::config::OsdConfig) -> i32 {
         match self {
-            NumField::Width => osd.width as i32,
-            NumField::Height => osd.height as i32,
-            NumField::Corner => osd.corner as i32,
+            // 尺寸 / 圆角 / 不透明度按**当前模板**读：编辑器切到媒体键模板时，
+            // 这几格显示的是媒体键那份。
+            NumField::Width => osd.card().width as i32,
+            NumField::Height => osd.card().height as i32,
+            NumField::Corner => osd.card().corner as i32,
             NumField::BarCorner => osd.bar_round as i32,
-            NumField::Opacity => osd.opacity as i32,
+            NumField::Opacity => osd.card().opacity as i32,
             NumField::ShadowX => osd.shadow.offset_x,
             NumField::ShadowY => osd.shadow.offset_y,
             NumField::ShadowBlur => osd.shadow.blur as i32,
@@ -373,11 +375,11 @@ impl NumField {
         let (low, high) = self.range();
         let value = value.clamp(low, high);
         match self {
-            NumField::Width => osd.width = value as u32,
-            NumField::Height => osd.height = value as u32,
-            NumField::Corner => osd.corner = value as u32,
+            NumField::Width => osd.set_card(|card| card.width = value as u32),
+            NumField::Height => osd.set_card(|card| card.height = value as u32),
+            NumField::Corner => osd.set_card(|card| card.corner = value as u32),
             NumField::BarCorner => osd.bar_round = value as u32,
-            NumField::Opacity => osd.opacity = value as u32,
+            NumField::Opacity => osd.set_card(|card| card.opacity = value as u32),
             NumField::ShadowX => osd.shadow.offset_x = value,
             NumField::ShadowY => osd.shadow.offset_y = value,
             NumField::ShadowBlur => osd.shadow.blur = value.max(0) as u32,
@@ -608,8 +610,15 @@ impl OsdEditor {
         }
     }
 
-    fn cfg(&self) -> crate::config::OsdConfig {
+    /// 配置里的原样，没按模板铺过 —— 撤销栈和「改没改」都拿它比。
+    fn raw_cfg(&self) -> crate::config::OsdConfig {
         self.config.borrow().get().osd.clone()
+    }
+
+    /// 画布用的配置：当前是媒体键模板时，尺寸 / 圆角 / 不透明度 / 背景色
+    /// 换成它自己那一套（见 `OsdConfig::view`）。
+    fn cfg(&self) -> crate::config::OsdConfig {
+        self.raw_cfg().view()
     }
 
     fn lang(&self) -> Lang {
@@ -617,11 +626,11 @@ impl OsdEditor {
     }
 
     fn update(&self, f: impl FnOnce(&mut crate::config::OsdConfig)) {
-        let before = self.cfg();
+        let before = self.raw_cfg();
         let _ = self.config.borrow_mut().update(|config| f(&mut config.osd));
         // 真的变了才记一步：滑条和拖动会连着调很多次，没变的那几次不该占位置，
         // 不然「按了 Ctrl+Z 却什么都没退」会显得莫名其妙。
-        if self.cfg() != before {
+        if self.raw_cfg() != before {
             let in_gesture = self.gesture_active();
             self.history.borrow_mut().push(before, in_gesture);
         }
@@ -632,9 +641,9 @@ impl OsdEditor {
     /// 画布底色这类「编辑器自己的外观」存在 `Config` 顶层：它们不影响提示条，
     /// 所以判脏 / 撤销栈仍然只比 `osd`（`before` 只取 `osd`，改这些不会占一步撤销）。
     fn update_config(&self, f: impl FnOnce(&mut crate::config::Config)) {
-        let before = self.cfg();
+        let before = self.raw_cfg();
         let _ = self.config.borrow_mut().update(f);
-        if self.cfg() != before {
+        if self.raw_cfg() != before {
             let in_gesture = self.gesture_active();
             self.history.borrow_mut().push(before, in_gesture);
         }
@@ -2420,8 +2429,10 @@ impl Render for OsdEditor {
                             height = (resize.height as f32 + dy).round().clamp(28.0, 320.0) as u32;
                         }
                         this.update(|osd| {
-                            osd.width = width;
-                            osd.height = height;
+                            osd.set_card(|card| {
+                                card.width = width;
+                                card.height = height;
+                            });
                         });
                         cx.notify();
                         return;

@@ -7,6 +7,7 @@ pub mod fonts;
 pub mod fullscreen;
 pub mod hotkey;
 pub mod legacy_osd;
+pub mod logfile;
 pub mod media;
 pub mod memory;
 pub mod monitors;

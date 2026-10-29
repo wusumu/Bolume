@@ -2649,6 +2649,25 @@ impl OsdAlign {
     }
 }
 
+/// 一套背景卡片的样子：尺寸、圆角、不透明度、背景色。
+///
+/// 音量模板和媒体键模板各一份 —— 媒体键那张要放歌名和艺术家，通常比音量卡片
+/// 宽一圈；配色也常常不一样（音量卡片一直在屏幕中间，媒体键卡片只在切歌时露一下）。
+/// 只有「媒体键这一套」单独存：没调过时它跟着音量那套走，改一下才分家。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsdCard {
+    /// 卡片尺寸（逻辑像素）。
+    pub width: u32,
+    pub height: u32,
+    /// 圆角（逻辑像素）。
+    pub corner: u32,
+    /// 不透明度（20..100）。
+    pub opacity: u32,
+    /// 背景色（`#rrggbb`）；空 = 跟随主题。
+    #[serde(default)]
+    pub color: String,
+}
+
 /// OSD 卡片的自定义配色。空串 = 跟随当前主题。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OsdColors {
@@ -3001,6 +3020,13 @@ pub struct OsdConfig {
     /// 媒体键模板的元素排布（和音量模板完全独立，各调各的）。
     #[serde(default = "default_media_layout")]
     pub media_layout: Vec<OsdPartPos>,
+
+    /// 媒体键模板**自己的背景**（尺寸 / 圆角 / 不透明度 / 背景色）。
+    ///
+    /// 空 = 还没单独调过，跟音量模板一样。老配置读进来就是空，行为一点不变；
+    /// 用户在媒体键模板下动一下背景才落成一份独立的值。
+    #[serde(default)]
+    pub media_card: Option<OsdCard>,
 }
 
 /// 默认的元素排布：喇叭在左、读数在右、音量条在底（卡片 191×50）。
@@ -3179,6 +3205,7 @@ impl Default for OsdConfig {
             part_colors: Vec::new(),
             layout: default_osd_layout(),
             media_layout: default_media_layout(),
+            media_card: None,
         }
     }
 }
@@ -3212,7 +3239,65 @@ impl OsdConfig {
     pub fn for_function(&self, function: OsdFunction) -> OsdConfig {
         let mut cfg = self.clone();
         cfg.detailed = function.is_media();
-        cfg
+        cfg.view()
+    }
+
+    /// 音量模板那一套背景（存在主字段里）。
+    fn volume_card(&self) -> OsdCard {
+        OsdCard {
+            width: self.width,
+            height: self.height,
+            corner: self.corner,
+            opacity: self.opacity,
+            color: self.colors.card.clone(),
+        }
+    }
+
+    /// 当前模板（音量 / 媒体键）的背景。
+    ///
+    /// 媒体键模板还没单独调过时返回音量那一套 —— 两套在用户没动之前永远一致。
+    pub fn card(&self) -> OsdCard {
+        if self.detailed {
+            self.media_card.clone().unwrap_or_else(|| self.volume_card())
+        } else {
+            self.volume_card()
+        }
+    }
+
+    /// 改当前模板的背景。媒体键那份不存在时先照着音量那份复制一份再改，
+    /// 这样「只调了圆角」不会把别的几项一起丢掉。
+    pub fn set_card(&mut self, edit: impl FnOnce(&mut OsdCard)) {
+        if self.detailed {
+            let mut card = self.card();
+            edit(&mut card);
+            self.media_card = Some(card);
+        } else {
+            let mut card = self.volume_card();
+            edit(&mut card);
+            self.width = card.width;
+            self.height = card.height;
+            self.corner = card.corner;
+            self.opacity = card.opacity;
+            self.colors.card = card.color;
+        }
+    }
+
+    /// 把这份配置铺成「当前模板的样子」：媒体键模板时换上它自己的背景。
+    ///
+    /// 渲染和编辑器读的都是 `width` / `height` / `corner` / `opacity` /
+    /// `colors.card` 这几个字段，在入口处铺一次比让每个调用点都去问模板简单得多，
+    /// 也不会漏掉某一处（比如阴影和尺寸手柄）。
+    pub fn view(mut self) -> OsdConfig {
+        if self.detailed {
+            if let Some(card) = self.media_card.clone() {
+                self.width = card.width;
+                self.height = card.height;
+                self.corner = card.corner;
+                self.opacity = card.opacity;
+                self.colors.card = card.color;
+            }
+        }
+        self
     }
 
     /// 某个元素的当前位置、尺寸与显隐（缺项回落到默认排布）。
@@ -3565,16 +3650,34 @@ impl OsdConfig {
         }
         let defaults = OsdConfig::default();
         // 排布本身。
-        self.width = defaults.width;
-        self.height = defaults.height;
         self.z_order.clear();
-        // 外观：配色（含元素单独色）、圆角、不透明度、投影。
-        self.colors = defaults.colors;
+        // 外观：文字 / 强调 / 轨道这些颜色两套模板共用，照旧回默认。
+        // 背景色和尺寸属于「**当前**模板的背景」—— 媒体键模板下恢复默认不能让
+        // 音量模板的卡片跟着变（以前就是一刀切，结果「在媒体键模板点恢复默认，
+        // 音量卡片的尺寸和背景色被悄悄改了」）。
+        let volume_card_color = self.colors.card.clone();
+        self.colors = defaults.colors.clone();
         self.part_colors.clear();
-        self.corner = defaults.corner;
         self.bar_round = defaults.bar_round;
-        self.opacity = defaults.opacity;
         self.shadow = defaults.shadow;
+        if self.detailed {
+            // 音量模板的背景色原样还回去，只动媒体键那份。
+            self.colors.card = volume_card_color;
+            if self.media_card.is_some() {
+                self.media_card = Some(OsdCard {
+                    width: defaults.width,
+                    height: defaults.height,
+                    corner: defaults.corner,
+                    opacity: defaults.opacity,
+                    color: defaults.colors.card.clone(),
+                });
+            }
+        } else {
+            self.width = defaults.width;
+            self.height = defaults.height;
+            self.corner = defaults.corner;
+            self.opacity = defaults.opacity;
+        }
     }
 
     /// 改一个元素内容的水平对齐。
@@ -7104,6 +7207,95 @@ mod tests {
         for part in OsdPart::FIXED {
             assert_eq!(empty.osd.part(part), defaults.part(part));
         }
+    }
+
+    /// 媒体键模板的背景可以单独调：没调过时跟音量那套一样，调过之后互不影响，
+    /// 而且**不碰音量模板**（老配置里 `media_card` 是 None，行为一点不变）。
+    #[test]
+    fn osd_media_card_starts_following_volume_then_splits() {
+        let mut osd = OsdConfig::default();
+        assert!(osd.media_card.is_none());
+
+        let volume = osd.card();
+        assert_eq!(osd.for_function(OsdFunction::NextTrack).width, volume.width);
+
+        // 切到媒体键模板，只改圆角：其余几项照抄音量那份，不是归零。
+        osd.detailed = true;
+        osd.set_card(|card| card.corner = 26);
+        let media = osd.card();
+        assert_eq!(media.corner, 26);
+        assert_eq!(media.width, volume.width);
+        assert_eq!(media.height, volume.height);
+        assert_eq!(media.opacity, volume.opacity);
+        assert_eq!(media.color, volume.color);
+
+        // 媒体键那份变了，音量那份不能跟着动。
+        assert_eq!(osd.width, volume.width);
+        assert_eq!(osd.corner, volume.corner);
+        assert_eq!(osd.for_function(OsdFunction::Volume).corner, volume.corner);
+        assert_eq!(osd.for_function(OsdFunction::NextTrack).corner, 26);
+
+        // 回头再改音量模板的尺寸，媒体键那份仍然独立。
+        osd.detailed = false;
+        osd.set_card(|card| {
+            card.width = 260;
+            card.height = 72;
+        });
+        assert_eq!(osd.for_function(OsdFunction::Volume).width, 260);
+        assert_eq!(osd.for_function(OsdFunction::NextTrack).width, volume.width);
+        assert_eq!(osd.for_function(OsdFunction::NextTrack).height, volume.height);
+    }
+
+    /// 老配置里没有 `media_card` 这个键：读进来是 None，不报错。
+    #[test]
+    fn osd_media_card_is_optional_in_json() {
+        let json = r#"{"width":200,"height":60,"corner":12,"opacity":90}"#;
+        let osd: OsdConfig = serde_json::from_str(json).unwrap();
+        assert!(osd.media_card.is_none());
+        assert_eq!(osd.card().width, 200);
+    }
+
+    /// 背景色跟着模板走：媒体键模板设了色，音量模板那条不受影响。
+    #[test]
+    fn osd_media_card_color_is_per_template() {
+        let mut osd = OsdConfig::default();
+        osd.colors.card = "#112233".to_string();
+        osd.detailed = true;
+        osd.set_card(|card| card.color = "#ff0000".to_string());
+        assert_eq!(osd.for_function(OsdFunction::Volume).colors.card, "#112233");
+        assert_eq!(osd.for_function(OsdFunction::NextTrack).colors.card, "#ff0000");
+    }
+
+    /// 媒体键模板「恢复默认」只动它自己那份背景：音量卡片的尺寸 / 圆角 / 背景色
+    /// 不能被连带改掉（这是分开设置之前就存在的一刀切）。
+    #[test]
+    fn reset_layout_keeps_volume_card_when_media_is_active() {
+        let mut osd = OsdConfig::default();
+        osd.width = 260;
+        osd.height = 72;
+        osd.corner = 4;
+        osd.colors.card = "#112233".to_string();
+
+        osd.detailed = true;
+        osd.set_card(|card| {
+            card.width = 340;
+            card.height = 96;
+            card.corner = 45;
+            card.color = "#cc3333".to_string();
+        });
+
+        osd.reset_layout();
+
+        let factory = OsdConfig::default();
+        let media = osd.card();
+        assert_eq!(media.width, factory.width, "媒体键那份要回出厂尺寸");
+        assert_eq!(media.corner, factory.corner);
+        assert_eq!(media.color, factory.colors.card, "背景色回「跟随主题」");
+
+        let volume = osd.for_function(OsdFunction::Volume);
+        assert_eq!((volume.width, volume.height), (260, 72), "音量卡片尺寸别动");
+        assert_eq!(volume.corner, 4);
+        assert_eq!(volume.colors.card, "#112233", "音量卡片背景色别动");
     }
 
     /// 位置选项的序号要能来回换，认不出的值退回默认的下居中。

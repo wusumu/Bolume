@@ -47,7 +47,48 @@ impl log::Log for StderrLogger {
     fn flush(&self) {}
 }
 
+/// panic 落盘。
+///
+/// release 编的是 `panic = "abort"`：一个 panic 就是进程直接消失，没有控制台、
+/// 没有对话框、事件日志里只有一句 `0xc0000409`。开机自启那条路上的表现就是
+/// **「任务跑了，但程序没起来」** —— 光看任务计划完全查不出来。这里把消息、
+/// 位置和调用栈追加进 `crash.log`，事后至少能指到哪一行。
+fn install_panic_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut text = String::from("panic: ");
+        let payload = info.payload();
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            text.push_str(message);
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            text.push_str(message);
+        } else {
+            text.push_str("(非字符串 payload)");
+        }
+        match info.location() {
+            Some(at) => text.push_str(&format!(" @ {}:{}:{}", at.file(), at.line(), at.column())),
+            None => text.push_str(" @ (未知位置)"),
+        }
+        if let Some(name) = std::thread::current().name() {
+            text.push_str(&format!("\n  thread: {name}"));
+        }
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        text.push_str(&format!("\n  args: {}", args.join(" ")));
+        // 不再写调用栈：release 是 `strip = "symbols"`，栈里全是 `<unknown>`，
+        // 一行位置（`文件:行:列`）反而更直接。
+        platform::logfile::append("crash.log", &text);
+        previous(info);
+    }));
+}
+
 fn main() {
+    install_panic_log();
+
+    // 调试用：确认崩溃日志这条链路真的在写（`BOLUME_PANIC_TEST=1`）。
+    if std::env::var_os("BOLUME_PANIC_TEST").is_some() {
+        panic!("panic log probe");
+    }
+
     if std::env::var_os("BOLUME_LOG").is_some() {
         let _ = log::set_boxed_logger(Box::new(StderrLogger));
         log::set_max_level(log::LevelFilter::Debug);

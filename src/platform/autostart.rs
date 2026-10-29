@@ -423,6 +423,16 @@ fn task_xml(exe: &std::path::Path, method: LaunchMethod, admin: bool, user: Opti
             if admin { "HighestAvailable" } else { "LeastPrivilege" }
         )
     };
+    // 系统启动那一档挂了「开机时」和「任何用户登录时」两条触发器，**必须允许并发**：
+    // 开机那份可能已经把进程送进会话又退场了（送进去的进程自己退了），也可能卡在
+    // 等待里，登录这一刻得能再起一份交接去补。交接内部用 `Global\` 互斥体保证同时
+    // 只有一份在干活，所以不会送两个实例进会话。登录那一档只有一条触发器，照旧
+    // 用 `IgnoreNew` 挡住重复点击。
+    let instances = if method == LaunchMethod::Boot {
+        "Parallel"
+    } else {
+        "IgnoreNew"
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -438,7 +448,7 @@ fn task_xml(exe: &std::path::Path, method: LaunchMethod, admin: bool, user: Opti
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>{instances}</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>

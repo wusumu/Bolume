@@ -1097,7 +1097,7 @@ impl NumberField {
             Self::OsdWidth => (160, 900),
             Self::OsdHeight => (48, 320),
             // 圆角最大到高度一半就够了（再大看不出变化）。
-            Self::OsdCorner => (0, 32),
+            Self::OsdCorner => (0, 160),
             // 太透明就看不见字了，最低给 20%。
             Self::OsdOpacity => (20, 100),
             Self::OsdX | Self::OsdY => (0, 4000),
@@ -1177,10 +1177,11 @@ impl NumberField {
             Self::FlyoutVerticalHeight => config.vertical_height = value,
             Self::PanelBarThickness => config.panel_bar_thickness = value,
             Self::PanelBarRound => config.panel_bar_round = value,
-            Self::OsdWidth => config.osd.width = value,
-            Self::OsdHeight => config.osd.height = value,
-            Self::OsdCorner => config.osd.corner = value,
-            Self::OsdOpacity => config.osd.opacity = value,
+            // 这几格跟编辑器一样按**当前模板**写：媒体键模板下改的是它自己那份背景。
+            Self::OsdWidth => config.osd.set_card(|card| card.width = value),
+            Self::OsdHeight => config.osd.set_card(|card| card.height = value),
+            Self::OsdCorner => config.osd.set_card(|card| card.corner = value),
+            Self::OsdOpacity => config.osd.set_card(|card| card.opacity = value),
             Self::OsdX => config.osd.custom_x = value,
             Self::OsdY => config.osd.custom_y = value,
             Self::OsdFadeIn => config.osd.fade_in_ms = value,
