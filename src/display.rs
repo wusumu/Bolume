@@ -71,6 +71,19 @@ pub fn monitor_index_at_cursor() -> usize {
         .unwrap_or(0)
 }
 
+/// 这块屏（`HMONITOR` 句柄）在 DDC 枚举里排第几（0 起）。
+///
+/// 顺序和 `Monitor::enumerate()` 一致（见 `monitor_index_at_cursor` 的说明），
+/// 所以只要手里有句柄就能对上 `displays` 里的那一项 —— 提示条拖亮度条时要靠它
+/// 找到「这条提示条所在那块屏」的亮度通道。认不出来就落到第一台：拖了总得
+/// 调点什么，整条没反应更糟。
+pub fn index_for_handle(handle: isize) -> usize {
+    screen_handles()
+        .iter()
+        .position(|candidate| candidate.0 as isize == handle)
+        .unwrap_or(0)
+}
+
 /// MCCS 的亮度 VCP 码（参考实现用的就是它）。
 pub const VCP_BRIGHTNESS: u8 = 0x10;
 /// MCCS 的对比度 VCP 码：现在就留好，将来加对比度只需多一条命令。

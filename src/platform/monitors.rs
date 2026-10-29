@@ -43,6 +43,24 @@ pub struct MonitorInfo {
     pub handle: isize,
 }
 
+/// 按 OSD 的显示器序号（0 = 主显示器，n = 第 n 台）取那块屏的句柄。
+///
+/// 和 `osd::target_area` 一套编号：序号写大了（换了台少一台的机器）就落到主屏，
+/// 别让「拖条调亮度」因为认不出屏幕就整条没反应。
+pub fn handle_of(index: u32) -> Option<isize> {
+    let list = monitors();
+    let chosen = if index == 0 {
+        list.iter()
+            .find(|info| info.is_primary)
+            .or_else(|| list.first())
+    } else {
+        list.get(index as usize - 1)
+            .or_else(|| list.iter().find(|info| info.is_primary))
+            .or_else(|| list.first())
+    };
+    chosen.map(|info| info.handle)
+}
+
 /// 鼠标指针此刻在哪台显示器上（`monitors()` 里的下标 + 1，取不到返回 `None`）。
 ///
 /// 用 `MonitorFromPoint(MONITOR_DEFAULTTONEAREST)` 而不是自己拿光标坐标去比矩形：

@@ -2369,20 +2369,29 @@ impl Render for OsdEditor {
 
         // 右上角 1:1 预览：设计画布是放大过的，字号到底多大得看这个。
         // 开了投影的话框要留出影子的位置，不然会被切掉。
+        //
+        // 这一小块**按卡片的原宽定宽、靠右摆**：卡片一旋转，转后的包围盒就变宽
+        // 变高，按它算宽度的话整块（连那行「实际大小 100%」）会跟着左右跳 ——
+        // 转个角度界面自己挪一下，看着像没对齐。用原宽定宽以后，不转时那行字
+        // 正好齐着卡片两边，转了也只有里面的卡片在动。
         let shadow_pad = osd::shadow_margin(view);
-        let preview_w = (box_w + shadow_pad * 2.0).min((canvas_w - 28.0).max(60.0));
+        let col_w = (view.width as f32 + shadow_pad * 2.0)
+            .min((canvas_w - 28.0).max(60.0));
+        let preview_w = (box_w + shadow_pad * 2.0).min(col_w);
         let preview_h = (box_h + shadow_pad * 2.0).min((canvas_h - 56.0).max(24.0));
-        let preview_left = (canvas_w - preview_w - 14.0).max(8.0);
+        let preview_left = (canvas_w - col_w - 14.0).max(8.0);
         let preview = div()
             .absolute()
             .left(px(preview_left))
             .top(px(10.))
+            .w(px(col_w))
             .flex()
             .flex_col()
+            .items_center()
             .gap(px(4.))
             .child(
                 div()
-                    .w(px(preview_w))
+                    .w_full()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -3408,6 +3417,10 @@ impl OsdEditor {
         self.selected = None;
         self.guide = None;
         self.confirm_reset = false;
+        // 正在改的那条文字连同它一起清掉：恢复默认会把自建文字整条删掉，
+        // 留着这份编辑状态的话，下一次失焦提交又把它写回去（等于没恢复）。
+        self.text = None;
+        self.text_drag = false;
         self.update(|osd| osd.reset_layout());
         cx.notify();
     }
@@ -3428,11 +3441,11 @@ impl OsdEditor {
         };
         let body = if lang.is_en() {
             format!(
-                "Restore the \"{template}\" template to factory settings? Element positions, sizes, visibility and layer order, plus the card size, corners, opacity, colors and shadow all go back. Text you typed stays."
+                "Restore the \"{template}\" template to factory settings? Element positions, sizes, visibility and layer order, plus the card size, corners, opacity, colors and shadow all go back. Text elements are removed and the status text goes back to automatic."
             )
         } else {
             format!(
-                "把「{template}」模板恢复成出厂？元素的位置、大小、显隐、图层顺序，以及卡片尺寸、圆角、不透明度、配色和阴影都会回到默认；你写的文字不动。"
+                "把「{template}」模板恢复成出厂？元素的位置、大小、显隐、图层顺序，以及卡片尺寸、圆角、不透明度、配色和阴影都会回到默认；自己加的文字会删掉，状态文字回到自动内容。"
             )
         };
 

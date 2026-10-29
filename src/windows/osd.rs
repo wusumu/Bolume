@@ -233,6 +233,18 @@ pub fn rotated_bounds(cfg: &OsdConfig) -> (f32, f32) {
     )
 }
 
+/// 提示条窗口实际要多大（逻辑像素，不含投影留白）。
+///
+/// 平时就是「卡片转后的包围盒」。但卡片转 90° 时，它的**布局矩形**（191×50）
+/// 会整个横在包围盒（50×191）外面；渲染器按布局矩形做顶点裁剪，四角全落在窗口外，
+/// 整块卡片（连里面的图标和字）就被裁掉，屏幕上只剩中间一条。所以窗口取两者的
+/// 并集 —— 布局矩形也装得下，顶点裁剪不会再误伤。多出来的那圈是透明的。
+pub fn window_extent(cfg: &OsdConfig) -> (f32, f32) {
+    let (card_w, card_h) = card_size(cfg);
+    let (box_w, box_h) = rotated_bounds(cfg);
+    (box_w.max(card_w), box_h.max(card_h))
+}
+
 /// 元素高度与它自己的 `size` 之间的倍数。
 ///
 /// 图标 / 音量条的 `size` 就是高度本身；标题是两行（标题 + 副标题），
@@ -1585,7 +1597,10 @@ impl Osd {
         // 贴边与夹取都按**转后的包围盒**算：转 90° 之后卡片是竖着的，
         // 按原尺寸贴边会让它一半跑到屏幕外面去。
         let (card_w, card_h) = rotated_bounds(cfg);
-        let (width, height) = (card_w + pad * 2.0, card_h + pad * 2.0);
+        // 窗口比卡片本体再大一圈：卡片的**布局矩形**也得装得下，否则转头
+        // 顶点裁剪会把整块内容裁掉（见 `window_extent`）。
+        let (extent_w, extent_h) = window_extent(cfg);
+        let (width, height) = (extent_w + pad * 2.0, extent_h + pad * 2.0);
         let area = target_area(self.monitor.unwrap_or(cfg.monitor));
         let margin = 24.0;
         let (ax, ay) = (area.origin.x.as_f32(), area.origin.y.as_f32());
@@ -1609,8 +1624,12 @@ impl Osd {
         // 被裁一点，也不能因为扩散变大就把卡片往里推（以前 pad 一涨，卡片就跳着走）。
         x = x.clamp(ax, (ax + aw - card_w).max(ax));
         y = y.clamp(ay, (ay + ah - card_h).max(ay));
-        // 卡片在窗口里居中，所以窗口再往左上让出 pad，卡片本体才落在锚点上。
-        let (x, y) = (x - pad, y - pad);
+        // 卡片在窗口里居中，所以窗口再往左上让出 pad + 「比卡片多出来的那一圈」，
+        // 卡片本体才落在锚点上。
+        let (x, y) = (
+            x - pad - (extent_w - card_w) * 0.5,
+            y - pad - (extent_h - card_h) * 0.5,
+        );
         self.base = (x, y, width, height);
         // 强制写一遍：新位置可能刚好和上一次的位移抵消成同一个值。
         self.last_offset = f32::NAN;
@@ -2092,6 +2111,11 @@ impl Osd {
         if !cfg.interactive || !self.visible {
             return;
         }
+        // 亮度模板里这根是亮度条：拖它直接写亮度（以前只认音量，拖上去毫无反应）。
+        if matches!(self.state.function, OsdFunction::Brightness) {
+            self.on_brightness_bar(display, window, cx);
+            return;
+        }
         if !matches!(self.state.function, OsdFunction::Volume | OsdFunction::Mute) {
             return;
         }
@@ -2150,11 +2174,59 @@ impl Osd {
         cx.notify();
     }
 
+    /// 拖亮度条：按拖到的位置写这条提示条所在那块屏的亮度。
+    ///
+    /// 亮度走 DDC/CI，一次写六十毫秒上下，所以整条链路和快捷键那套保持一致：
+    /// 写下去的同时记一笔目标（`note_brightness`），迟到的回读不会把条拽回去；
+    /// 读数和条的位置立刻按新值画，不等那六十毫秒。
+    fn on_brightness_bar(&mut self, level: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let cfg = self.cfg();
+        let value = (level.clamp(0.0, 1.0) * 100.0).round().clamp(0.0, 100.0) as u32;
+        // 这条提示条钉在哪块屏上就调哪台（「全部显示器」时每块屏各有一条）。
+        let monitor = self.monitor.unwrap_or(cfg.monitor);
+        let index = crate::platform::monitors::handle_of(monitor)
+            .map(crate::display::index_for_handle)
+            .unwrap_or(0);
+        let (_, engine, displays, _) = crate::gui::brightness_embed_deps(cx);
+        let channel = displays
+            .borrow()
+            .get(index)
+            .filter(|info| info.brightness.is_some())
+            .map(|info| info.key.clone());
+        if let Some(key) = channel {
+            engine.send(crate::display::DisplayCommand::SetBrightness {
+                key: key.clone(),
+                value,
+            });
+            crate::gui::note_brightness(cx, &key, value);
+            // 面板要是正开着，下一帧就按新值画，不跟着回读跳。
+            if let Some(entry) = displays.borrow_mut().get_mut(index) {
+                entry.brightness = Some(value);
+            }
+            crate::gui::refresh_brightness_window(cx);
+        }
+        // 通道不通也照样跟着手走：条得跟手，不然用户只会觉得「拖不动」。
+        let min_db = self.config.borrow().get().logarithmic_min_db as f32;
+        let level = value as f32 / 100.0;
+        let (percent, _) = readouts(level, false, min_db);
+        self.state.fraction = level;
+        self.state.percent = percent;
+        apply_style(&cfg, &mut self.state);
+        // 手按着的时候绝不淡出。
+        self.dragging = true;
+        self.phase = Phase::Hold {
+            until: Instant::now() + Duration::from_millis(cfg.hold_ms as u64),
+        };
+        self.alpha = 1.0;
+        self.apply_alpha(window, &cfg);
+        cx.notify();
+    }
+
     /// 松开滑条：手一停就重新开始倒计时，到点照常淡出。
     ///
     /// 松手那一声提示音跟面板同一个开关，OSD 这一侧另外还要过 `release_sound_osd`
-    /// 这个子开关（面板里是主开关直接管）。亮度 / 低音那几条虽然也画着滑条，
-    /// 拖它并不改设置（`on_bar_change` 早退），所以不跟着响。
+    /// 这个子开关（面板里是主开关直接管）。亮度条拖的是亮度、不是音量，
+    /// 那一声「音量到了」的音效跟它无关，所以不跟着响。
     fn on_bar_release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dragging = false;
         if !self.visible {

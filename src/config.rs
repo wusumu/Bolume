@@ -3781,39 +3781,39 @@ impl OsdConfig {
         self.part(part).rotation
     }
 
-    /// 把当前模板恢复成默认（两个模板各恢复各的），卡片外观一起回到出厂。
-    ///
-    /// 元素位置是归一化的，卡片一变尺寸它们按比例跟着走；用户点「恢复默认布局」
-    /// 通常就是「我把它拖乱了，回到原来那样」。
-    /// 把当前模板恢复成出厂排布，**连带整张卡片的外观**一起回默认。
+    /// 把当前模板恢复成出厂：排布、卡片外观、自定义文字全回默认。
     ///
     /// 用户点这个就是「我把它调乱了，回到原来那样」，所以配色、元素单独色、
-    /// 圆角、不透明度、阴影、图层顺序全部一起回出厂 —— 只把位置放回去、
-    /// 留着上一版配色和影子，等于恢复了个寂寞（0.47 之前的毛病）。
+    /// 圆角、不透明度、阴影、图层顺序、卡片尺寸、自建文字全部一起回出厂 ——
+    /// 只把位置放回去、留着上一版配色和影子，等于恢复了个寂寞（0.47 之前的毛病）；
+    /// 卡片上还留着一行自己写的字，看着更像没恢复干净。
     ///
-    /// 只恢复**当前**这套模板的排布（另一套各恢复各的），文字内容一个字不动：
-    /// 那是用户写的东西，不是「布局」；自定义文字连位置也一起留着（它们没有出厂位置）。
+    /// 只恢复**当前**这套模板（另一套各恢复各的）。
     pub fn reset_layout(&mut self) {
-        // 固定的五个元素回出厂排布；**用户自己新建的文字原样留着** ——
-        // 它们没有「出厂位置」，抹掉会让文字从元素列表里消失、还跑回卡片左上角。
-        let mut fresh = match self.template() {
+        // 排布：固定的五个元素回出厂。自建文字整条清掉 —— 内容、三套排布里
+        // 那几条、图层里的编号一起清，不然恢复完卡片上还挂着一行用户写的字。
+        let fresh = match self.template() {
             OsdTemplate::Media => default_media_layout(),
             // 亮度和音量一套结构（图标 + 读数 + 条），排布也就一套默认值。
             OsdTemplate::Volume | OsdTemplate::Brightness => default_osd_layout(),
         };
-        fresh.extend(
-            self.active()
-                .iter()
-                .filter(|slot| matches!(slot.part, OsdPart::Text(_)))
-                .copied(),
-        );
         match self.template() {
             OsdTemplate::Volume => self.layout = fresh,
             OsdTemplate::Media => self.media_layout = fresh,
             OsdTemplate::Brightness => self.brightness_layout = fresh,
         }
+        self.texts.clear();
+        // 状态文字清空 = 回自动内容（音量 / 下一曲）。
+        self.title_text.clear();
+        for layout in [
+            &mut self.layout,
+            &mut self.media_layout,
+            &mut self.brightness_layout,
+        ] {
+            layout.retain(|slot| !matches!(slot.part, OsdPart::Text(_)));
+        }
         let defaults = OsdConfig::default();
-        // 排布本身。
+        // 图层顺序回内置。
         self.z_order.clear();
         // 外观：文字 / 强调 / 轨道这些颜色两套模板共用，照旧回默认。
         // 背景色和尺寸属于「**当前**模板的背景」—— 媒体键模板下恢复默认不能让
@@ -3833,27 +3833,38 @@ impl OsdConfig {
             rotation: defaults.rotation,
         };
         match self.template() {
-            OsdTemplate::Volume => {
-                self.width = factory.width;
-                self.height = factory.height;
-                self.corner = factory.corner;
-                self.opacity = factory.opacity;
-                self.rotation = factory.rotation;
-            }
-            // 媒体键 / 亮度模板：音量模板的背景色原样还回去，只动自己那份。
+            OsdTemplate::Volume => self.apply_card(&factory),
+            // 媒体键 / 亮度模板：自己那份背景存在就整张换掉，音量那份原样还回去；
+            // 还没单独调过（None）= 用的就是音量那张卡，那就连它一起回出厂 ——
+            // 以前这里只在 Some 时动手，于是「背景没单独调过」的模板点恢复默认，
+            // 尺寸和背景色纹丝不动。
             OsdTemplate::Media => {
-                self.colors.card = volume_card_color;
                 if self.media_card.is_some() {
+                    self.colors.card = volume_card_color;
                     self.media_card = Some(factory);
+                } else {
+                    self.apply_card(&factory);
                 }
             }
             OsdTemplate::Brightness => {
-                self.colors.card = volume_card_color;
                 if self.brightness_card.is_some() {
+                    self.colors.card = volume_card_color;
                     self.brightness_card = Some(factory);
+                } else {
+                    self.apply_card(&factory);
                 }
             }
         }
+    }
+
+    /// 把一张卡片写回音量模板那几个主字段（也是「还没单独调过」的模板真正在用的那份）。
+    fn apply_card(&mut self, card: &OsdCard) {
+        self.width = card.width;
+        self.height = card.height;
+        self.corner = card.corner;
+        self.opacity = card.opacity;
+        self.colors.card = card.color.clone();
+        self.rotation = card.rotation;
     }
 
     /// 改一个元素内容的水平对齐。
@@ -5728,7 +5739,7 @@ mod tests {
         assert_eq!(back.osd.colors, config.osd.colors);
     }
 
-    /// 「恢复默认布局」连配色 / 阴影 / 圆角 / 图层一起回出厂，文字内容不动。
+    /// 「恢复默认布局」连配色 / 阴影 / 圆角 / 图层 / 文字一起回出厂。
     #[test]
     fn reset_layout_also_restores_appearance() {
         let mut osd = OsdConfig::default();
@@ -5748,8 +5759,7 @@ mod tests {
         let mut order = osd.parts();
         order.reverse();
         osd.z_order = order;
-        let text = "+10 dB".to_string();
-        osd.title_text = text.clone();
+        osd.title_text = "+10 dB".into();
 
         osd.reset_layout();
 
@@ -5766,30 +5776,66 @@ mod tests {
             "阴影（开关 / 偏移 / 扩散 / 颜色）全回默认"
         );
         assert!(osd.z_order.is_empty(), "图层顺序回内置顺序");
-        assert_eq!(osd.title_text, text, "文字是用户写的东西，不跟着重置");
+        assert!(osd.title_text.is_empty(), "状态文字回自动内容");
     }
 
-    /// 重置不会把用户新建的文字弄丢：位置留着，元素列表里照样看得到。
+    /// 「恢复默认布局」要连自建文字一起清掉：卡片上留着一行自己写的字，
+    /// 等于恢复了个寂寞。
     #[test]
-    fn reset_layout_keeps_custom_texts() {
+    fn reset_layout_drops_custom_texts() {
         let mut osd = OsdConfig::default();
         let part = osd.add_text();
         osd.set_text_for(part, "{hh}:{mm}".into());
         osd.set_part(part, 0.42, 0.66);
         osd.set_part_size(part, 15);
-
+        // 另一套模板里也有一条，恢复一起清。
+        osd.detailed = true;
+        osd.reset_layout();
+        osd.detailed = false;
         osd.reset_layout();
 
-        let slot = osd.part(part);
-        assert_eq!((slot.x, slot.y), (0.42, 0.66), "文字的位置不该被重置丢掉");
-        assert_eq!(slot.size, 15);
-        assert_eq!(osd.text_for(part), "{hh}:{mm}", "内容更不该丢");
-        assert!(
-            osd.parts().contains(&part),
-            "元素列表里必须还能看到这条文字"
-        );
+        assert!(osd.texts.is_empty(), "文字内容要清掉");
+        assert!(!osd.parts().contains(&part), "元素列表里不该再有这条文字");
+        assert!(!osd.shows_part(part), "也不该再画出来");
+        for layout in [&osd.layout, &osd.media_layout, &osd.brightness_layout] {
+            assert!(
+                !layout.iter().any(|slot| matches!(slot.part, OsdPart::Text(_))),
+                "三套排布里都不该留着文字条目"
+            );
+        }
         // 固定元素照常回出厂。
         assert_eq!(osd.part(OsdPart::Icon).x, default_osd_layout()[0].x);
+    }
+
+    /// 背景没单独调过的模板（`media_card` / `brightness_card` 是 None，用的就是
+    /// 音量那张卡）点「恢复默认布局」，尺寸和背景色也要回出厂 —— 以前只在 Some
+    /// 时动手，这两个模板下尺寸纹丝不动。
+    #[test]
+    fn reset_layout_restores_shared_card_size() {
+        for detailed in [true, false] {
+            let mut osd = OsdConfig::default();
+            osd.detailed = detailed;
+            assert!(
+                osd.media_card.is_none() && osd.brightness_card.is_none(),
+                "前提：还没单独调过背景"
+            );
+            // 在模板里把尺寸和背景色改掉（直接写主字段，模拟「老配置里根本没
+            // 单独这份背景」的状态，`media_card` / `brightness_card` 仍是 None）。
+            osd.width = 512;
+            osd.height = 96;
+            osd.corner = 2;
+            osd.rotation = 30;
+            osd.colors.card = "#101010".into();
+
+            osd.reset_layout();
+
+            let factory = OsdConfig::default();
+            assert_eq!(osd.width, factory.width, "detailed={detailed} 宽度要回出厂");
+            assert_eq!(osd.height, factory.height, "detailed={detailed} 高度要回出厂");
+            assert_eq!(osd.corner, factory.corner);
+            assert_eq!(osd.rotation, factory.rotation);
+            assert_eq!(osd.colors.card, factory.colors.card, "背景色也要回默认");
+        }
     }
 
     /// 「恢复默认布局」必须真的把拖动过的元素放回去，两个模板各恢复各的。
