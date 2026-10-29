@@ -943,6 +943,8 @@ enum NumberField {
     TrayMotionGain,
     /// 按住连发的间隔（毫秒）。
     HotkeyRepeatInterval,
+    /// 按住多久才开始连发（毫秒，0 = 不等）。
+    HotkeyRepeatDelay,
     /// 「指定显示器」那组亮度快捷键调第几台（1 起）。
     BrightnessHotkeyMonitor,
     /// 亮度快捷键自己的步进（百分点，0 = 跟面板的「亮度步进」）。
@@ -1022,6 +1024,7 @@ impl NumberField {
             Self::TrayMenuWidth => config.tray_menu_max_width,
             Self::TrayMotionGain => config.tray_motion_gain,
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval,
+            Self::HotkeyRepeatDelay => config.hotkey_repeat_delay,
             Self::BrightnessHotkeyMonitor => config.brightness.hotkey_monitor,
             Self::BrightnessHotkeyStep => config.brightness.hotkey_step,
             // 两个都是整数百分比 / 级别，直接就是显示值。
@@ -1113,6 +1116,7 @@ impl NumberField {
             Self::TrayMenuWidth => crate::config::TRAY_MENU_WIDTH_RANGE,
             Self::TrayMotionGain => crate::config::TRAY_MOTION_GAIN_RANGE,
             Self::HotkeyRepeatInterval => crate::config::HOTKEY_REPEAT_RANGE,
+            Self::HotkeyRepeatDelay => crate::config::HOTKEY_REPEAT_DELAY_RANGE,
             // 台数上限按 8 给：再多的场面亮度面板本来也放不下。
             Self::BrightnessHotkeyMonitor => (1, 8),
             Self::BrightnessHotkeyStep => crate::config::BRIGHTNESS_HOTKEY_STEP_RANGE,
@@ -1191,6 +1195,7 @@ impl NumberField {
             Self::TrayMenuWidth => config.tray_menu_max_width = value,
             Self::TrayMotionGain => config.tray_motion_gain = value,
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval = value,
+            Self::HotkeyRepeatDelay => config.hotkey_repeat_delay = value,
             Self::BrightnessHotkeyMonitor => config.brightness.hotkey_monitor = value,
             Self::BrightnessHotkeyStep => config.brightness.hotkey_step = value,
             Self::LoudnessLevel => config.loudness.level = value.clamp(1, 100),
@@ -1290,7 +1295,7 @@ impl NumberField {
             Self::UiFontScale | Self::UiOpacity | Self::UiContrast => format!("{value}%"),
             Self::TrayMenuWidth => format!("{value} px"),
             Self::TrayMotionGain => format!("{value}%"),
-            Self::HotkeyRepeatInterval => format!("{value} ms"),
+            Self::HotkeyRepeatInterval | Self::HotkeyRepeatDelay => format!("{value} ms"),
             Self::BrightnessHotkeyMonitor => format!("#{value}"),
             Self::BrightnessHotkeyStep => {
                 if value == 0 {
@@ -1337,6 +1342,7 @@ impl NumberField {
                 | Self::OsdHeight
                 | Self::PopupAnimation
                 | Self::HotkeyRepeatInterval
+                | Self::HotkeyRepeatDelay
         ) {
             4
         } else {
@@ -1363,6 +1369,10 @@ impl NumberField {
     /// 免得按一下只挪 1 个百分点、看不出变化。
     fn stepped(self, current: i32, direction: i32) -> i32 {
         let (low, high) = self.range();
+        // 连发延迟的 0 是正经值（「不等」），不是占位值：往上按一格就是 50ms。
+        if matches!(self, Self::HotkeyRepeatDelay) {
+            return (current + direction * self.step_size()).clamp(low, high);
+        }
         if direction > 0 && current == low && low == 0 {
             // 高度类字段的 0 是「自动 / 跟随」，往上按一下直接给一个像样的高度。
             if matches!(
@@ -8454,6 +8464,25 @@ impl Settings {
                             .child(lang.pick("按住连续触发", "Hold to repeat")),
                     )
                     .child(switch),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_tertiary())
+                            .child(lang.pick("延迟", "Delay")),
+                    )
+                    .child(self.number_stepper(
+                        "hotkey-repeat-delay",
+                        NumberField::HotkeyRepeatDelay,
+                        config.hotkey_repeat_delay as i32,
+                        lang,
+                        cx,
+                    )),
             )
             .child(
                 div()

@@ -3719,6 +3719,12 @@ pub const DEFAULT_HOTKEY_REPEAT_INTERVAL: u32 = 120;
 /// 连发间隔的可调范围（毫秒）。30ms 以下基本等于一路滑到底，1s 以上按着没感觉。
 pub const HOTKEY_REPEAT_RANGE: (u32, u32) = (30, 1000);
 
+/// 按住多久才开始连发（毫秒）。0 = 不额外等待，按住就按间隔走。
+///
+/// 和系统「键盘字符重复延迟」一个意思：手滑按一下不会立刻连跳好几档，
+/// 按住不放才进入连发。上限放到 9999（快十秒），够慢了；输入框也按四位给。
+pub const HOTKEY_REPEAT_DELAY_RANGE: (u32, u32) = (0, 9999);
+
 /// 「按住连续触发」默认在哪些动作上生效：音量四个 + 亮度六个。
 ///
 /// 名字和 [`crate::platform::hotkey::Action::key`] 一一对应。切歌、静音、播放暂停、
@@ -4250,6 +4256,14 @@ pub struct Config {
     /// 连发间隔（毫秒）。
     pub hotkey_repeat_interval: u32,
 
+    /// 按住多久才开始连发（毫秒，0–9999，默认 0）。
+    ///
+    /// 就是系统那套「键盘字符重复延迟」：按下之后先不动，按住超过这么久才开始
+    /// 按 `hotkey_repeat_interval` 一档档往下走。0 = 不等（和以前一样，按下就进连发节奏）。
+    /// 只在 `hotkey_hold_repeat` 开着、且这个动作勾了连发时才有意义。
+    #[serde(default)]
+    pub hotkey_repeat_delay: u32,
+
     /// 「按住连续触发」在哪些动作上生效：动作名，见 [`crate::platform::hotkey::Action::key`]。
     ///
     /// 默认是音量四个 + 亮度六个（[`DEFAULT_REPEAT_ACTIONS`]）。存成名字而不是位图，
@@ -4468,6 +4482,7 @@ impl Default for Config {
             hotkey_brightness_monitor_down: HotkeySlots::default(),
             hotkey_hold_repeat: true,
             hotkey_repeat_interval: DEFAULT_HOTKEY_REPEAT_INTERVAL,
+            hotkey_repeat_delay: 0,
             hotkey_repeat_actions: default_repeat_actions(),
             hotkey_ignore_system_repeat: true,
             hotkey_numpad_raw: false,
@@ -5579,6 +5594,8 @@ mod tests {
             config.hotkey_repeat_interval,
             DEFAULT_HOTKEY_REPEAT_INTERVAL
         );
+        // 连发延迟默认 0：按下就按间隔走，和加这一项之前完全一样。
+        assert_eq!(config.hotkey_repeat_delay, 0, "连发延迟默认 0");
         // rev 61：默认不理会系统的长按重复，重复节奏只看上面那个间隔。
         assert!(config.hotkey_ignore_system_repeat, "默认忽略系统重复");
         let old: Config = serde_json::from_str(r#"{"config_rev": 60}"#).expect("老配置要能解析");

@@ -2139,12 +2139,13 @@ static HOLD_REPEAT_TOKEN: AtomicU64 = AtomicU64::new(0);
 /// keydown 之后就断了），所以重复必须自己做。判断松没松走 `is_key_held`：
 /// 被吞过的键（媒体 / 音量键）在系统那边当没按过，只能问钩子自己的按下表。
 fn start_hold_repeat(cx: &mut App, hotkey: crate::config::Hotkey) {
-    let (enabled, interval) = {
+    let (enabled, interval, delay) = {
         let state = cx.global::<AppState>();
         let config = state.config.borrow();
         (
             config.get().hotkey_hold_repeat,
             config.get().hotkey_repeat_interval,
+            config.get().hotkey_repeat_delay,
         )
     };
     // 鼠标键（伪键码 0x100 起）没有「按住」这回事：一格滚轮就是一下。
@@ -2153,12 +2154,19 @@ fn start_hold_repeat(cx: &mut App, hotkey: crate::config::Hotkey) {
     }
     let (low, high) = crate::config::HOTKEY_REPEAT_RANGE;
     let interval = interval.clamp(low, high) as u64;
+    // 延迟可以设成 0：这时第一档照旧等一个间隔，和加这一项之前一模一样。
+    let (dlow, dhigh) = crate::config::HOTKEY_REPEAT_DELAY_RANGE;
+    let delay = delay.clamp(dlow, dhigh) as u64;
     let token = HOLD_REPEAT_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
     cx.spawn(async move |cx| {
+        // 第一档之前先等这么久 —— 系统那套「键盘字符重复延迟」的等价物。
+        // 0 就不额外等（下面循环第一次等的还是间隔）。
+        let mut wait = if delay > 0 { delay } else { interval };
         loop {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(interval))
+                .timer(std::time::Duration::from_millis(wait))
                 .await;
+            wait = interval;
             if HOLD_REPEAT_TOKEN.load(Ordering::SeqCst) != token {
                 return;
             }
