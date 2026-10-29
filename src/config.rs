@@ -3597,7 +3597,7 @@ impl OsdConfig {
             visible: true,
             rotation: 0.0,
         };
-        for layout in [&mut self.layout, &mut self.media_layout] {
+        for layout in [&mut self.layout, &mut self.media_layout, &mut self.brightness_layout] {
             if !layout.iter().any(|slot| slot.part == part) {
                 layout.push(position);
             }
@@ -3621,7 +3621,7 @@ impl OsdConfig {
                 }
             }
         }
-        for layout in [&mut self.layout, &mut self.media_layout] {
+        for layout in [&mut self.layout, &mut self.media_layout, &mut self.brightness_layout] {
             layout.retain(|slot| slot.part != OsdPart::Text(index as u16));
             for slot in layout.iter_mut() {
                 if let OsdPart::Text(other) = slot.part {
@@ -3649,7 +3649,7 @@ impl OsdConfig {
             .iter()
             .map(|index| self.texts[*index].clone())
             .collect();
-        for layout in [&mut self.layout, &mut self.media_layout] {
+        for layout in [&mut self.layout, &mut self.media_layout, &mut self.brightness_layout] {
             let mut next: Vec<OsdPartPos> = Vec::with_capacity(layout.len());
             for slot in layout.iter() {
                 match slot.part {
@@ -7501,6 +7501,43 @@ mod tests {
         osd.set_part_rotation(OsdPart::Icon, -45.0);
         osd.set_template(OsdTemplate::Volume);
         assert!((osd.rotation_of(OsdPart::Icon) - 170.0).abs() < 0.001);
+    }
+
+    /// 新加的自定义文字在三套模板里都要有自己的位置条目。
+    ///
+    /// 以前只往音量 / 媒体键两份排布里塞，切到亮度模板时那条文字会掉到卡片左上角
+    /// （回落到默认的 0.1 / 0.1），看着像「加了个空元素」。
+    #[test]
+    fn new_text_lands_in_every_template() {
+        let mut osd = OsdConfig::default();
+        let part = osd.add_text();
+        for template in [
+            OsdTemplate::Volume,
+            OsdTemplate::Media,
+            OsdTemplate::Brightness,
+        ] {
+            osd.set_template(template);
+            let slot = osd.part(part);
+            assert!(
+                (slot.x - 0.15).abs() < 0.001,
+                "{template:?} 里这条文字没落到位：x={}",
+                slot.x
+            );
+        }
+
+        // 删掉之后三套里都不该再有它。
+        osd.remove_text(0);
+        for template in [
+            OsdTemplate::Volume,
+            OsdTemplate::Media,
+            OsdTemplate::Brightness,
+        ] {
+            osd.set_template(template);
+            assert!(
+                !osd.parts().contains(&part),
+                "{template:?} 里还留着刚删掉的那条文字"
+            );
+        }
     }
 
     /// 调角度不该把删掉的元素重新弄出来。
