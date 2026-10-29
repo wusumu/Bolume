@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 use gpui::{
@@ -87,6 +88,56 @@ struct AppState {
     /// 一样的命令 —— 按两下依旧是静音。共用这张表以后，面板刚点过、
     /// 紧接着按键也接得上。
     mute_override: Rc<RefCell<HashMap<String, MuteNote>>>,
+    /// 亮度「先声夺人」表（键同显示器的 `key`）。
+    ///
+    /// 和上一条一个道理，只是慢得多：DDC/CI 写一次要六十毫秒上下（本机两台 ROG
+    /// 实测 60ms），工作线程写完把读数报回来时，界面早就接着按了下一下、算出了
+    /// 更远的值。拿这次回读盖掉本地预测，下一档又从旧值重算 —— 按住不放时数值
+    /// 会来回跳（74 → 76 → 74），写下去的还常常是重复值，手感上就是「回弹 + 阻力」。
+    brightness_override: Rc<RefCell<HashMap<String, BrightnessNote>>>,
+}
+
+/// 亮度「先声夺人」的记录：刚写下去的目标 + 时间。
+#[derive(Clone, Copy)]
+struct BrightnessNote {
+    want: u32,
+    at: Instant,
+}
+
+/// 回读一直对不上时最多顶多久。DDC/CI 一次写六十毫秒、加上排队，留足余量。
+const BRIGHTNESS_OVERRIDE_FOR: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// 记一笔「这一台刚被写成多少」：回读回来之前，下一档按这个值算。
+///
+/// 快捷键和亮度面板共用这张表 —— 拖完滑条紧接着按快捷键，也接得上。
+pub fn note_brightness(cx: &App, key: &str, value: u32) {
+    cx.global::<AppState>()
+        .brightness_override
+        .borrow_mut()
+        .insert(
+            key.to_string(),
+            BrightnessNote {
+                want: value.min(100),
+                at: Instant::now(),
+            },
+        );
+}
+
+/// 回读值该不该采信：刚写过就顶住本地目标，回读对上了或等够久才交还。
+///
+/// 判据和 `flyout::resolve_muted` 一样是「对上就交还」，不是「顶满多久」：
+/// 写成功时工作线程报回来的正是这个值，交还等于没变；写之前那一刻报上来的
+/// 旧值才对不上，那一下正是要挡的。
+fn resolve_brightness(map: &mut HashMap<String, BrightnessNote>, key: &str, real: u32) -> u32 {
+    let Some(note) = map.get(key) else {
+        return real;
+    };
+    let settle = note.want == real || note.at.elapsed() > BRIGHTNESS_OVERRIDE_FOR;
+    if settle {
+        map.remove(key);
+        return real;
+    }
+    note.want
 }
 
 /// 音量面板当前的窗口矩形（逻辑像素：x, y, 宽, 高）。
@@ -390,6 +441,7 @@ pub fn run(
                 display_error: display_error.clone(),
                 flyout_frame: Rc::new(Cell::new(None)),
                 mute_override: Rc::new(RefCell::new(HashMap::new())),
+                brightness_override: Rc::new(RefCell::new(HashMap::new())),
             };
             cx.set_global(state);
 
@@ -801,7 +853,21 @@ pub fn run(
                         let handle = {
                             let state = cx.global::<AppState>();
                             match event {
-                                DisplayEvent::Monitors(list) => {
+                                DisplayEvent::Monitors(mut list) => {
+                                    // 刚写下去的目标还没落地时，回读报的是上一档：
+                                    // 拿它盖掉本地值，下一档就会往回算（长按时的回弹）。
+                                    {
+                                        let mut overrides = state.brightness_override.borrow_mut();
+                                        for info in list.iter_mut() {
+                                            if let Some(real) = info.brightness {
+                                                info.brightness = Some(resolve_brightness(
+                                                    &mut overrides,
+                                                    &info.key,
+                                                    real,
+                                                ));
+                                            }
+                                        }
+                                    }
                                     *state.displays.borrow_mut() = list;
                                     *state.display_error.borrow_mut() = None;
                                 }
@@ -2114,6 +2180,9 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
             key: info.key.clone(),
             value: next,
         });
+        // 记一笔目标：工作线程写完会把读数报回来，那是**这一刻之前**的值，
+        // 直接采信等于把预测退回一档（见 `brightness_override`）。
+        note_brightness(cx, &info.key, next);
         // 本地先摆上：DDC 回读要几十毫秒，连发时下一步不该拿旧读数再算一遍。
         if let Some(entry) = displays.borrow_mut().get_mut(index) {
             entry.brightness = Some(next);
@@ -3024,5 +3093,62 @@ fn open_settings(cx: &mut App) {
             .settings
             .borrow_mut()
             .replace(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BRIGHTNESS_OVERRIDE_FOR, BrightnessNote, resolve_brightness};
+    use std::{collections::HashMap, time::{Duration, Instant}};
+
+    fn note(want: u32, age: Duration) -> BrightnessNote {
+        BrightnessNote {
+            want,
+            at: Instant::now()
+                .checked_sub(age)
+                .expect("测试里的时间差不会超过开机时长"),
+        }
+    }
+
+    /// 长按时的正题：回读报的是**上一档**，不能拿它把目标盖回去。
+    ///
+    /// 盖回去的后果不是「显示差一格」，而是下一档从旧值重算 —— 数值来回跳，
+    /// 写下去的还常常是重复值（实测 30ms 间隔连发时是 74 → 76 → 74）。
+    #[test]
+    fn late_readback_keeps_the_new_target() {
+        let mut map = HashMap::new();
+        map.insert("0:XG279Q".to_string(), note(42, Duration::from_millis(5)));
+
+        assert_eq!(resolve_brightness(&mut map, "0:XG279Q", 40), 42);
+        // 顶住期间表要留着，不然下一次回读又会被采信。
+        assert_eq!(map.len(), 1);
+    }
+
+    /// 回读追上了就交还（顺便清表）：这时候两边一样，顶着也没意义。
+    #[test]
+    fn matching_readback_settles() {
+        let mut map = HashMap::new();
+        map.insert("0:XG279Q".to_string(), note(42, Duration::from_millis(5)));
+
+        assert_eq!(resolve_brightness(&mut map, "0:XG279Q", 42), 42);
+        assert!(map.is_empty());
+    }
+
+    /// 写一直没成功（DDC 抖动）时不能永久乐观：等够久就采信真值。
+    #[test]
+    fn stale_note_gives_up() {
+        let mut map = HashMap::new();
+        let old = BRIGHTNESS_OVERRIDE_FOR + Duration::from_secs(1);
+        map.insert("0:XG279Q".to_string(), note(42, old));
+
+        assert_eq!(resolve_brightness(&mut map, "0:XG279Q", 40), 40);
+        assert!(map.is_empty());
+    }
+
+    /// 没记过的显示器（面板里手动改、显示器自己的按钮）一律照实报。
+    #[test]
+    fn unknown_display_passes_through() {
+        let mut map = HashMap::new();
+        assert_eq!(resolve_brightness(&mut map, "1:STRIX", 55), 55);
     }
 }

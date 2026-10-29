@@ -14,8 +14,8 @@ use std::{
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, ClickEvent, Context, ElementId, FocusHandle, FontWeight, IntoElement,
-    KeyDownEvent, Render, SharedString, TextRun, Window, div, px, Pixels,
+    Animation, AnimationExt, App, ClickEvent, Context, ElementId, FocusHandle, FontWeight,
+    IntoElement, KeyDownEvent, Render, SharedString, TextRun, Window, div, px, Pixels,
 };
 
 use crate::{
@@ -454,7 +454,7 @@ impl Brightness {
             return;
         };
         if let Ok(value) = buffer.trim().parse::<u32>() {
-            self.set_brightness(&key, value.min(100));
+            self.set_brightness(&key, value.min(100), cx);
         }
         cx.notify();
     }
@@ -466,11 +466,13 @@ impl Brightness {
         }
     }
 
-    fn set_brightness(&self, key: &str, value: u32) {
+    fn set_brightness(&self, key: &str, value: u32, cx: &mut App) {
         self.engine.send(DisplayCommand::SetBrightness {
             key: key.to_string(),
             value: value.min(100),
         });
+        // 和快捷键记同一笔：回读要六十毫秒才回来，这期间别让它把目标盖回上一档。
+        crate::gui::note_brightness(cx, key, value.min(100));
         // 立刻把本地预览摆到新位置：等 DDC 回读要几十毫秒，松手后滑条会先跳回去再回来。
         self.drag_values
             .borrow_mut()
@@ -591,7 +593,7 @@ impl Brightness {
         // 手动输入框留着会让读数看起来没变，先收掉。
         self.editing = None;
         for key in &keys {
-            self.set_brightness(key, value);
+            self.set_brightness(key, value, cx);
         }
         // 落定那一下：被套用的块闪一下，眼睛能确认「套到的是这台」。
         self.flash_blocks(keys, cx);
@@ -738,7 +740,7 @@ impl Brightness {
         if next != current {
             // 手动输入框留着会让读数看起来没变，先收掉。
             self.editing = None;
-            self.set_brightness(key, next);
+            self.set_brightness(key, next, cx);
             cx.notify();
         }
     }
@@ -1411,7 +1413,7 @@ impl Brightness {
                 let next = (current as i32 + direction * step as i32).clamp(0, 100) as u32;
                 if next != current {
                     this.editing = None;
-                    this.set_brightness(&key, next);
+                    this.set_brightness(&key, next, cx);
                     cx.notify();
                 }
             }))
@@ -1444,15 +1446,17 @@ impl Brightness {
         .enabled(editable)
         .vertical(vertical)
         .height(SLIDER_HEIGHT)
-        .on_change(move |value, window, _| {
+        .on_change(move |value, window, cx| {
             drag_values
                 .borrow_mut()
                 .insert(key_for_slider.clone(), value);
             window.refresh();
+            let percent = (value * 100.0).round().clamp(0.0, 100.0) as u32;
             engine.send(DisplayCommand::SetBrightness {
                 key: key_for_slider.clone(),
-                value: (value * 100.0).round().clamp(0.0, 100.0) as u32,
+                value: percent,
             });
+            crate::gui::note_brightness(cx, &key_for_slider, percent);
         })
         .on_release(move |window, _| {
             // 松手后保留本地值，等下一次回读（面板重新打开时会读）再对齐。

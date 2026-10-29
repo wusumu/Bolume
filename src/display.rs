@@ -290,6 +290,16 @@ fn run_worker(commands: Receiver<DisplayCommand>, events: async_channel::Sender<
             Some(DisplayCommand::SetBrightness { key, value }) => {
                 let mut target = (key, value);
                 let mut refresh_after = false;
+                // 写之前先并一次：连按快捷键时队列里会压着好几档，一次 DDC 写要
+                // 六十毫秒，中间那些值落下去就已经过时了 —— 白写，而且亮度会
+                // 一格一格地追、越落越远（长按时那种「拖不动」的手感就是这么来的）。
+                while let Ok(command) = commands.try_recv() {
+                    match command {
+                        DisplayCommand::SetBrightness { key, value } => target = (key, value),
+                        DisplayCommand::Refresh => refresh_after = true,
+                        DisplayCommand::Shutdown => return,
+                    }
+                }
                 loop {
                     apply(&mut entries, &target.0, target.1);
                     // 先把新值回给界面：DDC 写入有延迟，等下一次读回再刷新会明显滞后。
