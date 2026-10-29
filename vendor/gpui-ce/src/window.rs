@@ -4442,12 +4442,30 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
+            let mut origin = integer_origin
+                + raster_bounds
+                    .origin
+                    .map(|p| ScaledPixels((p.0 as f32 / raster_scale).round()))
+                    .map(Into::into);
+            if axis_aligned && !unrotated {
+                // 转 90° 的整数倍时，字形位图在屏幕上本来是逐像素对齐的；但卡片绕自己
+                // 中心转，中心常带 0.5，转过来每个字都落在半像素上。采样只能取整或插值，
+                // 笔画就发虚、细一截 —— 看着像被削掉一条边。这里把落点先对到整像素，
+                // 再逆变换回布局空间（整块最多偏半像素，看不出来）。
+                let r = element_transformation.rotation_scale;
+                let t = element_transformation.translation;
+                let screen_x = r[0][0] * origin.x.0 + r[0][1] * origin.y.0 + t[0];
+                let screen_y = r[1][0] * origin.x.0 + r[1][1] * origin.y.0 + t[1];
+                let dx = screen_x.round() - t[0];
+                let dy = screen_y.round() - t[1];
+                // 纯旋转 / 镜像时矩阵正交，逆就是转置。
+                origin = Point::new(
+                    ScaledPixels(r[0][0] * dx + r[1][0] * dy),
+                    ScaledPixels(r[0][1] * dx + r[1][1] * dy),
+                );
+            }
             let bounds = Bounds {
-                origin: integer_origin
-                    + raster_bounds
-                        .origin
-                        .map(|p| ScaledPixels((p.0 as f32 / raster_scale).round()))
-                        .map(Into::into),
+                origin,
                 // 2 倍位图缩回一半时向上取整：round 有可能比字形少 1px，
                 // 斜着转的时候那一像素就被抹掉，字的边缘看着像被切了一刀。
                 size: tile
