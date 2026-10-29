@@ -11513,13 +11513,13 @@ impl Settings {
             cx,
         );
 
-        // 音量条的粗细：面板里所有音量条 / 亮度条一起变。
+        // 滑条的粗细：面板里所有音量条 / 亮度条一起变。
         let bar_thickness = self.number_row(
             "panel-bar-thickness",
-            lang.pick("音量条粗细", "Bar thickness"),
+            lang.pick("滑条粗细", "Bar thickness"),
             lang.pick(
-                "面板里音量条有多粗（像素），亮度条跟着一起变；屏幕提示条（OSD）的条高在布局编辑器里调",
-                "How thick the volume bars are, in pixels; the brightness bars follow. The on-screen display's bar size lives in the layout editor",
+                "面板里音量条与亮度条有多粗（像素）；屏幕提示条（OSD）的条高在布局编辑器里调",
+                "How thick the volume and brightness bars are, in pixels. The on-screen display's bar size lives in the layout editor",
             ),
             NumberField::PanelBarThickness,
             config,
@@ -11527,10 +11527,10 @@ impl Settings {
             cx,
         );
 
-        // 音量条的圆角：按「条高的一半」算百分比，跟 OSD 的条圆角一个口径。
+        // 滑条的圆角：按「条高的一半」算百分比，跟 OSD 的条圆角一个口径。
         let bar_round = self.number_row(
             "panel-bar-round",
-            lang.pick("音量条圆角", "Bar corner"),
+            lang.pick("滑条圆角", "Bar corner"),
             lang.pick(
                 "按条高的一半算：100% = 全圆头（胶囊形），0% = 方角",
                 "Measured against half the bar height: 100% is a full pill, 0% is square",

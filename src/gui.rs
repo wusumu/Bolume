@@ -2043,6 +2043,7 @@ fn absolute_volume(cx: &mut App, direction: f32) {
     }
     show_osd(cx, request);
     // 音效在「真的变了一档」时才响：到顶 / 到底那几下按了也是同一个值。
+    // 声音本身在 `bolume-sound` 线程上播（见 `platform::sound`），这里只排队。
     if (predicted - display).abs() > 0.0001 {
         crate::platform::sound::step(&cfg, crate::config::VolumeGesture::Hotkey);
     }

@@ -17,6 +17,13 @@
 //! `waveOut` 常开句柄没有这个启动开销，缓冲直接排队，快拖就是一串点子。
 //!
 //! 另有一个「松手提示音」（[`tick`]），那是面板松手时走的系统提示音，和这里无关。
+//!
+//! # 为什么出声不在这里做
+//!
+//! 合成采样、`waveOut` 第一次打开、设备闲置后被唤醒都是几十毫秒的事。以前这些都
+//! 在调用线程（UI 线程）里同步做，表现就是「闲置久了按第一下调音量，提示条晚一拍」——
+//! 实测冷态 40ms、热态 2ms。现在 [`step`] / [`preview`] 只把音源丢进队列，
+//! 实际播放跑在 `bolume-sound` 线程上（见 [`enqueue`]）。
 
 use std::{
     cell::{Cell, RefCell},
@@ -189,21 +196,10 @@ pub fn step(config: &Config, gesture: VolumeGesture) {
     if !config.volume_sound.covers(gesture) {
         return;
     }
-    let now = Instant::now();
-    let throttled = LAST.with(|last| {
-        let mut hit = false;
-        if let Some(previous) = last.get() {
-            hit = now.duration_since(previous) < MIN_GAP;
-        }
-        if !hit {
-            last.set(Some(now));
-        }
-        hit
-    });
-    if throttled {
+    if throttled() {
         return;
     }
-    play(config);
+    enqueue(&config.volume_sound);
 }
 
 /// 试听：设置页那个按钮。
@@ -211,8 +207,17 @@ pub fn step(config: &Config, gesture: VolumeGesture) {
 /// 不看总开关、不看范围（按下去的意思就是「让我听一下」），但**要**走节流 ——
 /// 连点两下试听不该叠成一团噪音。
 pub fn preview(config: &Config) {
+    if throttled() {
+        return;
+    }
+    enqueue(&config.volume_sound);
+}
+
+/// 节流：`MIN_GAP` 之内只许响一声。留在调用线程上（`LAST` 是 thread_local），
+/// 和原来的口径完全一致。
+fn throttled() -> bool {
     let now = Instant::now();
-    let throttled = LAST.with(|last| {
+    LAST.with(|last| {
         let mut hit = false;
         if let Some(previous) = last.get() {
             hit = now.duration_since(previous) < MIN_GAP;
@@ -221,16 +226,57 @@ pub fn preview(config: &Config) {
             last.set(Some(now));
         }
         hit
-    });
-    if throttled {
+    })
+}
+
+/// 真正出声的活交给独立线程。
+///
+/// 合成采样、`waveOut` 第一次打开、设备闲置后被唤醒 —— 这几件事都在几十毫秒量级。
+/// 摆在 UI 线程里就是「闲置久了按第一下，提示条晚一拍」：实测冷态 `play` 占 40ms、
+/// 热态 2ms（同一份代码、同一个键）。丢给声音线程之后，UI 只要把「播哪一段」
+/// 塞进队列就走，一个 `send` 的工夫。
+static JOBS: std::sync::OnceLock<std::sync::mpsc::Sender<crate::config::VolumeSoundConfig>> =
+    std::sync::OnceLock::new();
+
+fn enqueue(sound: &crate::config::VolumeSoundConfig) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// 排队上限：声音线程万一被驱动卡住，别让队列跟着涨到天上去。
+    static PENDING: AtomicUsize = AtomicUsize::new(0);
+    const MAX_PENDING: usize = 4;
+
+    if PENDING.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
+        PENDING.fetch_sub(1, Ordering::SeqCst);
         return;
     }
-    play(config);
+    let sender = JOBS.get_or_init(|| {
+        let (sender, jobs) = std::sync::mpsc::channel::<crate::config::VolumeSoundConfig>();
+        // 起不来就退回自己播：宁可卡一下，也不能没声音。
+        if std::thread::Builder::new()
+            .name("bolume-sound".to_string())
+            .spawn(move || {
+                while let Ok(sound) = jobs.recv() {
+                    PENDING.fetch_sub(1, Ordering::SeqCst);
+                    play(&sound);
+                }
+            })
+            .is_err()
+        {
+            crate::platform::logfile::append("crash.log", "音效线程起不来，退回 UI 线程播放");
+        }
+        sender
+    });
+    if sender.send(sound.clone()).is_err() {
+        // 队列断了（线程没起来 / 已经退出）：就地在调用线程播。
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+        play(sound);
+    }
 }
 
 /// 把这一段音频交给系统播（立刻返回）。
-fn play(config: &Config) {
-    let sound = &config.volume_sound;
+///
+/// 只碰本线程的 `SINK` / 缓存，`waveOut` 用 `CALLBACK_NULL` 打开，没有线程亲和性 ——
+/// 所以整段可以放心跑在声音线程上。
+fn play(sound: &crate::config::VolumeSoundConfig) {
     let gain = gain(sound.volume);
     let base = format!("{}@{:03}", sound.source_key(), (gain * 1000.0) as u32);
 

@@ -2577,6 +2577,20 @@ impl OsdPart {
         }
     }
 
+    /// 界面上的名字，跟着当前在调哪套模板走。
+    ///
+    /// 同一个 `Bar` 在三套模板里画的不是一回事：音量、播放进度、亮度。
+    /// 一律叫「音量条」的话，媒体键 / 亮度模板里那一行是错的。
+    pub fn label_in(self, lang: Lang, template: OsdTemplate) -> String {
+        match (self, template) {
+            (Self::Bar, OsdTemplate::Brightness) => {
+                lang.pick("亮度条", "Brightness bar").to_string()
+            }
+            (Self::Bar, OsdTemplate::Media) => lang.pick("进度条", "Progress bar").to_string(),
+            _ => self.label(lang),
+        }
+    }
+
     /// 默认尺寸（逻辑像素）：图标是边长，文字是字号，音量条是厚度。
     pub fn default_size(self) -> u32 {
         match self {
@@ -7417,6 +7431,19 @@ mod tests {
         osd.brightness = false;
         assert!(!osd.shows(OsdFunction::Brightness));
         assert!(osd.shows(OsdFunction::Volume));
+    }
+
+    /// 同一个 `Bar` 元素在三套模板里叫不同的名字：音量条 / 进度条 / 亮度条。
+    #[test]
+    fn bar_is_named_after_the_template() {
+        assert_eq!(OsdPart::Bar.label_in(Lang::Zh, OsdTemplate::Volume), "音量条");
+        assert_eq!(
+            OsdPart::Bar.label_in(Lang::Zh, OsdTemplate::Brightness),
+            "亮度条"
+        );
+        assert_eq!(OsdPart::Bar.label_in(Lang::Zh, OsdTemplate::Media), "进度条");
+        // 其它元素不受影响。
+        assert_eq!(OsdPart::Icon.label_in(Lang::Zh, OsdTemplate::Brightness), "图标");
     }
 
     /// 老配置里没有 `media_card` 这个键：读进来是 None，不报错。

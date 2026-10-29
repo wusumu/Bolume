@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use crate::{
-    config::{ConfigStore, OsdAlign, OsdFunction, OsdPart},
+    config::{ConfigStore, OsdAlign, OsdFunction, OsdPart, OsdTemplate},
     i18n::Lang,
     ui::{self, theme},
     windows::osd::{self, OsdHandle, OsdResize, OsdState, OsdTarget},
@@ -190,8 +190,8 @@ impl ColorSlot {
             Self::Text => lang.pick("文字色", "Text color"),
             Self::Accent => lang.pick("强调色", "Accent color"),
             Self::Shadow => lang.pick("阴影色", "Shadow color"),
-            Self::BarTrack => lang.pick("音量条底色", "Bar track"),
-            Self::BarMuted => lang.pick("静音时音量条", "Bar when muted"),
+            Self::BarTrack => lang.pick("滑条底色", "Bar track"),
+            Self::BarMuted => lang.pick("静音时的填充", "Bar when muted"),
             Self::CanvasBg => lang.pick("画布底色", "Canvas color"),
             Self::Part(_) => lang.pick("元素颜色", "Element color"),
         }
@@ -4116,13 +4116,20 @@ impl OsdEditor {
         let mut rows: Vec<AnyElement> = Vec::new();
         // 列表倒着摆：**最上面那行画在最上层**（盖住它下面的）。
         // `parts()` 是「先画 → 后画」的顺序，所以这里翻过来。
-        let parts: Vec<OsdPart> = cfg.parts().into_iter().rev().collect();
+        let template = cfg.template();
+        let parts: Vec<OsdPart> = cfg
+            .parts()
+            .into_iter()
+            // 「分贝」是音量专有的对数口径：媒体键和亮度模板里留着一行点了没读数。
+            .filter(|part| !(template != OsdTemplate::Volume && *part == OsdPart::Db))
+            .rev()
+            .collect();
         for part in parts {
             let visible = cfg.shows_part(part);
             let selected = self.selected == Some(part);
             let editing = self.text.as_ref().map(|edit| edit.part) == Some(part);
             let store = self.config.clone();
-            let name = part.label(lang);
+            let name = part.label_in(lang, template);
             let text_index = part.text_index();
             // 状态文字自定义之后，自动内容的三个预览档位就没意义了。
             let title_chips = part == OsdPart::Title && cfg.title_text.trim().is_empty();
@@ -4639,12 +4646,14 @@ impl OsdEditor {
         }
 
         if part == OsdPart::Bar {
-            // 音量条：三段颜色 + 圆角。原来散在参数栏最底下，现在贴着它自己这一行。
+            // 滑条：三段颜色 + 圆角。原来散在参数栏最底下，现在贴着它自己这一行。
+            // 名字跟着模板走 —— 亮度模板里这根是亮度条，别叫音量条。
+            let template = cfg.template();
             body = body.child(
                 div()
                     .text_size(px(9.5))
                     .text_color(theme::text_tertiary())
-                    .child(lang.pick("音量条", "Volume bar")),
+                    .child(part.label_in(lang, template)),
             );
             body = body.child(self.color_row(
                 ColorSlot::Accent,
@@ -4660,13 +4669,17 @@ impl OsdEditor {
                 lang,
                 cx,
             ));
-            body = body.child(self.color_row(
-                ColorSlot::BarMuted,
-                BAR_MUTED_COLORS,
-                &cfg.colors.bar_muted,
-                lang,
-                cx,
-            ));
+            // 「静音时的填充」只有音量用得上：媒体键和亮度都没有静音状态，
+            // 摆一行点了没反应的色块只会让人以为没保存。
+            if template == OsdTemplate::Volume {
+                body = body.child(self.color_row(
+                    ColorSlot::BarMuted,
+                    BAR_MUTED_COLORS,
+                    &cfg.colors.bar_muted,
+                    lang,
+                    cx,
+                ));
+            }
             // 圆角按「半高的百分比」存：条高变了圆角跟着变，永远调得出圆头 / 方角。
             body = body.child(self.stepper(
                 "ed-bar-r",

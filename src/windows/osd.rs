@@ -1248,6 +1248,10 @@ impl Osd {
         let _ = self.refresh_time_text(&cfg);
         let now = Instant::now();
         let reactivate = !self.visible || matches!(self.phase, Phase::Hidden);
+        if reactivate {
+            // 和 `dispatch` 那条一起看，就能分清「按键到弹窗」慢在哪一段。
+            crate::platform::hotkey::trace("osd present (reactivate)");
+        }
         // 只有「从隐藏状态重新露头」才需要等首帧：卡片还在屏幕上时换内容，
         // 同一次绘制就把新内容提交了，不会露出旧 surface。
         let warmup = if reactivate { WARMUP } else { Duration::ZERO };
