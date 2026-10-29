@@ -1485,6 +1485,18 @@ impl Osd {
                 .to_string();
                 state.subtitle = String::new();
             }
+            OsdFunction::Brightness => {
+                // 亮度没有音频快照可等：调用方算好的比例（0..1）就是真值。
+                // 滑条、读数都按线性百分比算，别套音量的对数那一套。
+                let level = request.predicted.unwrap_or(0.0).clamp(0.0, 1.0);
+                let (percent, _) = readouts(level, false, min_db);
+                state.percent = percent;
+                state.fraction = level;
+                state.show_bar = true;
+                state.icon = "sun";
+                state.title = lang.pick("亮度", "Brightness").to_string();
+                state.subtitle = String::new();
+            }
             function => {
                 state.percent = String::new();
                 state.db = String::new();

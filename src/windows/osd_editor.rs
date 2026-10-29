@@ -1330,6 +1330,12 @@ pub(crate) const PREVIEWS: &[PreviewOption] = &[
         icon: "stop",
         muted: false,
     },
+    PreviewOption {
+        zh: "亮度",
+        en: "Brightness",
+        icon: "sun",
+        muted: false,
+    },
 ];
 
 /// 图标下拉的候选：`(图标名, 对应的状态下标)`，按图标去重。
@@ -1343,6 +1349,7 @@ const ICON_CHOICES: &[(&str, usize)] = &[
     ("play", 5),
     ("pause", 6),
     ("next", 7),
+    ("sun", 9),
     ("stop", 8),
 ];
 
@@ -3125,10 +3132,10 @@ impl OsdEditor {
         if !self.confirm_reset {
             return None;
         }
-        let template = if self.cfg().detailed {
-            lang.pick("媒体键", "Media keys")
-        } else {
-            lang.pick("音量", "Volume")
+        let template = match self.cfg().template() {
+            crate::config::OsdTemplate::Media => lang.pick("媒体键", "Media keys"),
+            crate::config::OsdTemplate::Brightness => lang.pick("亮度", "Brightness"),
+            crate::config::OsdTemplate::Volume => lang.pick("音量", "Volume"),
         };
         let body = if lang.is_en() {
             format!(
@@ -3912,11 +3919,15 @@ impl OsdEditor {
         lang: Lang,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (icon_name, label, kind) = if cfg.detailed {
+        let (icon_name, label, kind) = if cfg.template() != crate::config::OsdTemplate::Volume {
             let (icon, text) = match self.preview {
                 Some(index) => {
                     let option = &PREVIEWS[index.min(PREVIEWS.len() - 1)];
                     (option.icon, lang.pick(option.zh, option.en))
+                }
+                // 亮度模板的真实提示条就一张太阳，默认也照它画。
+                None if cfg.template() == crate::config::OsdTemplate::Brightness => {
+                    ("sun", lang.pick("亮度", "Brightness"))
                 }
                 None => ("play", lang.pick("播放", "Play")),
             };
@@ -4000,17 +4011,18 @@ impl OsdEditor {
             .border_color(theme::border())
             .bg(theme::surface());
 
-        // 模板切换（只有两个格子，不再挂「模板」两个字）。
+        // 模板切换：音量 / 媒体键 / 亮度，各调各的。
         let mut template = div().flex().items_center().gap(px(4.));
-        for (media, label) in [
-            (false, lang.pick("音量", "Volume")),
-            (true, lang.pick("媒体键", "Media keys")),
+        for (slot, label) in [
+            (crate::config::OsdTemplate::Volume, lang.pick("音量", "Volume")),
+            (crate::config::OsdTemplate::Media, lang.pick("媒体键", "Media keys")),
+            (crate::config::OsdTemplate::Brightness, lang.pick("亮度", "Brightness")),
         ] {
-            let on = cfg.detailed == media;
+            let on = cfg.template() == slot;
             let store = self.config.clone();
             template = template.child(
                 div()
-                    .id(SharedString::from(format!("ed-tpl-{media}")))
+                    .id(SharedString::from(format!("ed-tpl-{slot:?}")))
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(4.))
@@ -4025,7 +4037,7 @@ impl OsdEditor {
                     .hover(|style| style.bg(theme::surface_hover()))
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
                         let _ = store.borrow_mut().update(|config| {
-                            config.osd.detailed = media;
+                            config.osd.set_template(slot);
                         });
                         this.selected = None;
                         this.focus.focus(window, cx);
@@ -4041,8 +4053,8 @@ impl OsdEditor {
                 .text_size(px(10.))
                 .text_color(theme::text_tertiary())
                 .child(lang.pick(
-                    "音量 / 静音弹音量模板，媒体键弹媒体键模板",
-                    "Volume and mute use the volume template, media keys the media one",
+                    "音量 / 静音弹音量模板，媒体键弹媒体键模板，亮度键弹亮度模板",
+                    "Volume and mute use the volume template, media keys the media one, brightness its own",
                 )),
         );
 
@@ -4235,7 +4247,11 @@ impl OsdEditor {
             if title_chips {
                 // 没选过时跟画布一致：媒体模板默认「播放」，音量模板默认「音量」。
                 // （两个下拉的默认值必须一样，否则一进来就显示成两个不同的状态。）
-                let default = if cfg.detailed { 5 } else { 0 };
+                let default = match cfg.template() {
+                    crate::config::OsdTemplate::Media => 5,
+                    crate::config::OsdTemplate::Brightness => 9,
+                    crate::config::OsdTemplate::Volume => 0,
+                };
                 let index = self.preview.unwrap_or(default).min(PREVIEWS.len() - 1);
                 let option = &PREVIEWS[index];
                 let open = self.menu == Some(EditorMenu::State);
@@ -5068,11 +5084,18 @@ fn sample_state(cfg: &crate::config::OsdConfig, lang: Lang, preview: Option<usiz
                 option.muted,
             )
         }
-        None if cfg.detailed => ("play", lang.pick("播放", "Play"), false),
+        None if cfg.template() == crate::config::OsdTemplate::Media => ("play", lang.pick("播放", "Play"), false),
+        None if cfg.template() == crate::config::OsdTemplate::Brightness => {
+            ("sun", lang.pick("亮度", "Brightness"), false)
+        }
         None => (cfg.icon_style().icon, lang.pick("音量", "Volume"), false),
     };
     OsdState {
-        function: OsdFunction::Volume,
+        function: if cfg.template() == crate::config::OsdTemplate::Brightness {
+            OsdFunction::Brightness
+        } else {
+            OsdFunction::Volume
+        },
         target: OsdTarget::Device,
         icon,
         title: if !cfg.title_text.trim().is_empty() {

@@ -799,8 +799,14 @@ fn takeover_media() -> bool {
 static BLOCK_SYSTEM_OSD: AtomicBool = AtomicBool::new(false);
 
 /// 开关「禁用 Windows 音量条」（配置变更时由 `apply_config` 同步）。
+///
+/// 这里只是钩子那一半（吞掉音量键，让资源管理器收不到）；另一半在
+/// `platform::system_osd` —— 直接把系统那扇 OSD 窗口最小化。
+/// 两半都得有：Win10 上媒体键多半走 HID consumer，钩子根本看不见，
+/// 而「正在播放」那张卡片也不是按键触发的。
 pub fn set_block_system_osd(on: bool) {
     BLOCK_SYSTEM_OSD.store(on, Ordering::SeqCst);
+    crate::platform::system_osd::set_blocked(on);
 }
 
 fn block_system_osd() -> bool {

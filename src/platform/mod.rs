@@ -18,6 +18,7 @@ pub mod shell;
 pub mod single_instance;
 pub mod sound;
 pub mod sound_icons;
+pub mod system_osd;
 pub mod system_theme;
 pub mod winver;
 

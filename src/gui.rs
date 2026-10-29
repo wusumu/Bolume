@@ -2097,6 +2097,7 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
     };
 
     let mut changed = false;
+    let mut shown: Option<f32> = None;
     for index in targets {
         let info = &list[index];
         let Some(current) = info.brightness else {
@@ -2116,15 +2117,21 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
         if let Some(entry) = displays.borrow_mut().get_mut(index) {
             entry.brightness = Some(next);
         }
+        shown = Some(next as f32 / 100.0);
         changed = true;
     }
 
     if !changed {
         return;
     }
-    // 亮度键不弹任何窗口：直接改掉就行，屏幕本身就是反馈。
     // 面板要是正开着（用户自己拉开的），让它按新读数重画一次，滑条不会停在旧位置上。
     refresh_brightness_window(cx);
+    // 亮度的提示条：以前是「屏幕本身就是反馈」，现在跟音量一样弹一条，
+    // 外观在布局编辑器里单独调（亮度是第三套模板）。
+    // 多台一起调（All）时报最后一台 —— 步进一样，读数也一样。
+    if let Some(level) = shown {
+        show_osd(cx, OsdRequest::device(OsdFunction::Brightness).predicted(level));
+    }
 }
 
 /// 「按住连发」的令牌：每按一次 +1，跑着的重复任务发现令牌变了就自己退场。
@@ -2271,6 +2278,8 @@ fn quit_now(cx: &mut App) -> ! {
     // 接管期间被我们压到 2% 的应用，要在这里还回去：`process::exit` 不跑析构，
     // 接管线程的 `close()` 根本没机会执行。
     crate::audio::boost::release_all();
+    // 被最小化的系统音量条也要放回来，否则用户下次开机会以为系统坏了。
+    crate::platform::system_osd::restore();
     std::process::exit(0)
 }
 

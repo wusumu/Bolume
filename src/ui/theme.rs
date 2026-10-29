@@ -496,3 +496,23 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod hex_tests {
+    use super::parse_hex;
+
+    /// 色相按 -180..180 存，比较前要绕回 0..360。
+    fn hue_of(text: &str) -> f32 {
+        let degrees = parse_hex(text).unwrap().color.hue.into_degrees();
+        (degrees + 360.0) % 360.0
+    }
+
+    /// `#cc3333` 是红：H≈0。R/B 弄反的话会落在 240°（蓝）。
+    #[test]
+    fn parse_hex_keeps_channel_order() {
+        let red = hue_of("#cc3333");
+        assert!(red < 20.0 || red > 340.0, "hue={red}");
+        let blue = hue_of("#3333cc");
+        assert!((blue - 240.0).abs() < 20.0, "hue={blue}");
+    }
+}

@@ -2834,6 +2834,8 @@ fn default_media_layout() -> Vec<OsdPartPos> {
 pub enum OsdFunction {
     Volume,
     Mute,
+    /// 显示器亮度（快捷键 / 滚轮调完弹一条）。
+    Brightness,
     PrevTrack,
     NextTrack,
     PlayPause,
@@ -2841,32 +2843,51 @@ pub enum OsdFunction {
 }
 
 impl OsdFunction {
-    pub const ALL: [OsdFunction; 6] = [
+    pub const ALL: [OsdFunction; 7] = [
         OsdFunction::Volume,
         OsdFunction::Mute,
+        OsdFunction::Brightness,
         OsdFunction::PrevTrack,
         OsdFunction::NextTrack,
         OsdFunction::PlayPause,
         OsdFunction::Stop,
     ];
 
-    /// 媒体键（上一曲 / 下一曲 / 播放暂停 / 停止）—— 剩下的就是音量操作（音量 / 静音）。
+    /// 媒体键（上一曲 / 下一曲 / 播放暂停 / 停止）。
     ///
-    /// 提示条按这个分两套模板：音量操作走音量模板，其余一律走媒体键模板。
+    /// 提示条按这个分模板：音量 / 静音走音量模板，这四个走媒体键模板，
+    /// 亮度走自己那一套（见 `OsdConfig::template_for`）。
     pub fn is_media(self) -> bool {
-        !matches!(self, Self::Volume | Self::Mute)
+        matches!(
+            self,
+            Self::PrevTrack | Self::NextTrack | Self::PlayPause | Self::Stop
+        )
     }
 
     pub fn label(self, lang: Lang) -> &'static str {
         match self {
             Self::Volume => lang.pick("音量", "Volume"),
             Self::Mute => lang.pick("静音", "Mute"),
+            Self::Brightness => lang.pick("亮度", "Brightness"),
             Self::PrevTrack => lang.pick("上一曲", "Previous track"),
             Self::NextTrack => lang.pick("下一曲", "Next track"),
             Self::PlayPause => lang.pick("播放 / 暂停", "Play / pause"),
             Self::Stop => lang.pick("停止", "Stop"),
         }
     }
+}
+
+/// 提示条的三套模板。
+///
+/// 每套有自己的元素排布和背景（尺寸 / 圆角 / 不透明度 / 背景色），互不影响。
+/// 用哪一套由**触发的那次操作**决定；编辑器里切的是「你要调哪一套」，不改变运行时。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OsdTemplate {
+    #[default]
+    Volume,
+    Media,
+    Brightness,
 }
 
 /// OSD 贴到哪块屏上。
@@ -2897,9 +2918,10 @@ pub struct OsdConfig {
     /// 总开关。
     pub enabled: bool,
 
-    /// 下面六个是「哪一种操作要弹提示」的独立开关。
+    /// 下面这些是「哪一种操作要弹提示」的独立开关。
     pub volume: bool,
     pub mute: bool,
+    pub brightness: bool,
     pub prev_track: bool,
     pub next_track: bool,
     pub play_pause: bool,
@@ -3027,6 +3049,21 @@ pub struct OsdConfig {
     /// 用户在媒体键模板下动一下背景才落成一份独立的值。
     #[serde(default)]
     pub media_card: Option<OsdCard>,
+
+    /// 亮度模板的元素排布（和音量 / 媒体键完全独立）。
+    #[serde(default = "default_osd_layout")]
+    pub brightness_layout: Vec<OsdPartPos>,
+
+    /// 亮度模板自己的背景。空 = 跟音量模板一样（同 `media_card` 的口径）。
+    #[serde(default)]
+    pub brightness_card: Option<OsdCard>,
+
+    /// 编辑器当前停在亮度模板上。
+    ///
+    /// 和 `detailed`（媒体键那套）互斥，两个都 false 就是音量模板。
+    /// 单独存一个 bool 而不是把 `detailed` 换成枚举，是为了老配置原样能读。
+    #[serde(default)]
+    pub brightness_template: bool,
 }
 
 /// 默认的元素排布：喇叭在左、读数在右、音量条在底（卡片 191×50）。
@@ -3167,6 +3204,7 @@ impl Default for OsdConfig {
             enabled: true,
             volume: true,
             mute: true,
+            brightness: true,
             prev_track: true,
             next_track: true,
             play_pause: true,
@@ -3206,6 +3244,9 @@ impl Default for OsdConfig {
             layout: default_osd_layout(),
             media_layout: default_media_layout(),
             media_card: None,
+            brightness_layout: default_osd_layout(),
+            brightness_card: None,
+            brightness_template: false,
         }
     }
 }
@@ -3224,6 +3265,7 @@ impl OsdConfig {
         match function {
             OsdFunction::Volume => self.volume,
             OsdFunction::Mute => self.mute,
+            OsdFunction::Brightness => self.brightness,
             OsdFunction::PrevTrack => self.prev_track,
             OsdFunction::NextTrack => self.next_track,
             OsdFunction::PlayPause => self.play_pause,
@@ -3238,8 +3280,36 @@ impl OsdConfig {
     /// 运行时不看它 —— 否则换个模板就得改设置，媒体键触发时也画成音量样式。
     pub fn for_function(&self, function: OsdFunction) -> OsdConfig {
         let mut cfg = self.clone();
-        cfg.detailed = function.is_media();
+        cfg.set_template(Self::template_for(function));
         cfg.view()
+    }
+
+    /// 这次操作该用哪套模板。
+    pub fn template_for(function: OsdFunction) -> OsdTemplate {
+        if function == OsdFunction::Brightness {
+            OsdTemplate::Brightness
+        } else if function.is_media() {
+            OsdTemplate::Media
+        } else {
+            OsdTemplate::Volume
+        }
+    }
+
+    /// 编辑器 / 设置页当前在调哪套模板。
+    pub fn template(&self) -> OsdTemplate {
+        if self.brightness_template {
+            OsdTemplate::Brightness
+        } else if self.detailed {
+            OsdTemplate::Media
+        } else {
+            OsdTemplate::Volume
+        }
+    }
+
+    /// 切到哪套模板（只是「在调哪一套」，运行时不看这个）。
+    pub fn set_template(&mut self, template: OsdTemplate) {
+        self.detailed = template == OsdTemplate::Media;
+        self.brightness_template = template == OsdTemplate::Brightness;
     }
 
     /// 音量模板那一套背景（存在主字段里）。
@@ -3257,28 +3327,31 @@ impl OsdConfig {
     ///
     /// 媒体键模板还没单独调过时返回音量那一套 —— 两套在用户没动之前永远一致。
     pub fn card(&self) -> OsdCard {
-        if self.detailed {
-            self.media_card.clone().unwrap_or_else(|| self.volume_card())
-        } else {
-            self.volume_card()
+        match self.template() {
+            OsdTemplate::Volume => self.volume_card(),
+            OsdTemplate::Media => self.media_card.clone().unwrap_or_else(|| self.volume_card()),
+            OsdTemplate::Brightness => self
+                .brightness_card
+                .clone()
+                .unwrap_or_else(|| self.volume_card()),
         }
     }
 
     /// 改当前模板的背景。媒体键那份不存在时先照着音量那份复制一份再改，
     /// 这样「只调了圆角」不会把别的几项一起丢掉。
     pub fn set_card(&mut self, edit: impl FnOnce(&mut OsdCard)) {
-        if self.detailed {
-            let mut card = self.card();
-            edit(&mut card);
-            self.media_card = Some(card);
-        } else {
-            let mut card = self.volume_card();
-            edit(&mut card);
-            self.width = card.width;
-            self.height = card.height;
-            self.corner = card.corner;
-            self.opacity = card.opacity;
-            self.colors.card = card.color;
+        let mut card = self.card();
+        edit(&mut card);
+        match self.template() {
+            OsdTemplate::Volume => {
+                self.width = card.width;
+                self.height = card.height;
+                self.corner = card.corner;
+                self.opacity = card.opacity;
+                self.colors.card = card.color;
+            }
+            OsdTemplate::Media => self.media_card = Some(card),
+            OsdTemplate::Brightness => self.brightness_card = Some(card),
         }
     }
 
@@ -3288,14 +3361,17 @@ impl OsdConfig {
     /// `colors.card` 这几个字段，在入口处铺一次比让每个调用点都去问模板简单得多，
     /// 也不会漏掉某一处（比如阴影和尺寸手柄）。
     pub fn view(mut self) -> OsdConfig {
-        if self.detailed {
-            if let Some(card) = self.media_card.clone() {
-                self.width = card.width;
-                self.height = card.height;
-                self.corner = card.corner;
-                self.opacity = card.opacity;
-                self.colors.card = card.color;
-            }
+        let card = match self.template() {
+            OsdTemplate::Volume => None,
+            OsdTemplate::Media => self.media_card.clone(),
+            OsdTemplate::Brightness => self.brightness_card.clone(),
+        };
+        if let Some(card) = card {
+            self.width = card.width;
+            self.height = card.height;
+            self.corner = card.corner;
+            self.opacity = card.opacity;
+            self.colors.card = card.color;
         }
         self
     }
@@ -3306,18 +3382,18 @@ impl OsdConfig {
     /// 越界的值也在这里夹一遍 —— 渲染和设置页读的都是这个结果。
     /// 当前模板（音量 / 媒体键）对应的那份排布。
     fn active(&self) -> &Vec<OsdPartPos> {
-        if self.detailed {
-            &self.media_layout
-        } else {
-            &self.layout
+        match self.template() {
+            OsdTemplate::Volume => &self.layout,
+            OsdTemplate::Media => &self.media_layout,
+            OsdTemplate::Brightness => &self.brightness_layout,
         }
     }
 
     fn active_mut(&mut self) -> &mut Vec<OsdPartPos> {
-        if self.detailed {
-            &mut self.media_layout
-        } else {
-            &mut self.layout
+        match self.template() {
+            OsdTemplate::Volume => &mut self.layout,
+            OsdTemplate::Media => &mut self.media_layout,
+            OsdTemplate::Brightness => &mut self.brightness_layout
         }
     }
 
@@ -3632,10 +3708,10 @@ impl OsdConfig {
     pub fn reset_layout(&mut self) {
         // 固定的五个元素回出厂排布；**用户自己新建的文字原样留着** ——
         // 它们没有「出厂位置」，抹掉会让文字从元素列表里消失、还跑回卡片左上角。
-        let mut fresh = if self.detailed {
-            default_media_layout()
-        } else {
-            default_osd_layout()
+        let mut fresh = match self.template() {
+            OsdTemplate::Media => default_media_layout(),
+            // 亮度和音量一套结构（图标 + 读数 + 条），排布也就一套默认值。
+            OsdTemplate::Volume | OsdTemplate::Brightness => default_osd_layout(),
         };
         fresh.extend(
             self.active()
@@ -3643,10 +3719,10 @@ impl OsdConfig {
                 .filter(|slot| matches!(slot.part, OsdPart::Text(_)))
                 .copied(),
         );
-        if self.detailed {
-            self.media_layout = fresh;
-        } else {
-            self.layout = fresh;
+        match self.template() {
+            OsdTemplate::Volume => self.layout = fresh,
+            OsdTemplate::Media => self.media_layout = fresh,
+            OsdTemplate::Brightness => self.brightness_layout = fresh,
         }
         let defaults = OsdConfig::default();
         // 排布本身。
@@ -3660,23 +3736,33 @@ impl OsdConfig {
         self.part_colors.clear();
         self.bar_round = defaults.bar_round;
         self.shadow = defaults.shadow;
-        if self.detailed {
-            // 音量模板的背景色原样还回去，只动媒体键那份。
-            self.colors.card = volume_card_color;
-            if self.media_card.is_some() {
-                self.media_card = Some(OsdCard {
-                    width: defaults.width,
-                    height: defaults.height,
-                    corner: defaults.corner,
-                    opacity: defaults.opacity,
-                    color: defaults.colors.card.clone(),
-                });
+        let factory = OsdCard {
+            width: defaults.width,
+            height: defaults.height,
+            corner: defaults.corner,
+            opacity: defaults.opacity,
+            color: defaults.colors.card.clone(),
+        };
+        match self.template() {
+            OsdTemplate::Volume => {
+                self.width = factory.width;
+                self.height = factory.height;
+                self.corner = factory.corner;
+                self.opacity = factory.opacity;
             }
-        } else {
-            self.width = defaults.width;
-            self.height = defaults.height;
-            self.corner = defaults.corner;
-            self.opacity = defaults.opacity;
+            // 媒体键 / 亮度模板：音量模板的背景色原样还回去，只动自己那份。
+            OsdTemplate::Media => {
+                self.colors.card = volume_card_color;
+                if self.media_card.is_some() {
+                    self.media_card = Some(factory);
+                }
+            }
+            OsdTemplate::Brightness => {
+                self.colors.card = volume_card_color;
+                if self.brightness_card.is_some() {
+                    self.brightness_card = Some(factory);
+                }
+            }
         }
     }
 
@@ -5010,9 +5096,25 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn load(path: PathBuf) -> Self {
         let raw = std::fs::read_to_string(&path).ok();
-        let existing = raw
-            .as_deref()
-            .and_then(|content| serde_json::from_str::<Config>(content).ok());
+        // 解析失败绝不静默当默认配置：那样用户攒下的设置会一次性清零、现场也没了。
+        // 先把原文件留一份 `config.broken.json`，再把原因写进 `crash.log`。
+        let parsed = raw.as_deref().map(serde_json::from_str::<Config>);
+        let existing = match parsed {
+            Some(Ok(config)) => Some(config),
+            Some(Err(error)) => {
+                let backup = path.with_file_name("config.broken.json");
+                let _ = std::fs::copy(&path, &backup);
+                crate::platform::logfile::append(
+                    "crash.log",
+                    &format!(
+                        "配置解析失败（原文件已留底 {}）：{error}",
+                        backup.display()
+                    ),
+                );
+                None
+            }
+            None => None,
+        };
         let mut config = existing.clone().unwrap_or_default();
         let mut migrated = false;
         // rev 6 之前没有独立的对数滚轮步进：那会儿 `scroll_wheel_step` 在对数模式下
@@ -5869,6 +5971,28 @@ mod tests {
         let saved: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.tray_icon_style, TrayIconStyle::Arcs);
         assert!(!saved.use_logarithmic_volume);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 配置解析失败时不能静默用默认值：那是用户攒了几个月的设置一次性清零。
+    /// 原文件先留一份 `config.broken.json`，坏在哪写进 `crash.log`。
+    #[test]
+    fn broken_config_is_kept_before_falling_back() {
+        let dir = std::env::temp_dir().join(format!("bolume-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("config.json");
+        let bad = r#"{"config_rev": 73, "osd": {"brightness": "not-a-bool"}}"#;
+        std::fs::write(&path, bad).unwrap();
+
+        let store = ConfigStore::load(path.clone());
+        // 读不出来 → 退回默认值，程序照常能起。
+        assert_eq!(store.get().config_rev, CONFIG_REV);
+        // 现场留底：一字不差。
+        let kept = dir.join("config.broken.json");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), bad);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7244,6 +7368,55 @@ mod tests {
         assert_eq!(osd.for_function(OsdFunction::Volume).width, 260);
         assert_eq!(osd.for_function(OsdFunction::NextTrack).width, volume.width);
         assert_eq!(osd.for_function(OsdFunction::NextTrack).height, volume.height);
+    }
+
+    /// 亮度是第三套模板：背景和排布各自独立，互不串味。
+    #[test]
+    fn osd_brightness_template_is_independent() {
+        let mut osd = OsdConfig::default();
+        assert_eq!(
+            OsdConfig::template_for(OsdFunction::Brightness),
+            OsdTemplate::Brightness
+        );
+        assert!(osd.brightness_card.is_none());
+        // 没调过之前三套一样。
+        assert_eq!(osd.card().width, osd.for_function(OsdFunction::Brightness).width);
+
+        // 在亮度模板里只改宽和圆角：音量那份一点不动。
+        osd.set_template(OsdTemplate::Brightness);
+        osd.set_card(|card| {
+            card.width = 300;
+            card.corner = 40;
+        });
+        let brightness = osd.for_function(OsdFunction::Brightness);
+        assert_eq!(brightness.width, 300);
+        assert_eq!(brightness.corner, 40);
+        assert_eq!(osd.width, 191);
+        assert_eq!(osd.corner, 10);
+
+        // 亮度那份变了，媒体键那份也不能跟着动。
+        osd.set_template(OsdTemplate::Media);
+        assert_eq!(osd.card().width, 191);
+
+        // 排布也是独立的一份：在亮度模板里挪图标，别的模板不受影响。
+        osd.set_template(OsdTemplate::Brightness);
+        osd.active_mut()[0].x = 0.5;
+        assert_eq!(osd.brightness_layout[0].x, 0.5);
+        assert_ne!(osd.layout[0].x, 0.5);
+        assert_ne!(
+            osd.for_function(OsdFunction::Volume).active()[0].x,
+            osd.for_function(OsdFunction::Brightness).active()[0].x
+        );
+    }
+
+    /// 亮度提示默认开着，也可以在屏幕提示页单独关掉。
+    #[test]
+    fn brightness_osd_has_its_own_switch() {
+        let mut osd = OsdConfig::default();
+        assert!(osd.shows(OsdFunction::Brightness));
+        osd.brightness = false;
+        assert!(!osd.shows(OsdFunction::Brightness));
+        assert!(osd.shows(OsdFunction::Volume));
     }
 
     /// 老配置里没有 `media_card` 这个键：读进来是 None，不报错。

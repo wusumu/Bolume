@@ -9801,14 +9801,15 @@ impl Settings {
             }),
         );
 
-        // 禁用系统 OSD：只在 Bolume 运行时生效 —— 主程序自己的钩子把音量键拦下来，
-        // 资源管理器根本收不到，就不会弹它那条音量条。
+        // 禁用系统 OSD：两半一起 —— 钩子吞音量键，另外把系统那扇 OSD 窗口最小化。
+        // 后者才是 Win10 上真正管用的那半：媒体键多半走 HID，钩子根本看不见；
+        // 「正在播放」那张带封面的卡片也不是按键触发的。
         let kill_osd = self.toggle_row(
             "osd-block-system",
             lang.pick("禁用 Windows 音量条", "Hide the Windows volume bar"),
             lang.pick(
-                "Bolume 运行时按音量键只弹 Bolume 自己的卡片，Windows 那条音量条不再出现，带 Ctrl / Alt / Shift 也一样。退出 Bolume 后系统恢复原样。",
-                "While Bolume is running, the volume keys only show Bolume's own card — the Windows volume bar stays hidden, even with Ctrl / Alt / Shift held. Closing Bolume restores the default behaviour.",
+                "Bolume 运行时不再出现 Windows 自己的音量条，带 Ctrl / Alt / Shift 也一样；上一曲 / 下一曲 / 播放暂停弹出的那张带封面的卡片也一起隐藏。退出 Bolume 后系统恢复原样。",
+                "While Bolume is running, the Windows volume bar stays hidden, even with Ctrl / Alt / Shift held — and so does the album-art card that media keys bring up. Closing Bolume restores the default behaviour.",
             ),
             config.osd.block_system_osd,
             self.bind(|config| {
@@ -9833,6 +9834,13 @@ impl Settings {
                 lang.pick("静音键", "Mute key"),
                 config.osd.mute,
                 self.bind(|config| config.osd.mute = !config.osd.mute),
+            ),
+            self.compact_toggle_row(
+                "osd-fn-brightness",
+                OsdFunction::Brightness.label(lang),
+                lang.pick("亮度键 / 滚轮", "Brightness keys / wheel"),
+                config.osd.brightness,
+                self.bind(|config| config.osd.brightness = !config.osd.brightness),
             ),
             self.compact_toggle_row(
                 "osd-fn-prev",
@@ -10158,7 +10166,7 @@ impl Settings {
     /// 能一眼看出大概长什么样就够了。
     fn osd_preview(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
         // 缩略预览固定按音量模板画（最常看到的那一套）；
-        // 编辑器当前在改哪套（`detailed`）跟这里无关。
+        // 编辑器当前在改哪套（`template()`）跟这里无关。
         let cfg = config.osd.for_function(OsdFunction::Volume);
         let (width, _) = crate::windows::osd::card_size(&cfg);
         // 页面内容区大约 520px 宽，再宽的卡片按比例缩下来。
