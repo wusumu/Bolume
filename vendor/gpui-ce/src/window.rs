@@ -4448,10 +4448,12 @@ impl Window {
                         .origin
                         .map(|p| ScaledPixels((p.0 as f32 / raster_scale).round()))
                         .map(Into::into),
+                // 2 倍位图缩回一半时向上取整：round 有可能比字形少 1px，
+                // 斜着转的时候那一像素就被抹掉，字的边缘看着像被切了一刀。
                 size: tile
                     .bounds
                     .size
-                    .map(|size| ScaledPixels((size.0 as f32 / raster_scale).round()))
+                    .map(|size| ScaledPixels((size.0 as f32 / raster_scale).ceil()))
                     .map(Into::into),
             };
             let content_mask = self.snapped_content_mask();

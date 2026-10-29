@@ -1674,6 +1674,9 @@ impl gpui::EntityInputHandler for OsdEditor {
 impl Render for OsdEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cfg = self.cfg();
+        // 卡片转的是 90° 的奇数倍时，画面上的「横」和「竖」互换了：
+        // 画在转后边上的柄、箭头方向都要跟着换（不然竖边顶着横箭头）。
+        let crossed = ((cfg.rotation as f32 / 90.0).round() as i32).rem_euclid(2) == 1;
         // 确认弹窗开着时，画布先按「恢复默认之后」的样子画：用户在按下确认之前
         // 就能看见会换成什么。右侧参数栏仍显示当前值 —— 那是在改的现状，
         // 两者不一致是故意的（这里只是预览，还没写进配置）。
@@ -1866,7 +1869,8 @@ impl Render for OsdEditor {
                 } else {
                     theme::accent_soft()
                 })
-                .when(selected, |style| style.bg(theme::accent_soft()))
+                // 选中不刷底色：框是画在内容**上面**的，半透明底会把字蒙掉一块，
+                // 看着像文字被裁了。选中态交给边框颜色 + 手柄高亮。
                 .cursor(gpui::CursorStyle::OpenHand)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1923,7 +1927,9 @@ impl Render for OsdEditor {
                 } else {
                     (box_h - knob) / 2.0
                 };
-                let cursor = match (handle.moves_x(), handle.moves_y()) {
+                // 元素框是跟着卡片一起转的：转 90° / 270° 之后框的「横」「竖」
+                // 在屏幕上换了向，箭头必须跟着换，否则竖边顶着横箭头 —— 一拖就觉得是反的。
+                let cursor = match (handle.moves_x() != crossed, handle.moves_y() != crossed) {
                     // 对角线手柄的箭头要跟拖动方向一致：左上 / 右下是 ↖↘（Windows 的
                     // IDC_SIZENWSE，gpui 叫 ResizeUpLeftDownRight），右上 / 左下才是 ↗↙。
                     (true, true) => {
@@ -2252,9 +2258,15 @@ impl Render for OsdEditor {
                     .border_1()
                     .border_color(theme::accent())
                     // 右下角是 ↖↘（IDC_SIZENWSE）；写成 ↗↙ 的话箭头跟拖动方向正好拧着。
+                    // 卡片转 90° / 270° 之后，这根柄其实站到了视觉上的另一条边上，
+                    // 箭头得跟着换向 —— 否则竖着的边上顶着个横箭头，一拖就觉得是反的。
                     .cursor(if corner {
-                        gpui::CursorStyle::ResizeUpLeftDownRight
-                    } else if edge == CardEdge::Right {
+                        if crossed {
+                            gpui::CursorStyle::ResizeUpRightDownLeft
+                        } else {
+                            gpui::CursorStyle::ResizeUpLeftDownRight
+                        }
+                    } else if (edge == CardEdge::Right) != crossed {
                         gpui::CursorStyle::ResizeLeftRight
                     } else {
                         gpui::CursorStyle::ResizeUpDown
