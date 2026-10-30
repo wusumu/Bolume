@@ -2899,7 +2899,7 @@ mod tests {
     /// 造一笔「已经过去 `age`」的手势记录。
     fn hold_age(age: Duration) -> OsdHold {
         OsdHold {
-            at: Instant::now() - age,
+            at: crate::platform::ago(age),
         }
     }
 
@@ -2932,7 +2932,7 @@ mod tests {
         // 解除命令落地。
         assert!(resolve_hold(&mut hold, (0.5, false)));
         // 静默期过后也还顶着，直到上限。
-        hold.at = Instant::now() - HOLD_SETTLE - Duration::from_millis(20);
+        hold.at = crate::platform::ago(HOLD_SETTLE + Duration::from_millis(20));
         assert!(resolve_hold(&mut hold, (0.5, false)));
     }
 

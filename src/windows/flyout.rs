@@ -4859,14 +4859,14 @@ mod tests {
     /// 造一笔「已经过了静默期」的音量记录。
     fn settled_release(want: f32) -> ReleaseNote {
         let mut note = ReleaseNote::new(want);
-        note.at = std::time::Instant::now() - HOLD_SETTLE - std::time::Duration::from_millis(20);
+        note.at = crate::platform::ago(HOLD_SETTLE + std::time::Duration::from_millis(20));
         note
     }
 
     /// 造一笔「已经过了静默期」的静音记录。
     fn settled_mute(want: bool) -> MuteNote {
         let mut note = MuteNote::new(want);
-        note.at = std::time::Instant::now() - HOLD_SETTLE - std::time::Duration::from_millis(20);
+        note.at = crate::platform::ago(HOLD_SETTLE + std::time::Duration::from_millis(20));
         note
     }
 
@@ -4909,7 +4909,7 @@ mod tests {
     #[test]
     fn held_volume_expires_when_snapshot_never_moves() {
         let mut note = ReleaseNote::new(0.9);
-        note.at = std::time::Instant::now() - VOLUME_HOLD_FOR - std::time::Duration::from_millis(1);
+        note.at = crate::platform::ago(VOLUME_HOLD_FOR + std::time::Duration::from_millis(1));
         assert_eq!(resolve_held_volume(&mut note, 0.2), None);
     }
 
@@ -4931,7 +4931,7 @@ mod tests {
             assert_eq!(resolve_muted(&mut note, true), Some(false));
         }
         // 引擎受理之后快照才是新值。
-        note.at = std::time::Instant::now() - HOLD_SETTLE - std::time::Duration::from_millis(20);
+        note.at = crate::platform::ago(HOLD_SETTLE + std::time::Duration::from_millis(20));
         assert_eq!(resolve_muted(&mut note, false), None);
     }
 
@@ -4964,7 +4964,7 @@ mod tests {
     fn mute_override_expires() {
         let mut note = MuteNote::new(false);
         note.at =
-            std::time::Instant::now() - MUTE_OVERRIDE_FOR - std::time::Duration::from_millis(1);
+            crate::platform::ago(MUTE_OVERRIDE_FOR + std::time::Duration::from_millis(1));
         assert_eq!(resolve_muted(&mut note, true), None);
     }
 }

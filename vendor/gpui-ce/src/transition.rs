@@ -91,7 +91,14 @@ impl<T: Lerp + Clone + PartialEq + 'static> Transition<T> {
     }
 
     fn default_goal_updated_at(&self) -> Instant {
-        Instant::now() - Duration::from_secs_f32(self.duration_secs)
+        // Bolume patch: 不写 `Instant::now() - duration`。
+        //
+        // Windows 上 `Instant` 的起点是性能计数器（系统启动那一刻），开机没多久就
+        // 启动程序时这个值还不够减，减法直接 panic —— 那时动画还没开始，进程就先
+        // 没了。减不动就等于「这一拍已经过完」，过渡直接落在终点，视觉上没差别。
+        let now = Instant::now();
+        now.checked_sub(Duration::from_secs_f32(self.duration_secs))
+            .unwrap_or(now)
     }
 
     /// Evaluates the value of the transition without using the cache.

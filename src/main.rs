@@ -74,6 +74,12 @@ fn install_panic_log() {
         }
         let args: Vec<String> = std::env::args().skip(1).collect();
         text.push_str(&format!("\n  args: {}", args.join(" ")));
+        // 顺手记一行「开机多久了」：`Instant` 的起点就是系统启动那一刻，开机头几秒
+        // 内任何 `Instant::now() - 十几秒` 都会 panic，有这一行一眼能对上号。
+        text.push_str(&format!(
+            "\n  uptime: {:?}",
+            std::time::Instant::now()
+        ));
         // 不再写调用栈：release 是 `strip = "symbols"`，栈里全是 `<unknown>`，
         // 一行位置（`文件:行:列`）反而更直接。
         platform::logfile::append("crash.log", &text);

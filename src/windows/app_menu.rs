@@ -134,7 +134,7 @@ impl AppMenu {
             visible: false,
             size: (WIDTH, ROW_HEIGHT + PAD * 2.0),
             origin: (0.0, 0.0),
-            shown_at: Instant::now() - std::time::Duration::from_secs(1),
+            shown_at: crate::platform::ago(std::time::Duration::from_secs(1)),
         }
     }
 

@@ -151,7 +151,7 @@ impl TrayMenu {
             row_tops: Vec::new(),
             hovered: None,
             hovered_sub: None,
-            shown_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            shown_at: crate::platform::ago(std::time::Duration::from_secs(1)),
         }
     }
 

@@ -529,7 +529,11 @@ struct Worker {
     app_device: Option<AppDevicePolicy>,
     /// pid → 该应用被指定的设备。查一次 COM 要几微秒，别每帧都问。
     app_devices: std::collections::HashMap<u32, Option<String>>,
-    last_app_device_scan: Instant,
+    /// 上次扫的时间和「从没扫过」区分开：`None` 表示还没扫过，立刻就到期。
+    ///
+    /// 以前用 `Instant::now() - 10s` 表示「早就该扫了」，可 Windows 上 `Instant`
+    /// 的起点是系统启动那一刻，开机没多久就启动本程序时减不动 —— 直接 panic。
+    last_app_device_scan: Option<Instant>,
     resolver: AppInfoResolver,
     devices: Vec<DeviceEntry>,
     /// 被禁用的播放设备（音量接口拿不到，只记录信息）。
@@ -540,8 +544,8 @@ struct Worker {
     visible: bool,
     /// 动态托盘图标在看峰值：面板没开也得按 33ms 采一次。
     animating: bool,
-    last_session_scan: Instant,
-    last_device_scan: Instant,
+    last_session_scan: Option<Instant>,
+    last_device_scan: Option<Instant>,
     /// 设备音量回调的落地端：回调一来就往这里塞一条 EndpointChanged。
     wake: Sender<AudioCommand>,
     /// 快照出口。
@@ -607,6 +611,14 @@ struct MuteGuard {
     since: Instant,
 }
 
+/// 距上次做某件事够不够久；从没做过（`None`）一定够久。
+fn due(last: Option<Instant>, after: Duration) -> bool {
+    match last {
+        None => true,
+        Some(at) => at.elapsed() >= after,
+    }
+}
+
 fn run_worker(
     commands: Receiver<AudioCommand>,
     events: async_channel::Sender<AudioEvent>,
@@ -631,7 +643,7 @@ fn run_worker(
         policy: PolicyConfig::new(),
         app_device: AppDevicePolicy::new(),
         app_devices: std::collections::HashMap::new(),
-        last_app_device_scan: Instant::now() - Duration::from_secs(10),
+        last_app_device_scan: None,
         resolver: AppInfoResolver::new(icons_dir, icon_pixels, name_capitalize),
         devices: Vec::new(),
         disabled_devices: Vec::new(),
@@ -640,8 +652,8 @@ fn run_worker(
         apps_revision: 0,
         visible: false,
         animating: false,
-        last_session_scan: Instant::now() - Duration::from_secs(10),
-        last_device_scan: Instant::now() - Duration::from_secs(10),
+        last_session_scan: None,
+        last_device_scan: None,
         wake,
         events: events.clone(),
         cap: None,
@@ -799,8 +811,8 @@ impl Worker {
             // 设备集合变了必须立刻重扫：托盘菜单和面板里的设备列表都靠它。
             AudioCommand::DevicesChanged => {
                 self.refresh_devices();
-                self.last_device_scan = Instant::now();
-                self.last_session_scan = Instant::now() - Duration::from_secs(10);
+                self.last_device_scan = Some(Instant::now());
+                self.last_session_scan = None;
             }
             AudioCommand::SetDeviceVolume {
                 device_id,
@@ -945,7 +957,7 @@ impl Worker {
                 }
                 self.current_id = Some(device_id);
                 self.refresh_devices();
-                self.last_session_scan = Instant::now() - Duration::from_secs(10);
+                self.last_session_scan = None;
             }
             AudioCommand::SetAppDevice { pid, device_id } => {
                 let policy = match self.app_device.take() {
@@ -982,8 +994,8 @@ impl Worker {
                         // 启用/禁用会让设备在 ACTIVE / DISABLED 两个集合之间搬家，
                         // 必须整体重扫一遍，否则列表会同时缺一条、多一条。
                         self.refresh_devices();
-                        self.last_device_scan = Instant::now();
-                        self.last_session_scan = Instant::now() - Duration::from_secs(10);
+                        self.last_device_scan = Some(Instant::now());
+                        self.last_session_scan = None;
                     }
                     Err(error) => eprintln!("切换设备启用状态失败（{device_id}）：{error}"),
                 }
@@ -1059,7 +1071,7 @@ impl Worker {
                     // 图标路径变了（缓存名带尺寸），旧的会话记录全部作废重扫。
                     self.apps.clear();
                     self.apps_revision = self.apps_revision.wrapping_add(1);
-                    self.last_session_scan = Instant::now() - Duration::from_secs(10);
+                    self.last_session_scan = None;
                 }
             }
             AudioCommand::SetNameCapitalize(on) => {
@@ -1067,37 +1079,39 @@ impl Worker {
                     // 名字是随解析结果一起缓存的，清掉才有新名字。
                     self.apps.clear();
                     self.apps_revision = self.apps_revision.wrapping_add(1);
-                    self.last_session_scan = Instant::now() - Duration::from_secs(10);
+                    self.last_session_scan = None;
                 }
             }
         }
     }
 
     fn tick(&mut self) {
-        if self.last_app_device_scan.elapsed() >= APP_DEVICE_SCAN {
+        if due(self.last_app_device_scan, APP_DEVICE_SCAN) {
             self.refresh_app_devices();
         }
 
-        if self.last_device_scan.elapsed()
-            >= if self.visible {
+        if due(
+            self.last_device_scan,
+            if self.visible {
                 DEVICE_SCAN_VISIBLE
             } else {
                 DEVICE_SCAN_HIDDEN
-            }
-        {
-            self.last_device_scan = Instant::now();
+            },
+        ) {
+            self.last_device_scan = Some(Instant::now());
             self.refresh_devices();
-            self.last_session_scan = Instant::now() - Duration::from_secs(10);
+            self.last_session_scan = None;
         }
 
-        if self.last_session_scan.elapsed()
-            >= if self.visible {
+        if due(
+            self.last_session_scan,
+            if self.visible {
                 SESSION_SCAN_VISIBLE
             } else {
                 SESSION_SCAN_HIDDEN
-            }
-        {
-            self.last_session_scan = Instant::now();
+            },
+        ) {
+            self.last_session_scan = Some(Instant::now());
             self.rescan_sessions();
         }
 
@@ -1813,7 +1827,7 @@ impl Worker {
     /// 只在名单变化后、或每隔 `APP_DEVICE_SCAN` 跑一次：走的是 COM，
     /// 没必要跟着 30fps 的采样跑；在系统设置里改路由最多迟一两拍反映到标记上。
     fn refresh_app_devices(&mut self) {
-        self.last_app_device_scan = Instant::now();
+        self.last_app_device_scan = Some(Instant::now());
         let Some(policy) = self.app_device.as_ref() else {
             self.app_devices.clear();
             return;
