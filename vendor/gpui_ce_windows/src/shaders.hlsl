@@ -915,28 +915,12 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float2 local_position = unrotate_position(input.position.xy, quad.transformation);
 
-    float2x2 r = quad.transformation.rotation_scale;
-    bool axis_aligned =
-        (abs(r[0][0]) < 1e-4 || abs(abs(r[0][0]) - 1.0) < 1e-4) &&
-        (abs(r[0][1]) < 1e-4 || abs(abs(r[0][1]) - 1.0) < 1e-4) &&
-        (abs(r[1][0]) < 1e-4 || abs(abs(r[1][0]) - 1.0) < 1e-4) &&
-        (abs(r[1][1]) < 1e-4 || abs(abs(r[1][1]) - 1.0) < 1e-4);
-    if (!axis_aligned) {
-        const float radius = 1.0;
-        const float step_size = 2.0 * radius / 4.0;
-        float4 sum = 0.0;
-        [unroll]
-        for (int i = 0; i < 4; i++) {
-            [unroll]
-            for (int j = 0; j < 4; j++) {
-                float2 offset = float2(
-                    -radius + (float(i) + 0.5) * step_size,
-                    -radius + (float(j) + 0.5) * step_size);
-                sum += quad_color_at(quad, input, local_position + offset);
-            }
-        }
-        return sum * (1.0 / 16.0);
-    }
+    // Bolume patch: 不再对旋转元素做超采样。
+    //
+    // 超采样是把 ±1px 内的 16 个点取平均 —— 过渡宽度固定 2px 左右，而采样网格与
+    // 边缘的相位随角度变，同一张卡片走一圈就有的地方锐、有的地方糊，转 90° 时
+    // 还会沿边多出一条 50% 的实心细边。SDF 的距离在屏幕空间本来就每像素变 1，
+    // 单点覆盖（`0.5 - sdf`）算出来的过渡恰好一像素，任何角度都一致。
     return quad_color_at(quad, input, local_position);
 }
 

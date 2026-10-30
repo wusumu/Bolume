@@ -773,10 +773,14 @@ pub fn card_visual(
         .h(px(height * scale))
         // 圆角超过高度一半就只剩个胶囊形，再大视觉上没差别 —— 渲染时先夹住。
         .rounded(px((cfg.corner as f32).min(height / 2.0) * scale))
-        .bg(bg)
-        .border_1()
-        .border_color(theme::border_strong())
-        .overflow_hidden();
+        .bg(bg);
+    // 转着画的时候不描这圈 1px 的边：边框内外两道抗锯齿在斜着的像素网格上会叠成
+    // 一条两像素的浅灰线，沿边深浅不一 —— 看着就像「边缘多出来一条细边」。
+    // 正着摆的时候位图逐像素对齐，边框还是原来那条，不动。
+    if cfg.rotation == 0 {
+        card = card.border_1().border_color(theme::border_strong());
+    }
+    card = card.overflow_hidden();
 
     // 各元素先攒起来，最后按 `parts()` 的图层顺序落笔（靠后的盖在上面）。
     let mut layers: Vec<(OsdPart, AnyElement)> = Vec::new();
@@ -1051,8 +1055,11 @@ pub fn card_frame(cfg: &OsdConfig, scale: f32, content: impl IntoElement) -> Div
         .child(
             div()
                 .absolute()
-                .left(px((box_w - width) * 0.5 * scale))
-                .top(px((box_h - height) * 0.5 * scale))
+                // 摆到整像素上：差半个像素的话，转 90° 之后卡片边缘会压在像素中心，
+                // 单点覆盖算出两个半透明像素 —— 看着就是边上多出一条细线、而且
+                // 各处深浅不一。取整之后四周都是干净的锐边。
+                .left(px(((box_w - width) * 0.5 * scale).round()))
+                .top(px(((box_h - height) * 0.5 * scale).round()))
                 .child(core),
         )
 }
