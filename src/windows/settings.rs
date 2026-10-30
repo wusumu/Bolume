@@ -14534,21 +14534,27 @@ impl Settings {
     fn reload_profiles(&self) {
         let list = crate::profiles::list(&self.profiles_root());
         let live = self.config.borrow().get().clone();
-        let active = list
-            .iter()
-            .find(|profile| {
-                crate::profiles::read(&profile.path)
-                    .map(|config| Self::same_config(&config, &live))
-                    .unwrap_or(false)
-            })
-            .map(|profile| profile.path.clone());
         let backup = crate::profiles::main_backup(&self.profiles_root());
-        let backup_usable = crate::profiles::read(&backup)
-            .map(|config| !Self::same_config(&config, &live))
-            .unwrap_or(false);
+        // 快照跟当前内容一样（或者压根没快照）= 现在用的就是主配置本身。
+        // 这时候**不去找**「内容相同的副配置」：内容一样本来就没法分辨是不是它，
+        // 硬标会标到某份副本上，看着像「启用了另一份配置」。
+        let on_main = crate::profiles::read(&backup)
+            .map(|config| Self::same_config(&config, &live))
+            .unwrap_or(true);
+        let active = if on_main {
+            None
+        } else {
+            list.iter()
+                .find(|profile| {
+                    crate::profiles::read(&profile.path)
+                        .map(|config| Self::same_config(&config, &live))
+                        .unwrap_or(false)
+                })
+                .map(|profile| profile.path.clone())
+        };
         *self.profiles.borrow_mut() = list;
         *self.profile_active.borrow_mut() = active;
-        *self.profile_main_backup.borrow_mut() = backup_usable.then_some(backup);
+        *self.profile_main_backup.borrow_mut() = (!on_main).then_some(backup);
     }
 
     /// 两份配置是不是同一套（宽高、格式版本这种谁都不许动的字段不算）。
@@ -15207,15 +15213,27 @@ impl Settings {
             }
         };
         let before = self.config.borrow().get().clone();
-        // 启用是「整份盖掉主配置」，盖上就没了 —— 所以每次都先给现在这套留一份。
+        // 启用是「整份盖掉主配置」，盖上就没了 —— 所以先给现在这套留一份快照。
         //
-        // 只有两种情况不写：内容跟要启用的那份一模一样（点了个寂寞，别把
-        // 上一次的回退点顶掉），以及目标本身就是这份快照（写了就是自己盖自己）。
-        // 早先还有一条「Configs 里已经有一模一样的一份就不留」—— 那会让
-        // 主配置的「启用」在常见流程里变灰（比如先「副本」备份过再切档），去掉。
+        // 但快照只该装**真正的主配置**。现在这套本身要是某份副配置（说明主配置
+        // 早就被换走了），再切另一份副配置时绝不能把这份顶上去 —— 否则主配置行的
+        // 「启用」切回去的是上一份副配置，看着就像「启用了另一个副配置」。
+        //
+        // 另外两种情况也不写：内容跟要启用的那份一模一样（点了个寂寞，别把回退点
+        // 顶掉），以及目标本身就是这份快照（写了就是自己盖自己）。
         let backup_path = crate::profiles::main_backup(&self.profiles_root());
         let same = Self::same_config(&before, &source);
-        let kept = if same || path == backup_path {
+        let live_is_profile = crate::profiles::list(&self.profiles_root())
+            .iter()
+            .any(|profile| {
+                crate::profiles::read(&profile.path)
+                    .map(|config| Self::same_config(&config, &before))
+                    .unwrap_or(false)
+            });
+        let snapshot_is_better = crate::profiles::read(&backup_path)
+            .map(|config| !Self::same_config(&config, &before))
+            .unwrap_or(false);
+        let kept = if same || path == backup_path || (live_is_profile && snapshot_is_better) {
             None
         } else {
             crate::profiles::write(&backup_path, &before)
@@ -15256,11 +15274,19 @@ impl Settings {
             .and_then(|name| name.to_str())
             .unwrap_or("")
             .to_string();
-        let text = match (&kept, lang.is_en()) {
-            (Some(file), true) => format!("Switched to {name}; the previous setup is kept in {file}"),
-            (Some(file), false) => format!("已切换到 {name}，原来那套存进了 {file}"),
-            (None, true) => format!("Switched to {name}"),
-            (None, false) => format!("已切换到 {name}"),
+        // 切回主配置时说人话：那颗按钮读的就是快照，提示里不该露出「主配置.json」。
+        let text = if path == backup_path {
+            lang.pick("已切回主配置", "Switched back to the main config")
+                .to_string()
+        } else {
+            match (&kept, lang.is_en()) {
+                (Some(file), true) => {
+                    format!("Switched to {name}; the previous setup is kept in {file}")
+                }
+                (Some(file), false) => format!("已切换到 {name}，原来那套存进了 {file}"),
+                (None, true) => format!("Switched to {name}"),
+                (None, false) => format!("已切换到 {name}"),
+            }
         };
         self.set_profile_notice(text, cx);
         refresh_ui(window, cx);
