@@ -42,16 +42,20 @@ const PRIVATE_FLOOR: u64 = 60 * 1024 * 1024;
 /// 空闲修剪的节拍器。放在 gui 的驱动循环里，`tick()` 自己判条件。
 pub struct IdleTrim {
     last_visible: Instant,
-    last_trim: Instant,
+    /// 上次修剪的时刻。`None` = 还从没剪过，第一次到点就剪。
+    ///
+    /// 不要用 `Instant::now() - TRIM_EVERY` 表示「早该剪了」：Windows 上 `Instant`
+    /// 的起点就是系统启动那一刻，开机不到三分钟就启动本程序时减不动 ——
+    /// release 编的是 `panic = "abort"`，进程当场消失，用户看到的是「点了没反应」。
+    last_trim: Option<Instant>,
 }
 
 impl Default for IdleTrim {
     fn default() -> Self {
-        let now = Instant::now();
         Self {
-            last_visible: now,
+            last_visible: Instant::now(),
             // 第一次修剪不用等两分钟：启动后安静一会儿就该归位。
-            last_trim: now - TRIM_EVERY,
+            last_trim: None,
         }
     }
 }
@@ -63,7 +67,9 @@ impl IdleTrim {
             self.last_visible = Instant::now();
             return false;
         }
-        if self.last_visible.elapsed() < IDLE_AFTER || self.last_trim.elapsed() < TRIM_EVERY {
+        if self.last_visible.elapsed() < IDLE_AFTER
+            || self.last_trim.map_or(false, |at| at.elapsed() < TRIM_EVERY)
+        {
             return false;
         }
         let (ws_before, private_before) = (working_set(), private_bytes());
@@ -75,7 +81,7 @@ impl IdleTrim {
         #[cfg(feature = "gui")]
         trim_graphics();
         let trimmed = trim();
-        self.last_trim = Instant::now();
+        self.last_trim = Some(Instant::now());
         if trimmed {
             crate::platform::hotkey::trace(&format!(
                 "memory trim working_set {:.1}MB -> {:.1}MB private {:.1}MB -> {:.1}MB",
