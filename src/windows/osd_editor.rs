@@ -1718,7 +1718,10 @@ impl Render for OsdEditor {
         let preview = self.confirm_reset.then(|| {
             let mut draft = cfg.clone();
             draft.reset_layout();
-            draft
+            // `reset_layout` 只写「当前模板那一份」；扁平层（画的时候读的就是它）
+            // 还得重新铺一遍。不铺的话，媒体键 / 亮度模板的预览会用**旧的**文字与
+            // 配色来画 —— 已经关掉、但内容还在的那条自定义文字就会在预览里冒出来。
+            draft.view()
         });
         let view = preview.as_ref().unwrap_or(&cfg);
         // 预览时不着重显示选中框：看的是默认排布本身。
@@ -3502,6 +3505,9 @@ impl OsdEditor {
         const THUMB_H: f32 = 132.0;
         let mut draft = self.cfg();
         draft.reset_layout();
+        // 和画布那份预览一样要把扁平层重新铺一遍：不然这张缩略图还用着旧的文字 /
+        // 配色画，已经关掉但内容还在的那条自定义文字会冒出来。
+        let draft = draft.view();
         let sample = sample_state(&draft, lang, None);
         let (card_w, card_h) = osd::card_size(&draft);
         let thumb_scale = (THUMB_W / card_w).min(THUMB_H / card_h).min(3.0);
@@ -5688,7 +5694,33 @@ fn sample_state(cfg: &crate::config::OsdConfig, lang: Lang, preview: Option<usiz
 mod tests {
     use super::*;
 
-    /// 在音量 / 媒体键 / 亮度之间切换**不算**改了设置：三套模板各存各的，
+    /// 「恢复默认布局」的预览不能把**关掉但内容还在**的文字画出来。
+    ///
+    /// 自定义文字 / 标题在媒体键与亮度模板里存在各自的样式字段里，`reset_layout`
+    /// 清的是那一份；画的时候读的是扁平层，预览不重新铺一遍就还是旧内容 ——
+    /// 位置还得走「找不到就用默认点」的兜底，于是那条字会凭空出现在左上角。
+    #[test]
+    fn reset_preview_drops_text_that_was_switched_off() {
+        let mut osd = crate::config::OsdConfig::default();
+        osd.set_template(crate::config::OsdTemplate::Media);
+        osd.add_text();
+        osd.set_text_at(0, "hello".to_string());
+        osd.set_part_visible(OsdPart::Text(0), false);
+        let cfg = osd.view();
+        assert!(!cfg.shows_part(OsdPart::Text(0)), "前提：这条文字是关着的");
+
+        let mut draft = cfg.clone();
+        draft.reset_layout();
+        let shown = draft.view();
+        assert!(
+            shown.texts.is_empty(),
+            "恢复默认之后不该留下任何自定义文字"
+        );
+        assert!(!shown.parts().contains(&OsdPart::Text(0)));
+        assert!(!shown.shows_part(OsdPart::Text(0)));
+    }
+
+
     /// 换一套只是换个地方看，不该跳出「未保存的更改」。
     #[test]
     fn switching_template_is_not_an_edit() {
