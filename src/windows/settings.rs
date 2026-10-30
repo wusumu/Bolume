@@ -9516,7 +9516,7 @@ impl Settings {
 
         let enable = self.toggle_row(
             "osd-enabled",
-            lang.pick("显示屏幕提示", "Show on-screen display"),
+            lang.pick("启用屏幕提示", "Enable the on-screen display"),
             lang.pick(
                 "调音量、静音、切歌时在屏幕上闪一下",
                 "Flash a small card when volume, mute or playback changes",
@@ -9526,16 +9526,6 @@ impl Settings {
         );
 
         let preview = self.osd_preview(config, lang, cx);
-        let preview_hint = div()
-            .px(px(9.))
-            .pb(px(2.))
-            .text_size(theme::fs(10.5))
-            .text_color(theme::text_tertiary())
-            .child(lang.pick(
-                "尺寸、圆角、不透明度、配色、元素开关、对齐，全部在布局编辑器里调；这里只是缩略图。",
-                "Size, corner, opacity, colors, element switches and alignment all live in the layout editor — this is just a thumbnail.",
-            ))
-            .into_any_element();
 
         // 「预览屏幕提示」：右边两个按钮 —— 弹一次看效果，或者钉住不消失。
         // 这两件事本来就是「看一眼」的两种做法，分成两行还各带一句说明，
@@ -9640,10 +9630,10 @@ impl Settings {
         } else {
             &[
                 (0, "左上"),
-                (1, "上中"),
+                (1, "中上"),
                 (2, "右上"),
                 (3, "左下"),
-                (4, "下中"),
+                (4, "中下"),
                 (5, "右下"),
                 (6, "指定坐标"),
                 (7, "跟随鼠标"),
@@ -9796,13 +9786,9 @@ impl Settings {
 
         let open_editor = self.action_row(
             "osd-open-editor",
-            lang.pick("布局编辑器", "Layout editor"),
-            lang.pick(
-                "单独一扇大窗口，卡片放大到几倍；拖框体挪位置、拖角改大小，方向键 1px 微调",
-                "A big separate window with the card scaled up — drag to move, drag handles to resize, arrow keys nudge 1px",
-            )
-            .to_string(),
-            lang.pick("打开", "Open"),
+            lang.pick("屏幕提示布局编辑", "On-screen display layout"),
+            String::new(),
+            lang.pick("编辑", "Edit"),
             |window, cx| {
                 crate::gui::open_osd_editor(cx);
                 let _ = window;
@@ -10143,9 +10129,13 @@ impl Settings {
             self.section(
                 lang.pick("布局与样式", "Layout and style"),
                 "palette",
-                vec![open_editor, preview, preview_hint],
+                vec![open_editor, preview],
             ),
-            self.section(lang.pick("位置", "Position"), "monitor", position_rows),
+            self.section(
+                lang.pick("屏幕提示弹出位置", "On-screen display position"),
+                "monitor",
+                position_rows,
+            ),
             self.section(
                 lang.pick("显示内容", "Content"),
                 "info",
@@ -11974,7 +11964,7 @@ impl Settings {
 
         // 托盘右键菜单的布局：条目多，编辑器放进弹层，页面上只留一行入口。
         sections.push(self.section(
-            lang.pick("托盘菜单", "Tray menu"),
+            lang.pick("托盘右键菜单", "Tray context menu"),
             "settings",
             vec![
                 tray_menu_style,
@@ -11985,7 +11975,7 @@ impl Settings {
 
         // 悬浮提示：内容完全由用户写，每行一个模板。
         sections.push(self.section(
-            lang.pick("托盘提示", "Tray tooltip"),
+            lang.pick("托盘图标悬浮提示", "Tray icon tooltip"),
             "info",
             self.tooltip_rows(config, lang, snapshot, cx),
         ));
