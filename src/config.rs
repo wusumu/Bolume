@@ -2754,6 +2754,115 @@ pub const OSD_SHADOW_OFFSET_RANGE: (i32, i32) = (-40, 40);
 pub const OSD_SHADOW_BLUR_RANGE: (u32, u32) = (0, 200);
 pub const OSD_SHADOW_OPACITY_RANGE: (u32, u32) = (0, 100);
 
+/// 一套模板的「长相」：颜色、元素单独色、投影、条的圆角、图标样式、图层顺序、文字。
+///
+/// 音量模板这些还存在 [`OsdConfig`] 的扁平字段里（老配置原样能读），媒体键与亮度
+/// 模板各存一份 `Option<OsdStyle>`：`None` = 还没单独调过，跟音量那套一样；在那两套
+/// 模板上动了哪一项，才落成一份自己的值 —— 之后再改音量模板就不会连带它们。
+///
+/// 卡片背景（尺寸 / 圆角 / 不透明度 / 背景色 / 角度）不在这里，那是 [`OsdCard`]，
+/// 早就一套模板一份了。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OsdStyle {
+    /// 元素颜色（文字 / 图标）。
+    #[serde(default)]
+    pub text: String,
+    /// 强调色（条的填充、选中框）。
+    #[serde(default)]
+    pub accent: String,
+    /// 条的轨道底色；空 = 主题的轨道色。
+    #[serde(default)]
+    pub bar_track: String,
+    /// 静音时的填充色；空 = 主题那层半透明的淡色。
+    #[serde(default)]
+    pub bar_muted: String,
+    /// 元素各自的颜色（没列进来的跟随 `text`）。
+    #[serde(default)]
+    pub part_colors: Vec<PartColor>,
+    /// 卡片投影。
+    #[serde(default)]
+    pub shadow: OsdShadow,
+    /// 条的圆角（半高的百分之几）。
+    #[serde(default = "default_bar_round")]
+    pub bar_round: u32,
+    /// 喇叭图标样式（`auto` = 跟着音量变）。
+    #[serde(default = "default_icon_style")]
+    pub icon_style: String,
+    /// 百分比后面带不带 `%`。
+    #[serde(default = "default_true")]
+    pub percent_sign: bool,
+    /// 元素的图层顺序（后面的画在上面）。
+    #[serde(default)]
+    pub z_order: Vec<OsdPart>,
+    /// 标题文字；空 = 用自动标题。
+    #[serde(default)]
+    pub title_text: String,
+    /// 自定义文字。
+    #[serde(default)]
+    pub texts: Vec<String>,
+}
+
+fn default_bar_round() -> u32 {
+    100
+}
+
+impl Default for OsdStyle {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            accent: String::new(),
+            bar_track: String::new(),
+            bar_muted: String::new(),
+            part_colors: Vec::new(),
+            shadow: OsdShadow::default(),
+            bar_round: default_bar_round(),
+            icon_style: default_icon_style(),
+            percent_sign: true,
+            z_order: Vec::new(),
+            title_text: String::new(),
+            texts: Vec::new(),
+        }
+    }
+}
+
+impl OsdStyle {
+    /// 从扁平字段（音量模板那份存法）拿一套出来。
+    fn from_flat(cfg: &OsdConfig) -> Self {
+        Self {
+            text: cfg.colors.text.clone(),
+            accent: cfg.colors.accent.clone(),
+            bar_track: cfg.colors.bar_track.clone(),
+            bar_muted: cfg.colors.bar_muted.clone(),
+            part_colors: cfg.part_colors.clone(),
+            shadow: cfg.shadow.clone(),
+            bar_round: cfg.bar_round,
+            icon_style: cfg.icon_style.clone(),
+            percent_sign: cfg.percent_sign,
+            z_order: cfg.z_order.clone(),
+            title_text: cfg.title_text.clone(),
+            texts: cfg.texts.clone(),
+        }
+    }
+
+    /// 铺回扁平字段（音量模板那份存法，也是渲染 / 编辑器读的那一层）。
+    ///
+    /// 不碰 `colors.card`：背景色归 [`OsdCard`] 管，别在这里被覆盖掉。
+    fn write_flat(self, cfg: &mut OsdConfig) {
+        cfg.colors.text = self.text;
+        cfg.colors.accent = self.accent;
+        cfg.colors.bar_track = self.bar_track;
+        cfg.colors.bar_muted = self.bar_muted;
+        cfg.part_colors = self.part_colors;
+        cfg.shadow = self.shadow;
+        cfg.bar_round = self.bar_round;
+        cfg.icon_style = self.icon_style;
+        cfg.percent_sign = self.percent_sign;
+        cfg.z_order = self.z_order;
+        cfg.title_text = self.title_text;
+        cfg.texts = self.texts;
+    }
+}
+
 /// 元素旋转的可调范围（度）。
 pub const OSD_ROTATION_RANGE: (i32, i32) = (-180, 180);
 
@@ -3109,6 +3218,16 @@ pub struct OsdConfig {
     #[serde(default)]
     pub brightness_card: Option<OsdCard>,
 
+    /// 媒体键模板自己的外观（颜色 / 投影 / 条圆角 / 图标 / 图层 / 文字）。
+    ///
+    /// 空 = 还没单独调过，跟音量模板那套一样（同 `media_card` 的口径）。
+    #[serde(default)]
+    pub media_style: Option<OsdStyle>,
+
+    /// 亮度模板自己的外观。空 = 跟音量模板一样。
+    #[serde(default)]
+    pub brightness_style: Option<OsdStyle>,
+
     /// 编辑器当前停在亮度模板上。
     ///
     /// 和 `detailed`（媒体键那套）互斥，两个都 false 就是音量模板。
@@ -3303,6 +3422,8 @@ impl Default for OsdConfig {
             media_card: None,
             brightness_layout: default_osd_layout(),
             brightness_card: None,
+            media_style: None,
+            brightness_style: None,
             brightness_template: false,
         }
     }
@@ -3417,6 +3538,42 @@ impl OsdConfig {
         }
     }
 
+    /// 当前模板的外观（颜色 / 投影 / 条圆角 / 图标 / 图层 / 文字）。
+    ///
+    /// 媒体键 / 亮度模板还没单独调过时返回音量那一套 —— 在用户动之前，三套永远一致。
+    pub fn style(&self) -> OsdStyle {
+        match self.template() {
+            OsdTemplate::Volume => OsdStyle::from_flat(self),
+            OsdTemplate::Media => self
+                .media_style
+                .clone()
+                .unwrap_or_else(|| OsdStyle::from_flat(self)),
+            OsdTemplate::Brightness => self
+                .brightness_style
+                .clone()
+                .unwrap_or_else(|| OsdStyle::from_flat(self)),
+        }
+    }
+
+    /// 改当前模板的外观。音量模板写回扁平字段，另两套各存一份自己的。
+    pub fn set_style(&mut self, style: OsdStyle) {
+        match self.template() {
+            OsdTemplate::Volume => style.write_flat(self),
+            OsdTemplate::Media => self.media_style = Some(style),
+            OsdTemplate::Brightness => self.brightness_style = Some(style),
+        }
+    }
+
+    /// 在「当前模板的外观」上就地改一项。
+    ///
+    /// 改颜色 / 投影 / 条圆角 / 图层 / 文字都走这里 —— 各模板各改各的，
+    /// 别再直接往 `colors` / `shadow` / `texts` 这些扁平字段上写（那是音量模板那份）。
+    pub fn edit_style(&mut self, edit: impl FnOnce(&mut OsdStyle)) {
+        let mut style = self.style();
+        edit(&mut style);
+        self.set_style(style);
+    }
+
     /// 把这份配置铺成「当前模板的样子」：媒体键模板时换上它自己的背景。
     ///
     /// 渲染和编辑器读的都是 `width` / `height` / `corner` / `opacity` /
@@ -3437,6 +3594,16 @@ impl OsdConfig {
             self.opacity = card.opacity;
             self.colors.card = card.color;
             self.rotation = card.rotation;
+        }
+        // 外观（颜色 / 投影 / 条圆角 / 图标 / 图层 / 文字）跟着一起铺：
+        // 渲染和编辑器读的都是这层扁平字段，在入口处换一次最不容易漏。
+        let look = match self.template() {
+            OsdTemplate::Volume => None,
+            OsdTemplate::Media => self.media_style.clone(),
+            OsdTemplate::Brightness => self.brightness_style.clone(),
+        };
+        if let Some(look) = look {
+            look.write_flat(&mut self);
         }
         self
     }
@@ -3518,10 +3685,13 @@ impl OsdConfig {
     /// 固定的五个 + 这份排布里出现的自定义文字，然后按 `z_order` 重排；
     /// `z_order` 里没提到的（新加的文字、老配置）按内置顺序补在最后。
     pub fn parts(&self) -> Vec<OsdPart> {
+        // 图层和文字都按**当前模板**那份算：三套模板现在各管各的，
+        // 拿扁平字段会在媒体键 / 亮度模板下列出音量那套的文字。
+        let style = self.style();
         let mut existing = OsdPart::FIXED.to_vec();
         // 新建的文字**一律**列出来：万一某次重置把它从排布里挤掉了，
         // 卡片上还在画、列表里却找不到，那就没法再调它了。
-        for index in 0..self.texts.len() {
+        for index in 0..style.texts.len() {
             existing.push(OsdPart::Text(index as u16));
         }
         for position in self.active() {
@@ -3530,7 +3700,7 @@ impl OsdConfig {
             }
         }
         let mut out: Vec<OsdPart> = Vec::with_capacity(existing.len());
-        for part in &self.z_order {
+        for part in &style.z_order {
             if existing.contains(part) && !out.contains(part) {
                 out.push(*part);
             }
@@ -3552,7 +3722,7 @@ impl OsdConfig {
         order.remove(from);
         let target = target.min(order.len());
         order.insert(target, part);
-        self.z_order = order;
+        self.edit_style(|style| style.z_order = order);
     }
 
     /// 第 `index` 条自定义文字（越界给空串）。
@@ -3565,10 +3735,12 @@ impl OsdConfig {
 
     /// 写第 `index` 条自定义文字（越界就补齐）。
     pub fn set_text_at(&mut self, index: usize, value: String) {
-        while self.texts.len() <= index {
-            self.texts.push(String::new());
-        }
-        self.texts[index] = value;
+        self.edit_style(|style| {
+            while style.texts.len() <= index {
+                style.texts.push(String::new());
+            }
+            style.texts[index] = value;
+        });
     }
 
     /// 一条文字的内容（状态文字读 `title_text`，自定义文字读 `texts`）。
@@ -3580,22 +3752,42 @@ impl OsdConfig {
         }
     }
 
+    /// **当前模板**下一条文字的内容（读不到给空串）。
+    ///
+    /// `text_for` 读的是扁平字段（渲染 / 设置页那份 = 音量模板），编辑器在原始配置上
+    /// 判「这条字原来是不是空的」得走这个 —— 否则在亮度模板上写第一条文字时，
+    /// 会拿音量模板那条的判断结果去决定要不要打开元素。
+    pub fn style_text_for(&self, part: OsdPart) -> String {
+        let style = self.style();
+        match part {
+            OsdPart::Title => style.title_text,
+            OsdPart::Text(index) => style
+                .texts
+                .get(index as usize)
+                .cloned()
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     /// 写一条文字的内容。
     pub fn set_text_for(&mut self, part: OsdPart, value: String) {
         match part {
-            OsdPart::Title => self.title_text = value,
+            OsdPart::Title => self.edit_style(|style| style.title_text = value),
             OsdPart::Text(index) => self.set_text_at(index as usize, value),
             _ => {}
         }
     }
 
-    /// 新建一条自定义文字（条数不限），两个模板各补一条排布。
+    /// 新建一条自定义文字（条数不限），只给**当前**这套模板补一条排布。
+    ///
+    /// 文字内容现在一套模板一份：在亮度模板加的字不会跑到音量卡上去。
     ///
     /// 位置摆在「现有元素最靠下的那条」下面，压不到东西；摆不下就贴着
     /// 底边挤一点（反正拖一下就能挪走），总比正好盖在状态文字上强。
     pub fn add_text(&mut self) -> OsdPart {
-        let index = self.texts.len();
-        self.texts.push(String::new());
+        let index = self.style().texts.len();
+        self.edit_style(|style| style.texts.push(String::new()));
         let part = OsdPart::Text(index as u16);
         let lowest = self
             .active()
@@ -3614,37 +3806,51 @@ impl OsdConfig {
             visible: true,
             rotation: 0.0,
         };
-        for layout in [&mut self.layout, &mut self.media_layout, &mut self.brightness_layout] {
-            if !layout.iter().any(|slot| slot.part == part) {
-                layout.push(position);
-            }
+        let layout = self.active_mut();
+        if !layout.iter().any(|slot| slot.part == part) {
+            layout.push(position);
         }
         part
     }
 
-    /// 删掉第 `index` 条自定义文字：内容、两套排布里的条目一起删，
-    /// 后面的文字编号整体往前挪一格（不然会留个空洞，`texts` 也越删越长）。
+    /// 删掉第 `index` 条自定义文字：内容、当前模板排布里的条目、图层与颜色表里的
+    /// 那一条一起删，后面的文字编号整体往前挪一格（不然会留个空洞，`texts` 也越删越长）。
     pub fn remove_text(&mut self, index: usize) {
-        if index >= self.texts.len() {
+        let mut style = self.style();
+        if index >= style.texts.len() {
             return;
         }
-        self.texts.remove(index);
-        self.z_order
+        style.texts.remove(index);
+        style
+            .z_order
             .retain(|part| *part != OsdPart::Text(index as u16));
-        for part in self.z_order.iter_mut() {
+        for part in style.z_order.iter_mut() {
             if let OsdPart::Text(other) = *part {
                 if other as usize > index {
                     *part = OsdPart::Text(other - 1);
                 }
             }
         }
-        for layout in [&mut self.layout, &mut self.media_layout, &mut self.brightness_layout] {
-            layout.retain(|slot| slot.part != OsdPart::Text(index as u16));
-            for slot in layout.iter_mut() {
-                if let OsdPart::Text(other) = slot.part {
-                    if other as usize > index {
-                        slot.part = OsdPart::Text(other - 1);
-                    }
+        // 元素单独色里的 Text(n) 一起重编号：不跟着挪，颜色会挂到后面那条字上。
+        style
+            .part_colors
+            .retain(|entry| entry.part != OsdPart::Text(index as u16));
+        for entry in style.part_colors.iter_mut() {
+            if let OsdPart::Text(other) = entry.part {
+                if other as usize > index {
+                    entry.part = OsdPart::Text(other - 1);
+                }
+            }
+        }
+        self.set_style(style);
+
+        // 排布只动**当前**这套模板：另两套的文字各管各的，编号对不上它。
+        let layout = self.active_mut();
+        layout.retain(|slot| slot.part != OsdPart::Text(index as u16));
+        for slot in layout.iter_mut() {
+            if let OsdPart::Text(other) = slot.part {
+                if other as usize > index {
+                    slot.part = OsdPart::Text(other - 1);
                 }
             }
         }
@@ -3734,19 +3940,28 @@ impl OsdConfig {
     }
 
     /// 设置元素颜色；传空串就是「恢复跟随文字色」。
+    ///
+    /// 只改当前模板：亮度条的颜色和音量条的颜色是两条独立记录。
     pub fn set_part_color(&mut self, part: OsdPart, color: String) {
         let color = color.trim().to_string();
-        if let Some(pos) = self.part_colors.iter().position(|entry| entry.part == part) {
-            if color.is_empty() {
-                self.part_colors.remove(pos);
-            } else {
-                self.part_colors[pos].color = color;
+        let mut style = self.style();
+        match style.part_colors.iter().position(|entry| entry.part == part) {
+            Some(pos) => {
+                if color.is_empty() {
+                    style.part_colors.remove(pos);
+                } else {
+                    style.part_colors[pos].color = color;
+                }
             }
-            return;
+            None => {
+                if color.is_empty() {
+                    // 本来就没有这一条，不用凭空落一份模板外观。
+                    return;
+                }
+                style.part_colors.push(PartColor { part, color });
+            }
         }
-        if !color.is_empty() {
-            self.part_colors.push(PartColor { part, color });
-        }
+        self.set_style(style);
     }
 
     /// 改一个元素的尺寸（逻辑像素）。
@@ -3790,40 +4005,23 @@ impl OsdConfig {
     ///
     /// 只恢复**当前**这套模板（另一套各恢复各的）。
     pub fn reset_layout(&mut self) {
-        // 排布：固定的五个元素回出厂。自建文字整条清掉 —— 内容、三套排布里
-        // 那几条、图层里的编号一起清，不然恢复完卡片上还挂着一行用户写的字。
+        // 排布：当前这套模板回出厂。自建文字的条目在默认排布里本来就没有，
+        // 整块换掉就等于把它们一起清掉了。
         let fresh = match self.template() {
             OsdTemplate::Media => default_media_layout(),
             // 亮度和音量一套结构（图标 + 读数 + 条），排布也就一套默认值。
             OsdTemplate::Volume | OsdTemplate::Brightness => default_osd_layout(),
         };
-        match self.template() {
-            OsdTemplate::Volume => self.layout = fresh,
-            OsdTemplate::Media => self.media_layout = fresh,
-            OsdTemplate::Brightness => self.brightness_layout = fresh,
-        }
-        self.texts.clear();
-        // 状态文字清空 = 回自动内容（音量 / 下一曲）。
-        self.title_text.clear();
-        for layout in [
-            &mut self.layout,
-            &mut self.media_layout,
-            &mut self.brightness_layout,
-        ] {
-            layout.retain(|slot| !matches!(slot.part, OsdPart::Text(_)));
-        }
+        *self.active_mut() = fresh;
+
+        // 外观与文字：配色、元素单独色、条圆角、投影、图标样式、图层顺序、
+        // 自建文字、标题，全回出厂 —— 但只回**当前**这套模板。这些原来是三套
+        // 共用的扁平字段，在亮度模板点恢复默认，音量条和读数也跟着变了色。
+        self.set_style(OsdStyle::default());
+
+        // 背景（尺寸 / 圆角 / 不透明度 / 背景色 / 角度）本来就一套模板一份。
         let defaults = OsdConfig::default();
-        // 图层顺序回内置。
-        self.z_order.clear();
-        // 外观：文字 / 强调 / 轨道这些颜色两套模板共用，照旧回默认。
-        // 背景色和尺寸属于「**当前**模板的背景」—— 媒体键模板下恢复默认不能让
-        // 音量模板的卡片跟着变（以前就是一刀切，结果「在媒体键模板点恢复默认，
-        // 音量卡片的尺寸和背景色被悄悄改了」）。
         let volume_card_color = self.colors.card.clone();
-        self.colors = defaults.colors.clone();
-        self.part_colors.clear();
-        self.bar_round = defaults.bar_round;
-        self.shadow = defaults.shadow;
         let factory = OsdCard {
             width: defaults.width,
             height: defaults.height,
@@ -3903,7 +4101,8 @@ impl OsdConfig {
 
     /// 选一个喇叭样式（`auto` = 跟着音量变）。
     pub fn set_icon_style(&mut self, style: &str) {
-        self.icon_style = style.to_string();
+        let style = style.to_string();
+        self.edit_style(|look| look.icon_style = style);
     }
 
     /// 百分比后面带不带 `%`。
@@ -7469,6 +7668,138 @@ mod tests {
         }
     }
 
+    /// 亮度模板的配色 / 条圆角 / 投影 / 元素单独色各管各的：改它不能动音量那张。
+    #[test]
+    fn osd_brightness_style_is_separate_from_volume() {
+        let mut osd = OsdConfig::default();
+        osd.set_template(OsdTemplate::Brightness);
+        osd.edit_style(|style| {
+            style.text = "#112233".into();
+            style.accent = "#445566".into();
+            style.bar_track = "#778899".into();
+            style.shadow.enabled = true;
+            style.bar_round = 0;
+            style.percent_sign = false;
+        });
+        osd.set_part_color(OsdPart::Bar, "#abcdef".into());
+
+        let volume = osd.for_function(OsdFunction::Volume);
+        assert_eq!(volume.colors.text, "", "音量模板的字色不该跟着变");
+        assert_eq!(volume.colors.accent, "");
+        assert_eq!(volume.colors.bar_track, "");
+        assert_eq!(volume.bar_round, 100);
+        assert!(!volume.shadow.enabled);
+        assert!(volume.percent_sign);
+        assert_eq!(volume.part_color(OsdPart::Bar), "", "音量条的颜色也是独立的");
+
+        let brightness = osd.for_function(OsdFunction::Brightness);
+        assert_eq!(brightness.colors.text, "#112233");
+        assert_eq!(brightness.colors.accent, "#445566");
+        assert_eq!(brightness.colors.bar_track, "#778899");
+        assert_eq!(brightness.bar_round, 0);
+        assert!(brightness.shadow.enabled);
+        assert!(!brightness.percent_sign);
+        assert_eq!(brightness.part_color(OsdPart::Bar), "#abcdef");
+    }
+
+    /// 没单独调过的那两套跟着音量走；一旦自己调过一项，就只改自己。
+    #[test]
+    fn osd_template_style_follows_volume_until_touched() {
+        let mut osd = OsdConfig::default();
+        osd.colors.text = "#010203".into();
+        assert!(osd.media_style.is_none());
+        assert!(osd.brightness_style.is_none());
+        assert_eq!(
+            osd.for_function(OsdFunction::NextTrack).colors.text,
+            "#010203"
+        );
+
+        osd.set_template(OsdTemplate::Media);
+        osd.edit_style(|style| style.text = "#0a0b0c".into());
+        assert_eq!(osd.for_function(OsdFunction::Volume).colors.text, "#010203");
+        assert_eq!(osd.for_function(OsdFunction::NextTrack).colors.text, "#0a0b0c");
+
+        // 回头再改音量模板：媒体键那套保持自己的值。
+        osd.set_template(OsdTemplate::Volume);
+        osd.edit_style(|style| style.text = "#0d0e0f".into());
+        assert_eq!(osd.for_function(OsdFunction::Volume).colors.text, "#0d0e0f");
+        assert_eq!(osd.for_function(OsdFunction::NextTrack).colors.text, "#0a0b0c");
+        // 亮度那套还没动过，仍旧跟着音量。
+        assert_eq!(
+            osd.for_function(OsdFunction::Brightness).colors.text,
+            "#0d0e0f"
+        );
+    }
+
+    /// 恢复默认只回当前这套模板：别把另外两套的配色和文字一起清掉。
+    #[test]
+    fn osd_reset_layout_only_resets_current_template_style() {
+        let mut osd = OsdConfig::default();
+        osd.colors.text = "#111111".into();
+        osd.set_part_color(OsdPart::Bar, "#222222".into());
+
+        osd.set_template(OsdTemplate::Brightness);
+        osd.edit_style(|style| {
+            style.text = "#333333".into();
+            style.bar_round = 10;
+        });
+        osd.reset_layout();
+
+        let brightness = osd.for_function(OsdFunction::Brightness);
+        assert_eq!(brightness.colors.text, "", "自己这套回默认");
+        assert_eq!(brightness.bar_round, 100);
+
+        let volume = osd.for_function(OsdFunction::Volume);
+        assert_eq!(volume.colors.text, "#111111", "音量模板的颜色别被带着回默认");
+        assert_eq!(volume.part_color(OsdPart::Bar), "#222222");
+    }
+
+    /// 自定义文字一套模板一份：在亮度模板加的字不会跑到音量卡上。
+    #[test]
+    fn osd_texts_are_per_template() {
+        let mut osd = OsdConfig::default();
+        osd.set_template(OsdTemplate::Brightness);
+        let part = osd.add_text();
+        osd.set_text_for(part, "亮度".into());
+
+        assert_eq!(osd.for_function(OsdFunction::Brightness).text_at(0), "亮度");
+        assert!(
+            osd.for_function(OsdFunction::Volume).texts.is_empty(),
+            "音量模板不该凭空多一条空文字"
+        );
+        assert!(
+            !osd.layout.iter().any(|slot| slot.part == part),
+            "音量模板的排布里也不该多一条"
+        );
+        assert!(osd.brightness_layout.iter().any(|slot| slot.part == part));
+
+        // 音量模板自己加一条：编号从 0 开始，内容和位置都互不干扰。
+        osd.set_template(OsdTemplate::Volume);
+        let own = osd.add_text();
+        assert_eq!(own, OsdPart::Text(0));
+        osd.set_text_for(own, "音量".into());
+        assert_eq!(osd.for_function(OsdFunction::Volume).text_at(0), "音量");
+        assert_eq!(osd.for_function(OsdFunction::Brightness).text_at(0), "亮度");
+    }
+
+    /// 0.88 之前存的配置里没有 `media_style` / `brightness_style`，要能照常读，
+    /// 而且读进来是「跟着音量走」。
+    #[test]
+    fn osd_template_styles_are_optional_for_old_configs() {
+        let json = serde_json::to_string(&OsdConfig::default()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("media_style");
+        object.remove("brightness_style");
+        let osd: OsdConfig = serde_json::from_value(value).unwrap();
+        assert!(osd.media_style.is_none());
+        assert!(osd.brightness_style.is_none());
+        assert_eq!(
+            osd.for_function(OsdFunction::Brightness).bar_round,
+            osd.bar_round
+        );
+    }
+
     /// 媒体键模板的背景可以单独调：没调过时跟音量那套一样，调过之后互不影响，
     /// 而且**不碰音量模板**（老配置里 `media_card` 是 None，行为一点不变）。
     #[test]
@@ -7568,41 +7899,35 @@ mod tests {
         assert!((osd.rotation_of(OsdPart::Icon) - 170.0).abs() < 0.001);
     }
 
-    /// 新加的自定义文字在三套模板里都要有自己的位置条目。
+    /// 新加的自定义文字只落在**当前**这套模板里，位置也不是兜底的 0.1 / 0.1。
     ///
-    /// 以前只往音量 / 媒体键两份排布里塞，切到亮度模板时那条文字会掉到卡片左上角
-    /// （回落到默认的 0.1 / 0.1），看着像「加了个空元素」。
+    /// 0.88 之前三套模板共用一份文字：在亮度模板加的字会同时出现在音量卡上
+    /// （当时的三套排布还得各补一条位置）。现在谁加谁有，内容与位置一起分家。
     #[test]
-    fn new_text_lands_in_every_template() {
+    fn new_text_lands_in_the_current_template_only() {
         let mut osd = OsdConfig::default();
+        osd.set_template(OsdTemplate::Brightness);
         let part = osd.add_text();
-        for template in [
-            OsdTemplate::Volume,
-            OsdTemplate::Media,
-            OsdTemplate::Brightness,
-        ] {
-            osd.set_template(template);
-            let slot = osd.part(part);
-            assert!(
-                (slot.x - 0.15).abs() < 0.001,
-                "{template:?} 里这条文字没落到位：x={}",
-                slot.x
-            );
-        }
+        let slot = osd.part(part);
+        assert!(
+            (slot.x - 0.15).abs() < 0.001,
+            "亮度模板里这条文字没落到位：x={}",
+            slot.x
+        );
+        assert!(osd.brightness_layout.iter().any(|entry| entry.part == part));
+        assert!(!osd.layout.iter().any(|entry| entry.part == part));
+        assert!(!osd.media_layout.iter().any(|entry| entry.part == part));
 
-        // 删掉之后三套里都不该再有它。
+        // 切回音量模板：没有这条字，排布里也没有它的条目。
+        osd.set_template(OsdTemplate::Volume);
+        assert!(!osd.parts().contains(&part));
+        assert!(osd.texts.is_empty(), "音量模板不该凭空多一条空文字");
+
+        // 删掉之后当前模板里也不该再有它。
+        osd.set_template(OsdTemplate::Brightness);
         osd.remove_text(0);
-        for template in [
-            OsdTemplate::Volume,
-            OsdTemplate::Media,
-            OsdTemplate::Brightness,
-        ] {
-            osd.set_template(template);
-            assert!(
-                !osd.parts().contains(&part),
-                "{template:?} 里还留着刚删掉的那条文字"
-            );
-        }
+        assert!(!osd.brightness_layout.iter().any(|entry| entry.part == part));
+        assert!(osd.for_function(OsdFunction::Brightness).texts.is_empty());
     }
 
     /// 调角度不该把删掉的元素重新弄出来。

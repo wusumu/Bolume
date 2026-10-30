@@ -170,11 +170,12 @@ impl ColorSlot {
     fn set(self, config: &mut crate::config::Config, value: String) {
         match self {
             Self::Card => config.osd.set_card(|card| card.color = value),
-            Self::Text => config.osd.colors.text = value,
-            Self::Accent => config.osd.colors.accent = value,
-            Self::Shadow => config.osd.shadow.color = value,
-            Self::BarTrack => config.osd.colors.bar_track = value,
-            Self::BarMuted => config.osd.colors.bar_muted = value,
+            // 颜色走 `edit_style`：一套模板一份，改亮度卡片的字色不会动音量那张。
+            Self::Text => config.osd.edit_style(|style| style.text = value),
+            Self::Accent => config.osd.edit_style(|style| style.accent = value),
+            Self::Shadow => config.osd.edit_style(|style| style.shadow.color = value),
+            Self::BarTrack => config.osd.edit_style(|style| style.bar_track = value),
+            Self::BarMuted => config.osd.edit_style(|style| style.bar_muted = value),
             Self::CanvasBg => config.editor_bg = value,
             Self::Part(part) => config.osd.set_part_color(part, value),
         }
@@ -429,12 +430,19 @@ impl NumField {
             NumField::Width => osd.set_card(|card| card.width = value as u32),
             NumField::Height => osd.set_card(|card| card.height = value as u32),
             NumField::Corner => osd.set_card(|card| card.corner = value as u32),
-            NumField::BarCorner => osd.bar_round = value as u32,
+            // 条圆角 / 投影也按模板存：三套模板各调各的。
+            NumField::BarCorner => {
+                osd.edit_style(|style| style.bar_round = value as u32);
+            }
             NumField::Opacity => osd.set_card(|card| card.opacity = value as u32),
-            NumField::ShadowX => osd.shadow.offset_x = value,
-            NumField::ShadowY => osd.shadow.offset_y = value,
-            NumField::ShadowBlur => osd.shadow.blur = value.max(0) as u32,
-            NumField::ShadowOpacity => osd.shadow.opacity = value.clamp(0, 100) as u32,
+            NumField::ShadowX => osd.edit_style(|style| style.shadow.offset_x = value),
+            NumField::ShadowY => osd.edit_style(|style| style.shadow.offset_y = value),
+            NumField::ShadowBlur => {
+                osd.edit_style(|style| style.shadow.blur = value.max(0) as u32);
+            }
+            NumField::ShadowOpacity => osd.edit_style(|style| {
+                style.shadow.opacity = value.clamp(0, 100) as u32;
+            }),
             NumField::Rotation(RotationTarget::Card) => {
                 osd.set_card(|card| card.rotation = value);
             }
@@ -1150,7 +1158,8 @@ impl OsdEditor {
         self.update(|osd| {
             // 原来空着、现在写了字：自动打开（不然写了也看不见）。
             // 其余情况一律不碰开关 —— 用户刚点眼睛关掉的那一下，不能被保存又打开。
-            let was_empty = osd.text_for(part).trim().is_empty();
+            // 按**当前模板**判：文字内容各模板各一份。
+            let was_empty = osd.style_text_for(part).trim().is_empty();
             osd.set_text_for(part, text.clone());
             if part != OsdPart::Title && was_empty && !text.is_empty() {
                 osd.set_part_visible(part, true);
@@ -4654,7 +4663,9 @@ impl OsdEditor {
                             cx.listener(move |this, _, _, cx| {
                                 this.suppress_row_click = Some(std::time::Instant::now());
                                 let next = !this.cfg().percent_sign;
-                                this.update(|osd| osd.percent_sign = next);
+                                this.update(|osd| {
+                                    osd.edit_style(|style| style.percent_sign = next)
+                                });
                                 cx.notify();
                             }),
                         )
@@ -4792,7 +4803,7 @@ impl OsdEditor {
                 .hover(|style| style.bg(theme::surface_hover()))
                 .on_click(cx.listener(|this, _: &gpui::ClickEvent, _window, cx| {
                     let next = !this.cfg().shadow.enabled;
-                    this.update(|osd| osd.shadow.enabled = next);
+                    this.update(|osd| osd.edit_style(|style| style.shadow.enabled = next));
                     cx.notify();
                 }))
                 .child(

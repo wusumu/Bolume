@@ -957,6 +957,24 @@ enum NumberField {
     VolumeSound,
 }
 
+/// 设置页里那几格 OSD 数值（尺寸 / 圆角 / 元素大小 / 文字）对准的一直是**音量模板**：
+/// 页面上那块预览就是按音量模板画的。编辑器停在媒体键或亮度模板时不能跟着它走，
+/// 否则「看着是音量卡，改的是另一张」。要调另外两套，用编辑器的参数栏。
+fn with_volume_osd<R>(
+    config: &mut crate::config::Config,
+    edit: impl FnOnce(&mut crate::config::OsdConfig) -> R,
+) -> R {
+    let saved = config.osd.template();
+    if saved != crate::config::OsdTemplate::Volume {
+        config.osd.set_template(crate::config::OsdTemplate::Volume);
+    }
+    let out = edit(&mut config.osd);
+    if saved != crate::config::OsdTemplate::Volume {
+        config.osd.set_template(saved);
+    }
+    out
+}
+
 impl NumberField {
     /// 数字框里显示的值（有符号：面板字间距能填负数）。
     ///
@@ -1177,17 +1195,19 @@ impl NumberField {
             Self::FlyoutVerticalHeight => config.vertical_height = value,
             Self::PanelBarThickness => config.panel_bar_thickness = value,
             Self::PanelBarRound => config.panel_bar_round = value,
-            // 这几格跟编辑器一样按**当前模板**写：媒体键模板下改的是它自己那份背景。
-            Self::OsdWidth => config.osd.set_card(|card| card.width = value),
-            Self::OsdHeight => config.osd.set_card(|card| card.height = value),
-            Self::OsdCorner => config.osd.set_card(|card| card.corner = value),
-            Self::OsdOpacity => config.osd.set_card(|card| card.opacity = value),
+            // 这几格读的一直是音量模板那份（上面那块预览也是按音量模板画的），
+            // 写的时候也必须落在同一份上 —— 否则编辑器停在亮度模板时，
+            // 「预览是音量卡，改的却是亮度卡」。
+            Self::OsdWidth => with_volume_osd(config, |osd| osd.set_card(|c| c.width = value)),
+            Self::OsdHeight => with_volume_osd(config, |osd| osd.set_card(|c| c.height = value)),
+            Self::OsdCorner => with_volume_osd(config, |osd| osd.set_card(|c| c.corner = value)),
+            Self::OsdOpacity => with_volume_osd(config, |osd| osd.set_card(|c| c.opacity = value)),
             Self::OsdX => config.osd.custom_x = value,
             Self::OsdY => config.osd.custom_y = value,
             Self::OsdFadeIn => config.osd.fade_in_ms = value,
             Self::OsdFadeOut => config.osd.fade_out_ms = value,
             Self::OsdHold => config.osd.hold_ms = value,
-            Self::OsdSize(part) => config.osd.set_part_size(part, value),
+            Self::OsdSize(part) => with_volume_osd(config, |osd| osd.set_part_size(part, value)),
             Self::DeviceNameSize => config.device_name_size = value,
             Self::PopupAnimation => config.popup_animation_ms = value,
             Self::UiFontScale => config.ui_font_scale = value,
@@ -6794,11 +6814,14 @@ impl Settings {
             OsdPart::Text(u16::from(slot - 1))
         };
         let _ = self.config.borrow_mut().update(|config| {
-            config.osd.set_text_for(part, text.clone());
-            // 填了字就把这个元素打开：标题默认是关着的，不打开会让人以为没生效。
-            if !text.is_empty() {
-                config.osd.set_part_visible(part, true);
-            }
+            // 这一页只有一套文字框，对准音量模板（预览也是它）。
+            with_volume_osd(config, |osd| {
+                osd.set_text_for(part, text.clone());
+                // 填了字就把这个元素打开：标题默认是关着的，不打开会让人以为没生效。
+                if !text.is_empty() {
+                    osd.set_part_visible(part, true);
+                }
+            });
         });
         refresh_ui(window, cx);
     }
