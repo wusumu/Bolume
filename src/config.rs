@@ -5920,6 +5920,21 @@ impl ConfigStore {
         self.draft_base.as_ref()
     }
 
+    /// 整份换成 `src`（跳过 `except` 里那几个），并且**立刻落盘**。
+    ///
+    /// 切配置档用它：换档是用户按下「启用」的当下就要生效的事，不能因为还在草稿
+    /// 模式里就只改内存 —— 那样关掉设置窗一切又弹回去了。
+    /// 装完顺手把草稿的参照点挪到新的一份，否则「有未保存的更改」会一直亮着。
+    pub fn install(&mut self, src: &Config, except: &[&str]) -> io::Result<()> {
+        self.config.copy_all(src, except);
+        let saved = self.save();
+        if self.draft_base.is_some() {
+            self.draft_base = Some(self.config.clone());
+            self.draft_dirty = false;
+        }
+        saved
+    }
+
     /// 把草稿写进文件，参照点往前挪到当前这一份（还在草稿模式里，可以接着改）。
     pub fn commit_draft(&mut self) -> io::Result<()> {
         self.save()?;

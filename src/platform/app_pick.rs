@@ -126,6 +126,27 @@ pub fn pick_sound_async(owner: isize) -> async_channel::Receiver<Option<String>>
     pick_async(PickKind::Sound, owner)
 }
 
+/// 选一个 `.json`：配置页的「导入」用的。
+pub fn pick_json_async(owner: isize) -> async_channel::Receiver<Option<String>> {
+    pick_async(PickKind::Json, owner)
+}
+
+/// 「另存为」：把一份配置导出到用户挑的位置（配置页的「导出」用的）。
+///
+/// 和打开框同一套：自起 STA 线程 + channel，主线程一步都不阻塞。
+pub fn save_json_async(
+    owner: isize,
+    default_name: &str,
+) -> async_channel::Receiver<Option<String>> {
+    let (sender, receiver) = async_channel::bounded(1);
+    let name = default_name.to_string();
+    std::thread::spawn(move || {
+        let path = unsafe { show_save_dialog(owner, &name) };
+        let _ = sender.send_blocking(path);
+    });
+    receiver
+}
+
 fn pick_async(kind: PickKind, owner: isize) -> async_channel::Receiver<Option<String>> {
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
@@ -146,6 +167,8 @@ enum PickKind {
     Icon,
     /// 一个 `.wav`（音量音效）。
     Sound,
+    /// 一个 `.json`（导入配置档）。
+    Json,
 }
 
 /// `owner` 是设置窗的 HWND（0 = 不认主）。给了主，对话框就是**模态**：
@@ -199,6 +222,10 @@ unsafe fn show_dialog_owned(kind: PickKind, owner: isize) -> Option<String> {
             pszName: w!("音效文件 (*.wav)"),
             pszSpec: w!("*.wav"),
         }),
+        PickKind::Json => Some(windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC {
+            pszName: w!("配置文件 (*.json)"),
+            pszSpec: w!("*.json"),
+        }),
         _ => None,
     };
     if let Some(filter) = filter {
@@ -208,6 +235,7 @@ unsafe fn show_dialog_owned(kind: PickKind, owner: isize) -> Option<String> {
     let title = match kind {
         PickKind::Icon => w!("选择托盘图标"),
         PickKind::Sound => w!("选择音效文件"),
+        PickKind::Json => w!("选择配置文件"),
         PickKind::Folder => w!("Select the folder to disable Bolume in"),
         PickKind::App => w!("Select the app to disable Bolume in"),
     };
@@ -232,5 +260,95 @@ unsafe fn show_dialog_owned(kind: PickKind, owner: isize) -> Option<String> {
     if initialized.is_ok() {
         unsafe { CoUninitialize() };
     }
+    path.filter(|path| !path.is_empty())
+}
+
+/// 「另存为」对话框：给配置页的「导出」用。
+///
+/// 和打开框一样在自起的 STA 线程里跑（见 `pick_icon_async` 上面那段说明）：
+/// 这里一旦在主线程开模态框，gpui 的状态还借在手上，一借就是 `BorrowMutError`。
+unsafe fn show_save_dialog(owner: isize, default_name: &str) -> Option<String> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FileSaveDialog,
+        IFileSaveDialog, SIGDN_FILESYSPATH,
+    };
+    use windows::core::{HSTRING, w};
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    // 后面几条提前返回的路都要顺手收尾，写成闭包省得每处抄一遍。
+    let release = || {
+        if initialized.is_ok() {
+            unsafe { CoUninitialize() };
+        }
+    };
+
+    let dialog: IFileSaveDialog =
+        match unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER) } {
+            Ok(dialog) => dialog,
+            Err(_) => {
+                release();
+                return None;
+            }
+        };
+
+    let mut options = match unsafe { dialog.GetOptions() } {
+        Ok(options) => options,
+        Err(_) => {
+            release();
+            return None;
+        }
+    };
+    options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT;
+    let _ = unsafe { dialog.SetOptions(options) };
+    let _ = unsafe {
+        dialog.SetFileTypes(&[windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC {
+            pszName: w!("配置文件 (*.json)"),
+            pszSpec: w!("*.json"),
+        }])
+    };
+    let _ = unsafe { dialog.SetDefaultExtension(w!("json")) };
+    let _ = unsafe { dialog.SetTitle(w!("导出配置")) };
+    // 预填文件名：用最原始的宽字符串指针，`HSTRING` 那条路在某些系统上会被
+    // 对话框悄悄忽略（实测框是空的）。
+    let wide: Vec<u16> = default_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let _ = unsafe { dialog.SetFileName(windows::core::PCWSTR(wide.as_ptr())) };
+    // 有的系统会把这条悄悄无视（框里还是空的），用户看到的是「导出」没名字。
+    // 读回来对不上就记一笔，别让人以为是自己没填。
+    let readback = unsafe { dialog.GetFileName() }
+        .ok()
+        .and_then(|name| {
+            let text = unsafe { name.to_string() }.ok();
+            unsafe { CoTaskMemFree(Some(name.0 as *const _)) };
+            text
+        })
+        .unwrap_or_default();
+    if readback != default_name {
+        crate::platform::logfile::append(
+            "pick.log",
+            &format!("save dialog ignored the name: wanted {default_name:?}, got {readback:?}"),
+        );
+    }
+
+    let parent = (owner != 0).then(|| unsafe { HWND(owner as *mut _) });
+    if unsafe { dialog.Show(parent) }.is_err() {
+        release();
+        return None;
+    }
+    let path = unsafe { dialog.GetResult() }
+        .ok()
+        .and_then(|item| unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok())
+        .and_then(|name| {
+            let path = unsafe { name.to_string() }.ok();
+            unsafe { CoTaskMemFree(Some(name.0 as *const _)) };
+            path
+        });
+    release();
     path.filter(|path| !path.is_empty())
 }

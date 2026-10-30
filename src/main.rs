@@ -11,6 +11,7 @@ mod i18n;
 mod motion;
 mod platform;
 mod probe;
+mod profiles;
 mod startup;
 mod textvars;
 mod tray;

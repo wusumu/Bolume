@@ -3,6 +3,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    path::PathBuf,
     rc::Rc,
     sync::Arc,
 };
@@ -95,10 +96,12 @@ enum Page {
     Osd,
     /// 黑名单：哪些应用在前台时整个 Bolume 让路。
     Blocklist,
+    /// 配置档：几套设置之间来回切（`Configs/` 里的 .json）。
+    Profiles,
     About,
 }
 
-const PAGE_COUNT: usize = 10;
+const PAGE_COUNT: usize = 11;
 
 /// 解除静音矩阵里的一格：开关 id、当前值、点一下怎么改。
 type UnmuteCell = (&'static str, bool, fn(&mut Config));
@@ -114,6 +117,7 @@ impl Page {
         Page::Shortcuts,
         Page::Osd,
         Page::Blocklist,
+        Page::Profiles,
         Page::About,
     ];
 
@@ -132,6 +136,7 @@ impl Page {
             Self::Shortcuts => "shortcuts",
             Self::Osd => "osd",
             Self::Blocklist => "blocklist",
+            Self::Profiles => "profiles",
             Self::About => "about",
         }
     }
@@ -150,6 +155,8 @@ impl Page {
             Self::Shortcuts => "keyboard",
             Self::Osd => "monitor",
             Self::Blocklist => "ban",
+            // 层叠的几条：几个配置档摞在一起。
+            Self::Profiles => "levels",
             Self::About => "info",
         }
     }
@@ -165,6 +172,7 @@ impl Page {
             Self::Shortcuts => lang.pick("快捷键", "Shortcuts"),
             Self::Osd => lang.pick("屏幕提示", "On-screen"),
             Self::Blocklist => lang.pick("黑名单", "Blocklist"),
+            Self::Profiles => lang.pick("配置", "Profiles"),
             Self::About => lang.pick("关于", "About"),
         }
     }
@@ -304,6 +312,9 @@ fn page_fields(page: Page) -> &'static [&'static str] {
         ],
         Page::Osd => &["osd", "editor_bg", "editor_panel_w"],
         Page::Blocklist => &["app_block"],
+        // 配置页管的是「哪一份配置」，不是某一项设置：没有可恢复的字段，
+        // 菜单里那两条「本页」自然是灰的（见 `page_has_fields`）。
+        Page::Profiles => &[],
         Page::About => &[],
     }
 }
@@ -327,6 +338,33 @@ struct Restore {
     factory: bool,
     /// `true` = 整份配置，`false` = 只动当前这一页。
     whole: bool,
+    /// `true` = 从用户挑的一份备份文件里只搬本页的字段（`factory` / `whole` 不看）。
+    from_file: bool,
+}
+
+impl Restore {
+    fn revert(whole: bool) -> Self {
+        Self {
+            factory: false,
+            whole,
+            from_file: false,
+        }
+    }
+
+    fn factory(whole: bool) -> Self {
+        Self {
+            factory: true,
+            whole,
+            from_file: false,
+        }
+    }
+
+    /// 从备份文件只导入本页。
+    const IMPORT: Self = Self {
+        factory: false,
+        whole: false,
+        from_file: true,
+    };
 }
 
 pub struct Settings {
@@ -492,6 +530,20 @@ pub struct Settings {
     donate_image: RefCell<Option<Arc<RenderImage>>>,
     /// 标题栏那个三横杠菜单是不是开着（恢复更改 / 恢复出厂设置都在里面）。
     restore_menu_open: bool,
+    /// 配置页的列表缓存。
+    ///
+    /// 不在每帧里读目录（那是 IO）：进这一页、以及增删改导入之后自己刷一次。
+    profiles: RefCell<Vec<crate::profiles::Profile>>,
+    /// 正在改名的档：(文件, 输入缓冲)。
+    profile_rename: Option<(PathBuf, String)>,
+    /// 新建配置时的名字输入。
+    profile_new: Option<String>,
+    /// 点过一次「删除」的那一档：再点一次才真删（文件删了可找不回来）。
+    profile_pending_delete: Option<PathBuf>,
+    /// 配置页的临时提示（成功 / 失败），2.6 秒后自己消失。
+    profile_notice: Option<(String, u64)>,
+    /// 提示的序号：连着操作几次时，只有最后那条到点才把自己清掉。
+    profile_notice_seq: u64,
     /// 「有未保存的更改，关掉就没了」那个确认框是不是开着。
     ///
     /// 设置页是草稿模式：改了只在内存里，按「应用 / 保存」才落盘。
@@ -2071,6 +2123,12 @@ impl Settings {
             donate_image: RefCell::new(None),
             restore_menu_open: false,
             confirm_close: false,
+            profiles: RefCell::new(Vec::new()),
+            profile_rename: None,
+            profile_new: None,
+            profile_pending_delete: None,
+            profile_notice: None,
+            profile_notice_seq: 0,
         }
     }
 
@@ -4918,6 +4976,14 @@ impl Settings {
                 if page == Page::Devices && this.device_tab == 1 {
                     crate::gui::refresh_displays(cx);
                 }
+                // 配置页：进来重扫一次 `Configs/`（外面拖进来 / 删掉的文件也能看到），
+                // 顺手把上一次没输完的名字、待确认的删除都收掉。
+                if page == Page::Profiles {
+                    this.reload_profiles();
+                    this.profile_rename = None;
+                    this.profile_new = None;
+                    this.profile_pending_delete = None;
+                }
                 refresh_ui(window, cx);
             }))
             .child(icon(
@@ -6537,6 +6603,13 @@ impl Settings {
         if self.font_menu.is_some() {
             return Some(self.font_filter.as_str());
         }
+        // 配置页：改名 / 新建，先给它们让路（同时只会有一处编辑）。
+        if let Some((_, text)) = self.profile_rename.as_ref() {
+            return Some(text.as_str());
+        }
+        if let Some(text) = self.profile_new.as_ref() {
+            return Some(text.as_str());
+        }
         self.device_rename
             .as_ref()
             .or(self.display_rename.as_ref())
@@ -6567,6 +6640,12 @@ impl Settings {
     fn text_edit_mut(&mut self) -> Option<&mut String> {
         if self.font_menu.is_some() {
             return Some(&mut self.font_filter);
+        }
+        if self.profile_rename.is_some() {
+            return self.profile_rename.as_mut().map(|(_, text)| text);
+        }
+        if self.profile_new.is_some() {
+            return self.profile_new.as_mut();
         }
         if self.device_rename.is_some() {
             self.device_rename.as_mut().map(|(_, text)| text)
@@ -6633,6 +6712,8 @@ impl Settings {
         } else if self.block_exempt_edit.is_some() {
             // 第二块名单单独一格：两框之间来回点不该互相回退。
             Some(6)
+        } else if self.profile_rename.is_some() || self.profile_new.is_some() {
+            Some(7)
         } else {
             None
         }
@@ -14413,6 +14494,800 @@ impl Settings {
         ]
     }
 
+    // ======================= 配置页 =======================
+
+    /// `config.json` 所在目录：副配置就在它下面的 `Configs/`。
+    fn profiles_root(&self) -> PathBuf {
+        std::path::Path::new(self.config_path.as_ref())
+            .parent()
+            .map(|dir| dir.to_path_buf())
+            .unwrap_or_default()
+    }
+
+    /// 重扫 `Configs/`，把列表缓存换新。
+    ///
+    /// 进这一页、以及每次增删改导入之后调一次。不在渲染里读目录：那是 IO，
+    /// 一帧一次纯属浪费；外面手动改文件的话，切走再切回来就能看到。
+    fn reload_profiles(&self) {
+        *self.profiles.borrow_mut() = crate::profiles::list(&self.profiles_root());
+    }
+
+    /// 配置页底部那句临时提示（2.6 秒后自己消失）。
+    fn set_profile_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.profile_notice_seq = self.profile_notice_seq.wrapping_add(1);
+        let seq = self.profile_notice_seq;
+        self.profile_notice = Some((text, seq));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(2600))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.profile_notice.as_ref().is_some_and(|(_, id)| *id == seq) {
+                    this.profile_notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 「多久之前」：档列表用这个代替完整日期（这里不引时间库）。
+    fn profile_age(age: Option<u64>, lang: Lang) -> String {
+        let Some(age) = age else {
+            return String::new();
+        };
+        if age < 60 {
+            return lang.pick("刚刚", "just now").to_string();
+        }
+        if age < 3600 {
+            let n = age / 60;
+            return if lang.is_en() {
+                format!("{n} min ago")
+            } else {
+                format!("{n} 分钟前")
+            };
+        }
+        if age < 86_400 {
+            let n = age / 3600;
+            return if lang.is_en() {
+                format!("{n} h ago")
+            } else {
+                format!("{n} 小时前")
+            };
+        }
+        let n = age / 86_400;
+        if lang.is_en() {
+            format!("{n} d ago")
+        } else {
+            format!("{n} 天前")
+        }
+    }
+
+    /// 配置页的一个窄按钮。`primary` 是强调色那颗（「启用」），`enabled` 决定能不能点。
+    fn profile_chip(
+        &self,
+        id: String,
+        label: &str,
+        primary: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let lit = primary && enabled;
+        let base = div()
+            .id(SharedString::from(id))
+            .flex_none()
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .text_size(theme::fs(11.))
+            .bg(if lit { theme::accent() } else { theme::track() })
+            .text_color(if lit {
+                theme::text_primary()
+            } else if enabled {
+                theme::text_secondary()
+            } else {
+                theme::text_tertiary()
+            })
+            .child(label.to_string());
+        if !enabled {
+            return base.into_any_element();
+        }
+        base.cursor_pointer()
+            .hover(|style| style.opacity(0.88))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                action(this, window, cx)
+            }))
+            .into_any_element()
+    }
+
+    /// 主配置那一行：它永远在用，只能导出。
+    fn main_profile_row(&self, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
+        let source = PathBuf::from(self.config_path.as_ref());
+        let name = PathBuf::from(self.config_path.as_ref())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.json")
+            .to_string();
+        let export = self.profile_chip(
+            "profile-main-export".into(),
+            lang.pick("导出…", "Export…"),
+            false,
+            true,
+            cx,
+            move |this, window, cx| {
+                this.export_profile(source.clone(), "config.json".to_string(), window, cx)
+            },
+        );
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(9.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_ROW))
+            .bg(theme::track())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(theme::fs(12.))
+                            .text_color(theme::text_primary())
+                            .child(lang.pick("主配置", "Main config")),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .truncate()
+                            .text_size(theme::fs(10.))
+                            .text_color(theme::text_tertiary())
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(theme::RADIUS_SMALL))
+                            .bg(theme::accent_soft())
+                            .text_size(theme::fs(9.5))
+                            .text_color(theme::accent())
+                            .child(lang.pick("正在使用", "In use")),
+                    ),
+            )
+            .child(export)
+            .into_any_element()
+    }
+
+    /// 一份副配置：名字（点一下就地改名）+ 多久之前 + 四个动作。
+    fn profile_row(
+        &self,
+        profile: &crate::profiles::Profile,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = profile.path.clone();
+        let renaming = matches!(&self.profile_rename, Some((target, _)) if *target == path);
+        let pending_delete = self.profile_pending_delete.as_deref() == Some(path.as_path());
+        // 有未保存的改动时不许切：切档是整份替换，那些改动会静默消失。
+        let dirty = self.config.borrow().is_dirty();
+        let key = path.display().to_string();
+
+        let title = match (&self.profile_rename, renaming) {
+            (Some((_, buffer)), true) => format!("{buffer}▏"),
+            _ => profile.name.clone(),
+        };
+        let rename_path = path.clone();
+        let name = div()
+            .id(SharedString::from(format!("profile-name-{key}")))
+            .flex_1()
+            .min_w(px(0.))
+            .truncate()
+            .text_size(theme::fs(12.))
+            .text_color(theme::text_primary())
+            .cursor_pointer()
+            .when(renaming, |style| {
+                style
+                    .px(px(4.))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(theme::track())
+            })
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.begin_profile_rename(rename_path.clone(), window, cx)
+            }))
+            .child(title);
+
+        let age = div()
+            .flex_none()
+            .text_size(theme::fs(10.))
+            .text_color(theme::text_tertiary())
+            .child(Self::profile_age(profile.age_secs(), lang));
+
+        let activate_path = path.clone();
+        let activate = self.profile_chip(
+            format!("profile-activate-{key}"),
+            lang.pick("启用", "Use"),
+            true,
+            !dirty,
+            cx,
+            move |this, window, cx| this.activate_profile(activate_path.clone(), window, cx),
+        );
+
+        let rename_path = path.clone();
+        let rename = self.profile_chip(
+            format!("profile-rename-{key}"),
+            lang.pick("改名", "Rename"),
+            false,
+            true,
+            cx,
+            move |this, window, cx| this.begin_profile_rename(rename_path.clone(), window, cx),
+        );
+
+        let export_path = path.clone();
+        let export_name = format!("{}.json", profile.name);
+        let export = self.profile_chip(
+            format!("profile-export-{key}"),
+            lang.pick("导出…", "Export…"),
+            false,
+            true,
+            cx,
+            move |this, window, cx| {
+                this.export_profile(export_path.clone(), export_name.clone(), window, cx)
+            },
+        );
+
+        let delete_path = path.clone();
+        let delete = self.profile_chip(
+            format!("profile-delete-{key}"),
+            lang.pick("删除", "Delete"),
+            false,
+            true,
+            cx,
+            move |this, window, cx| this.delete_profile(delete_path.clone(), window, cx),
+        );
+        // 待确认的那颗要自己画：红字 + 还能点（改完样式换了元素，别把点击丢掉）。
+        let confirm_delete = {
+            let again = path.clone();
+            div()
+                .id(SharedString::from(format!("profile-delete-confirm-{key}")))
+                .flex_none()
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(theme::RADIUS_SMALL))
+                .bg(theme::track())
+                .text_size(theme::fs(11.))
+                .text_color(theme::danger())
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.88))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.delete_profile(again.clone(), window, cx)
+                }))
+                .child(lang.pick("再点一次确认", "Click again to delete"))
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(9.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_ROW))
+            .when(pending_delete, |style| style.bg(theme::track()))
+            .child(name)
+            .child(age)
+            .child(activate)
+            .child(rename)
+            .child(export)
+            .child(if pending_delete {
+                confirm_delete
+            } else {
+                delete
+            })
+            .into_any_element()
+    }
+
+    fn profiles_page(&self, lang: Lang, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let profiles = self.profiles.borrow().clone();
+        let dirty = self.config.borrow().is_dirty();
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        rows.push(
+            div()
+                .px(px(9.))
+                .py(px(2.))
+                .text_size(theme::fs(10.5))
+                .text_color(theme::text_tertiary())
+                .child(lang.pick(
+                    "主配置永远是程序目录下的 config.json。下面每一份都放在 Configs 文件夹里，点「启用」就整份换过来、立刻生效，也会留在主配置里。",
+                    "The main config is always config.json next to the program. Every profile below lives in the Configs folder; “Use” swaps it in whole, applies it right away and keeps it as the main config.",
+                ))
+                .into_any_element(),
+        );
+        rows.push(self.main_profile_row(lang, cx));
+
+        rows.push(
+            div()
+                .h(px(1.))
+                .flex_none()
+                .my(px(2.))
+                .mx(px(6.))
+                .bg(theme::border())
+                .into_any_element(),
+        );
+
+        if profiles.is_empty() {
+            rows.push(
+                div()
+                    .px(px(9.))
+                    .py(px(6.))
+                    .text_size(theme::fs(11.))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick(
+                        "还没有别的配置。点「新建」把当前这套存一份，或者把 .json 文件拖进来。",
+                        "No other profiles yet. Use New to save the current setup, or drop a .json file here.",
+                    ))
+                    .into_any_element(),
+            );
+        } else {
+            for profile in &profiles {
+                rows.push(self.profile_row(profile, lang, cx));
+            }
+        }
+
+        // 新建时就在列表底下多一行输入框：敲名字、回车。
+        if let Some(buffer) = self.profile_new.as_ref() {
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(9.))
+                    .py(px(4.))
+                    .rounded(px(theme::RADIUS_ROW))
+                    .bg(theme::accent_soft())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .px(px(4.))
+                            .rounded(px(theme::RADIUS_SMALL))
+                            .bg(theme::track())
+                            .text_size(theme::fs(12.))
+                            .text_color(theme::text_primary())
+                            .child(format!("{buffer}▏")),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(theme::fs(10.))
+                            .text_color(theme::text_secondary())
+                            .child(lang.pick("回车保存 · Esc 取消", "Enter to save · Esc to cancel")),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let new_lang = lang;
+        let new_button = self.profile_chip(
+            "profile-new".into(),
+            lang.pick("＋ 新建", "＋ New"),
+            false,
+            self.profile_new.is_none(),
+            cx,
+            move |this, window, cx| this.begin_profile_new(new_lang, window, cx),
+        );
+        let import = self.profile_chip(
+            "profile-import".into(),
+            lang.pick("导入…", "Import…"),
+            false,
+            true,
+            cx,
+            |this, window, cx| this.import_dialog(window, cx),
+        );
+        let mut actions = div().flex().items_center().gap(px(8.)).px(px(9.)).pt(px(2.)).child(new_button);
+        actions = actions.child(import);
+        if dirty {
+            actions = actions.child(
+                div()
+                    .flex_1()
+                    .text_size(theme::fs(10.))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick(
+                        "有未保存的更改：先应用或保存，才能切配置",
+                        "Unsaved changes: apply or save before switching",
+                    )),
+            );
+        }
+        rows.push(actions.into_any_element());
+
+        let card = self.section(lang.pick("配置档", "Profiles"), "levels", rows);
+        // 拖拽整页都能接：系统把文件拖进来时只有「拖到窗口里」这一个事件，
+        // 挂在卡片上更准，挂整页则不会因为正好落在说明文字上就丢掉。
+        vec![
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .on_drop::<gpui::ExternalPaths>(cx.listener(
+                    |this, paths: &gpui::ExternalPaths, window, cx| {
+                        let files: Vec<PathBuf> = paths.paths().to_vec();
+                        this.import_files(files, window, cx);
+                    },
+                ))
+                .child(card)
+                .into_any_element(),
+        ]
+    }
+
+    /// 点「新建」：列表底下多一行输入框，默认名已经填好。
+    fn begin_profile_new(&mut self, lang: Lang, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_rename = None;
+        self.profile_pending_delete = None;
+        let stem = lang.pick("配置", "Config");
+        let taken: Vec<String> = self
+            .profiles
+            .borrow()
+            .iter()
+            .map(|profile| profile.name.to_lowercase())
+            .collect();
+        let mut candidate = stem.to_string();
+        let mut n = 2;
+        while taken.contains(&candidate.to_lowercase()) {
+            candidate = format!("{stem} {n}");
+            n += 1;
+        }
+        self.profile_new = Some(candidate);
+        refresh_ui(window, cx);
+    }
+
+    /// 点名字开始改名（缓冲从当前名字开始，省得重打）。
+    fn begin_profile_rename(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .profiles
+            .borrow()
+            .iter()
+            .find(|profile| profile.path == path)
+            .cloned()
+        else {
+            return;
+        };
+        self.profile_new = None;
+        self.profile_pending_delete = None;
+        self.profile_rename = Some((path, profile.name));
+        refresh_ui(window, cx);
+    }
+
+    fn commit_profile_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile_new.is_some() {
+            self.commit_profile_new(window, cx);
+        } else {
+            self.commit_profile_rename(window, cx);
+        }
+    }
+
+    fn commit_profile_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(buffer) = self.profile_new.take() else {
+            return;
+        };
+        let lang = self.config.borrow().get().language;
+        let name = crate::profiles::clean_name(&buffer);
+        if name.is_empty() {
+            // 空名字不收，留着他接着打。
+            self.profile_new = Some(buffer);
+            self.set_profile_notice(
+                lang.pick("名字不能为空", "Name cannot be empty").to_string(),
+                cx,
+            );
+            return;
+        }
+        self.profile_pending_delete = None;
+        let config = self.config.borrow().get().clone();
+        match crate::profiles::create(&self.profiles_root(), &name, &config) {
+            Ok(path) => {
+                self.reload_profiles();
+                let saved = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&name)
+                    .to_string();
+                let text = if lang.is_en() {
+                    format!("Saved {saved}")
+                } else {
+                    format!("已保存 {saved}")
+                };
+                self.set_profile_notice(text, cx);
+            }
+            Err(error) => self.set_profile_notice(error.to_string(), cx),
+        }
+        refresh_ui(window, cx);
+    }
+
+    fn commit_profile_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, buffer)) = self.profile_rename.take() else {
+            return;
+        };
+        let lang = self.config.borrow().get().language;
+        match crate::profiles::rename(&path, &buffer) {
+            Ok(_) => {
+                self.reload_profiles();
+                self.set_profile_notice(lang.pick("已改名", "Renamed").to_string(), cx);
+            }
+            Err(error) if error == "empty name" => {
+                self.profile_rename = Some((path, buffer));
+                self.set_profile_notice(
+                    lang.pick("名字不能为空", "Name cannot be empty").to_string(),
+                    cx,
+                );
+                refresh_ui(window, cx);
+                return;
+            }
+            Err(error) if error == "exists" => {
+                self.set_profile_notice(
+                    lang.pick("已经有同名的配置了", "A profile with that name exists")
+                        .to_string(),
+                    cx,
+                );
+            }
+            Err(error) => self.set_profile_notice(error.to_string(), cx),
+        }
+        refresh_ui(window, cx);
+    }
+
+    /// 「启用」：把这一档整份装进主配置，立刻生效。
+    fn activate_profile(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lang = self.config.borrow().get().language;
+        if self.config.borrow().is_dirty() {
+            self.set_profile_notice(
+                lang.pick(
+                    "先应用或保存当前更改，再切配置",
+                    "Apply or save your changes before switching",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        let source = match crate::profiles::read(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                let text = if lang.is_en() {
+                    format!("Cannot read this profile: {error}")
+                } else {
+                    format!("这份配置读不进来：{error}")
+                };
+                self.set_profile_notice(text, cx);
+                return;
+            }
+        };
+        let before = self.config.borrow().get().clone();
+        let installed = self
+            .config
+            .borrow_mut()
+            .install(&source, &UNTOUCHED_FIELDS);
+        if let Err(error) = installed {
+            self.set_profile_notice(error.to_string(), cx);
+            return;
+        }
+        let after = self.config.borrow().get().clone();
+        // 切过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
+        let autostart_changed = Self::fields_differ(
+            &before,
+            &after,
+            Some(&["launch_at_login", "launch_method", "run_as_admin"]),
+        );
+        self.profile_rename = None;
+        self.profile_new = None;
+        self.profile_pending_delete = None;
+        self.close_transient_popups();
+        self.apply_everything(&after, None, autostart_changed, window, cx);
+        self.reload_profiles();
+        let lang = after.language;
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let text = if lang.is_en() {
+            format!("Switched to {name}")
+        } else {
+            format!("已切换到 {name}")
+        };
+        self.set_profile_notice(text, cx);
+    }
+
+    /// 删除：点第一次只是变成「确认删除」，再点一次才真删。
+    fn delete_profile(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile_pending_delete.as_deref() != Some(path.as_path()) {
+            self.profile_rename = None;
+            self.profile_pending_delete = Some(path);
+            refresh_ui(window, cx);
+            return;
+        }
+        let lang = self.config.borrow().get().language;
+        self.profile_pending_delete = None;
+        match crate::profiles::remove(&path) {
+            Ok(()) => {
+                self.reload_profiles();
+                self.set_profile_notice(lang.pick("已删除", "Deleted").to_string(), cx);
+            }
+            Err(error) => self.set_profile_notice(error.to_string(), cx),
+        }
+        refresh_ui(window, cx);
+    }
+
+    /// 导出：弹「另存为」，挑好位置再写。
+    ///
+    /// 主配置导出的是**内存里这一份**（含还没落盘的草稿），副配置导的是文件本身。
+    fn export_profile(
+        &mut self,
+        source: PathBuf,
+        default_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = crate::windows::platform::hwnd_of(window)
+            .map(|hwnd| hwnd.0 as isize)
+            .unwrap_or(0);
+        let receiver = crate::platform::app_pick::save_json_async(owner, &default_name);
+        let is_main = source == PathBuf::from(self.config_path.as_ref());
+        let live = self.config.borrow().get().clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(picked) = receiver.recv().await else {
+                return;
+            };
+            let Some(picked) = picked else {
+                return;
+            };
+            let dest = PathBuf::from(picked);
+            let outcome = if is_main {
+                crate::profiles::write(&dest, &live)
+            } else {
+                crate::profiles::export(&source, &dest)
+            };
+            let _ = this.update(cx, |this, cx| {
+                let lang = this.config.borrow().get().language;
+                match outcome {
+                    Ok(()) => {
+                        this.set_profile_notice(lang.pick("已导出", "Exported").to_string(), cx)
+                    }
+                    Err(error) => this.set_profile_notice(error.to_string(), cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 「导入…」：选文件。
+    fn import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = crate::windows::platform::hwnd_of(window)
+            .map(|hwnd| hwnd.0 as isize)
+            .unwrap_or(0);
+        let receiver = crate::platform::app_pick::pick_json_async(owner);
+        cx.spawn(async move |this, cx| {
+            let Ok(picked) = receiver.recv().await else {
+                return;
+            };
+            let Some(picked) = picked else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.import_files(vec![PathBuf::from(picked)], window, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// 导入一批文件（拖进来的也可能不止一个）。
+    fn import_files(&mut self, files: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let lang = self.config.borrow().get().language;
+        let root = self.profiles_root();
+        let mut done = 0usize;
+        let mut first_error: Option<String> = None;
+        for file in files {
+            match crate::profiles::import(&root, &file) {
+                Ok(_) => done += 1,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if done > 0 {
+            self.reload_profiles();
+            self.profile_pending_delete = None;
+            let text = if lang.is_en() {
+                format!("Imported {done} profile(s)")
+            } else {
+                format!("已导入 {done} 份配置")
+            };
+            self.set_profile_notice(text, cx);
+        } else if let Some(error) = first_error {
+            let text = if lang.is_en() {
+                format!("Import failed: {error}")
+            } else {
+                format!("导入失败：{error}")
+            };
+            self.set_profile_notice(text, cx);
+        }
+        refresh_ui(window, cx);
+    }
+
+    /// 配置页的键盘：改名 / 新建时按键都属于名字。
+    fn handle_profile_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.profile_rename.is_none() && self.profile_new.is_none() {
+            return false;
+        }
+        // 输入法正在拼字：这些键交给输入法。
+        if self.text_marked.is_some() {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        if key == "enter" {
+            cx.stop_propagation();
+            self.commit_profile_edit(window, cx);
+            return true;
+        }
+        if key == "escape" {
+            cx.stop_propagation();
+            self.profile_rename = None;
+            self.profile_new = None;
+            self.text_marked = None;
+            refresh_ui(window, cx);
+            return true;
+        }
+        if key == "backspace" {
+            cx.stop_propagation();
+            self.backspace_text_edit(cx);
+            return true;
+        }
+        if key == "v" && event.keystroke.modifiers.control {
+            cx.stop_propagation();
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text().map(|text| text.to_string()));
+            if let Some(text) = text {
+                self.insert_rename_text(&text);
+                refresh_ui(window, cx);
+            }
+            return true;
+        }
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+            return false;
+        }
+        if let Some(text) = event.keystroke.key_char.as_ref() {
+            cx.stop_propagation();
+            self.insert_rename_text(text);
+            refresh_ui(window, cx);
+            return true;
+        }
+        false
+    }
+
     fn about_page(&self, lang: Lang, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let row = |title: &'static str, value: String| -> AnyElement {
             div()
@@ -14719,20 +15594,30 @@ impl Settings {
                             "restore-page",
                             lang.pick("恢复本页更改", "Revert this page").to_string(),
                             page_changed,
-                            Restore {
-                                factory: false,
-                                whole: false,
-                            },
+                            Restore::revert(false),
                             cx,
                         ))
                         .child(self.restore_item(
                             "restore-all",
                             lang.pick("恢复全部更改", "Revert all pages").to_string(),
                             all_changed,
-                            Restore {
-                                factory: false,
-                                whole: true,
-                            },
+                            Restore::revert(true),
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .h(px(1.))
+                                .flex_none()
+                                .my(px(4.))
+                                .mx(px(6.))
+                                .bg(theme::border()),
+                        )
+                        .child(caption(lang.pick("从备份导入", "Import from backup")))
+                        .child(self.restore_item(
+                            "import-page",
+                            lang.pick("只替换本页配置…", "Replace this page only…").to_string(),
+                            page_has_fields,
+                            Restore::IMPORT,
                             cx,
                         ))
                         .child(
@@ -14748,20 +15633,14 @@ impl Settings {
                             "reset-page",
                             lang.pick("本页恢复出厂设置", "Reset this page").to_string(),
                             page_has_fields,
-                            Restore {
-                                factory: true,
-                                whole: false,
-                            },
+                            Restore::factory(false),
                             cx,
                         ))
                         .child(self.restore_item(
                             "reset-all",
                             lang.pick("全部恢复出厂设置", "Reset everything").to_string(),
                             true,
-                            Restore {
-                                factory: true,
-                                whole: true,
-                            },
+                            Restore::factory(true),
                             cx,
                         )),
                 )
@@ -14830,6 +15709,10 @@ impl Settings {
     ///
     /// 只改草稿 —— 屏幕上立刻能看到结果（预览），但要按「应用 / 保存」才写进文件。
     fn restore(&mut self, what: Restore, window: &mut Window, cx: &mut Context<Self>) {
+        if what.from_file {
+            self.import_page_from_file(window, cx);
+            return;
+        }
         let page = self.page;
         let source = if what.factory {
             Config::default()
@@ -14872,13 +15755,76 @@ impl Settings {
         self.apply_everything(&config, scope, false, window, cx);
     }
 
+    /// 菜单里那条「只替换本页配置」：挑一份整份备份，只把属于本页的字段搬进草稿。
+    ///
+    /// 和「恢复本页」是同一套动作，只是参照点换成了用户手里的文件 ——
+    /// 别人发来一份调好的配置，只想借它「外观」这一页，就用这个。
+    fn import_page_from_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let page = self.page;
+        let keys = page_fields(page);
+        if keys.is_empty() {
+            return;
+        }
+        let owner = crate::windows::platform::hwnd_of(window)
+            .map(|hwnd| hwnd.0 as isize)
+            .unwrap_or(0);
+        let receiver = crate::platform::app_pick::pick_json_async(owner);
+        cx.spawn(async move |this, cx| {
+            let Ok(picked) = receiver.recv().await else {
+                return;
+            };
+            let Some(picked) = picked else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.restore_menu_open = false;
+                let lang = this.config.borrow().get().language;
+                let source = match crate::profiles::read(&PathBuf::from(&picked)) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        let text = if lang.is_en() {
+                            format!("Cannot read this file: {error}")
+                        } else {
+                            format!("这份文件读不进来：{error}")
+                        };
+                        this.set_profile_notice(text, cx);
+                        refresh_ui(window, cx);
+                        return;
+                    }
+                };
+                let applied = this
+                    .config
+                    .borrow_mut()
+                    .edit_draft(&source, Some(keys), &UNTOUCHED_FIELDS);
+                if applied {
+                    this.close_transient_popups();
+                    let config = this.config.borrow().get().clone();
+                    this.apply_everything(&config, Some(page), false, window, cx);
+                    let text = lang
+                        .pick("已导入本页配置", "Imported this page")
+                        .to_string();
+                    this.set_profile_notice(text, cx);
+                } else {
+                    let text = lang
+                        .pick("这份文件里这一页和现在一样", "Nothing to import for this page")
+                        .to_string();
+                    this.set_profile_notice(text, cx);
+                }
+                refresh_ui(window, cx);
+            });
+        })
+        .detach();
+    }
+
     /// 页面底部那条「应用 / 保存」：草稿模式的出口。
     fn apply_bar(&self, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
         let dirty = self.config.borrow().is_dirty();
-        let hint = if dirty {
-            lang.pick("有未保存的更改", "Unsaved changes")
-        } else {
-            ""
+        // 临时提示（导入成功之类）借用底栏这块地方：任何一页都看得见，
+        // 不用为一句「已导入」再开一条状态栏。
+        let hint = match &self.profile_notice {
+            Some((text, _)) => text.clone(),
+            None if dirty => lang.pick("有未保存的更改", "Unsaved changes").to_string(),
+            None => String::new(),
         };
         div()
             .h(px(40.))
@@ -15226,6 +16172,7 @@ impl Settings {
             Page::Shortcuts => self.shortcuts_page(config, lang, cx),
             Page::Osd => self.osd_page(config, lang, cx),
             Page::Blocklist => self.blocklist_page(config, lang, cx),
+            Page::Profiles => self.profiles_page(lang, cx),
             Page::About => self.about_page(lang, cx),
         };
         let body = div()
@@ -15414,6 +16361,10 @@ impl Render for Settings {
                 }
                 // 应用音量名单里的就地输入（数字）。
                 if this.handle_app_edit_key(event, window, cx) {
+                    return;
+                }
+                // 配置页：改名 / 新建时就地输入。
+                if this.handle_profile_key(event, window, cx) {
                     return;
                 }
                 // 色号输入框：这时候按键是十六进制字符，不是快捷键。

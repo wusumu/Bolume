@@ -84,6 +84,13 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 
 - 改动先留在窗口里：底部「应用」写进配置但不关窗，「保存」写进配置并关窗；直接点关闭会问保存 / 不保存 / 取消
 - 标题栏右上角的三横杠是恢复：`恢复本页更改` / `恢复全部更改`（退回上一次生效的样子）、`本页恢复出厂设置` / `全部恢复出厂设置`；恢复完同样要点「应用」才落盘，点错了可以再恢复回来
+- 同一份三横杠菜单里还能 `只替换本页配置…`：挑一份备份的 `config.json`，只把这**一页**负责的那几个字段搬进当前草稿，其它页不动
+
+**配置档**
+
+- `配置` 页可以存好几套设置：根目录 `Configs/` 里每个 `.json` 就是一份，主配置仍然是根目录的 `config.json`
+- 新建 / 改名 / 导出 / 导入都在这一页；`.json` 文件直接拖到这一页上也会导入
+- 点某份的「启用」就整份换过来、立刻生效（写进主配置），有未保存的改动时会先拦住
 
 ## 截图
 
@@ -169,6 +176,7 @@ cargo test --release
 
 - `config_rev` 是配置格式版本，程序升级时会自动迁移旧配置
 - 设备名、应用音量上限、黑名单等都记在里面，换机器直接拷这个文件
+- `Configs/` 里放的是副配置（设置页 `配置` 那一页）：每份一个 `.json`，格式和 `config.json` 一模一样，里面缺的字段按默认补齐；点「启用」就是把它整份装进 `config.json`，所以切换完直接生效
 
 ## 目录结构
 
@@ -218,6 +226,8 @@ vendor/
 - Global hotkeys for everything, including media keys taken over through a low-level keyboard hook, hold-to-repeat, and an app blocklist that gets out of the way in fullscreen games
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
 - Edits stay in the window until you press **Apply** (save, keep editing) or **Save** (save and close); closing with pending edits asks save / don't save / cancel. The ≡ menu in the title bar reverts this page or everything, or restores factory defaults, per page or wholesale
+- The same ≡ menu can `Replace this page only…`: pick a backed-up `config.json` and only the fields that page owns are copied into the current draft, nothing else moves
+- Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. Create / rename / export / import there, or just drop a `.json` onto the page; **Use** installs a profile into the main config and applies it immediately
 - Popup animations can follow the system: the panel and the OSD both rise from the bottom edge of the screen from *behind* the taskbar, animated frame-by-frame in sync with the display refresh rate, matching how Windows 11 (and 10) animate their own volume surfaces
 
 Download the latest `Bolume_vX.XX.zip` from [Releases](../../releases), extract anywhere and run `Bolume.exe`. Windows 10/11 x64, no installer, no .NET.
