@@ -170,6 +170,165 @@ impl Page {
     }
 }
 
+/// 每页管哪些顶层配置字段（`Config` 的 serde 字段名）。
+///
+/// 「恢复本页更改 / 本页恢复出厂设置」按这张表动配置：只碰本页能改到的字段，
+/// 别的页一个字都不动。切分照的是设置页的实际归属 ——
+///
+/// - 「常规」页除了自启 / 管理员 / 语言，还带着「启动时套用」那两张卡（`startup`）；
+/// - 「设备」页的两个页签是设备名单与显示器亮度（`brightness`）；
+/// - 外观 / 面板 / 托盘三组本来是同一批卡片拆出来的，这儿的归属照那三组划分；
+/// - 「关于」页没有自己的设置项，清单是空的。
+///
+/// 这里故意不用 `#[serde(flatten)]` 之类的结构化写法：一张平铺的表最容易看懂，
+/// 加字段时也只要在对应那一行补一个名字（测试会盯着「有没有名字没被任何一页收」）。
+fn page_fields(page: Page) -> &'static [&'static str] {
+    match page {
+        Page::General => &[
+            "language",
+            "launch_at_login",
+            "launch_method",
+            "run_as_admin",
+            "startup",
+        ],
+        Page::Devices => &["device_names", "display_names", "device_icons", "brightness"],
+        Page::Appearance => &[
+            "theme_follow_system",
+            "theme_light_surface",
+            "theme_light_accent",
+            "theme_dark_surface",
+            "theme_dark_accent",
+            "theme_surface",
+            "theme_accent",
+            "ui_font_scale",
+            "ui_opacity",
+            "ui_font",
+            "ui_font_weight",
+            "ui_contrast",
+            "ui_motion",
+        ],
+        Page::Volume => &[
+            "use_logarithmic_volume",
+            "logarithmic_min_db",
+            "use_scroll_wheel_in_tray",
+            "use_global_mouse_wheel_hook",
+            "use_scroll_wheel_in_apps",
+            "scroll_wheel_step",
+            "scroll_wheel_in_db",
+            "log_scroll_wheel_step",
+            "release_sound",
+            "release_sound_osd",
+            "volume_cap",
+            "unmute",
+            "volume_sound",
+            "loudness",
+            "app_loudness",
+        ],
+        Page::Panel => &[
+            "hide_on_focus_lost",
+            "show_system_sounds",
+            "sounding_apps_first",
+            "app_sort",
+            "app_names",
+            "hidden_apps",
+            "flyout_width",
+            "panel_bar_thickness",
+            "panel_bar_round",
+            "panel_layout",
+            "vertical_app_names",
+            "vertical_height",
+            "panel_font",
+            "panel_font_size",
+            "panel_letter_spacing",
+            "panel_line_height",
+            "panel_font_weight",
+            "device_name_size",
+            "app_icon_size",
+            "app_name_capitalize",
+            "activity_effect",
+            "popup_animation",
+            "popup_animation_ms",
+            "popup_anim_style",
+            "panel_close_animation",
+            "footer",
+        ],
+        Page::Tray => &[
+            "tray_icon_style",
+            "tray_icon_color",
+            "tray_icon_custom",
+            "tray_color_by_level",
+            "tray_motion",
+            "tray_motion_gain",
+            "tray_number_font",
+            "tray_number_antialias",
+            // `tray_number_size` 不在清单里：它是 rev 67 之前的旧字段，只剩迁移读它，
+            // 而且 `skip_serializing` 让它在 JSON 里根本不存在（搬不过去）。
+            "tray_digit_one",
+            "tray_digit_two",
+            "tray_digit_three",
+            "tray_menu",
+            "tray_menu_style",
+            "tray_menu_max_width",
+            "tooltip",
+        ],
+        Page::Shortcuts => &[
+            "hotkey_flyout",
+            "hotkey_settings",
+            "hotkey_volume_up",
+            "hotkey_volume_down",
+            "hotkey_app_volume_up",
+            "hotkey_app_volume_down",
+            "hotkey_volume_step",
+            "hotkey_volume_follow_log",
+            "hotkey_volume_in_db",
+            "hotkey_app_volume_step",
+            "hotkey_app_volume_follow_log",
+            "hotkey_app_volume_in_db",
+            "hotkey_media_prev",
+            "hotkey_media_next",
+            "hotkey_media_play_pause",
+            "hotkey_media_mute",
+            "hotkey_media_stop",
+            "hotkey_brightness_up",
+            "hotkey_brightness_down",
+            "hotkey_brightness_all_up",
+            "hotkey_brightness_all_down",
+            "hotkey_brightness_monitor_up",
+            "hotkey_brightness_monitor_down",
+            "hotkey_hold_repeat",
+            "hotkey_repeat_interval",
+            "hotkey_repeat_delay",
+            "hotkey_repeat_actions",
+            "hotkey_ignore_system_repeat",
+            "hotkey_numpad_raw",
+        ],
+        Page::Osd => &["osd", "editor_bg", "editor_panel_w"],
+        Page::Blocklist => &["app_block"],
+        Page::About => &[],
+    }
+}
+
+/// 任何一页都不该碰的字段：窗口尺寸是「上次开多大」，跟着重置会把窗口缩掉；
+/// `config_rev` 是配置结构自己的版本，重置后还得是当前这一版。
+const UNTOUCHED_FIELDS: [&str; 3] = ["settings_width", "settings_height", "config_rev"];
+
+/// 关窗确认框里按了哪一颗。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseAnswer {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// 菜单里的「恢复」那一条：恢复出厂还是恢复更改、只动本页还是整份。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Restore {
+    /// `true` = 恢复出厂默认，`false` = 退回到打开设置窗时的样子。
+    factory: bool,
+    /// `true` = 整份配置，`false` = 只动当前这一页。
+    whole: bool,
+}
+
 pub struct Settings {
     config: Rc<RefCell<ConfigStore>>,
     config_path: SharedString,
@@ -331,6 +490,13 @@ pub struct Settings {
     donate_open: bool,
     /// 收款码解码后的图：解一次就留着，浮层重画不用反复解 PNG。
     donate_image: RefCell<Option<Arc<RenderImage>>>,
+    /// 标题栏那个三横杠菜单是不是开着（恢复更改 / 恢复出厂设置都在里面）。
+    restore_menu_open: bool,
+    /// 「有未保存的更改，关掉就没了」那个确认框是不是开着。
+    ///
+    /// 设置页是草稿模式：改了只在内存里，按「应用 / 保存」才落盘。
+    /// 所以点 × 时得先问一句，不然用户以为改好了、关掉才发现全丢了。
+    confirm_close: bool,
 }
 
 /// 往黑名单里加一条的结果。
@@ -1842,6 +2008,9 @@ impl Settings {
         engine: Rc<AudioEngine>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // 设置页开着的时候是「草稿模式」：改动只留内存，按「应用 / 保存」才落盘。
+        // 参照点（`恢复更改` 要退回的那一份）由 `ConfigStore` 自己记。
+        config.borrow_mut().begin_draft();
         Self {
             config,
             config_path: config_path.into(),
@@ -1900,6 +2069,8 @@ impl Settings {
             color_memory: std::collections::HashMap::new(),
             donate_open: false,
             donate_image: RefCell::new(None),
+            restore_menu_open: false,
+            confirm_close: false,
         }
     }
 
@@ -1935,7 +2106,9 @@ impl Settings {
             if generation_handle.get() != generation {
                 return;
             }
-            let _ = store.borrow_mut().update(|config| {
+            // 窗口尺寸不是用户在设置页做的改动：走 `update_now` 立刻落盘，
+            // 不进草稿 —— 否则拖一下窗口就变成「有未保存的更改」，还得按应用才记住。
+            let _ = store.borrow_mut().update_now(|config| {
                 config.settings_width = width;
                 config.settings_height = height;
             });
@@ -6651,8 +6824,23 @@ impl Settings {
     /// 订阅要存在自己身上：`Subscription` 一被 drop 回调就失效了。
     pub fn watch_preview_release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let window_id = window.window_handle().window_id();
+        let store = self.config.clone();
         let sub = cx.on_window_closed(move |cx, closed| {
             if closed == window_id {
+                // 窗口没了，草稿模式也要收：留着的话以后所有写配置都只进内存、
+                // 永远不落盘（托盘菜单里改的东西也会跟着一起丢）。
+                if store.borrow_mut().discard_draft() {
+                    // 预览出去的东西（主题色、托盘图标、面板宽度）退回生效中的那份。
+                    let config = store.borrow().get().clone();
+                    crate::gui::apply_theme_extras(&config);
+                    crate::gui::refresh_tray_icon(cx);
+                    crate::gui::refresh_tray_menu(cx);
+                    crate::gui::sync_tray_motion(cx);
+                    // 锁在屏幕上的那个预览面板要按退回后的配置重排；没开着的就别去
+                    // 预览了 —— 关设置窗时突然蹦一块面板，比不改还怪。
+                    crate::gui::refresh_flyout_size_if_visible(cx);
+                    crate::gui::repaint_windows(cx);
+                }
                 crate::gui::release_osd_pins(cx);
                 crate::gui::release_flyout(cx);
             }
@@ -14449,6 +14637,558 @@ impl Settings {
         )
     }
 
+    /// 标题栏三横杠里那份菜单：恢复更改 / 恢复出厂设置，各自再分「本页 / 全部」。
+    ///
+    /// 四条都只改草稿（内存），要按底下的「应用 / 保存」才落盘。好处是点错了还能
+    /// 撤：参照点一直在，「恢复更改」随时能把草稿退回上一次生效的那一份。
+    fn restore_menu_overlay(
+        &self,
+        config: &Config,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.restore_menu_open {
+            return None;
+        }
+        let base = self.config.borrow().draft_base().cloned();
+        let page_changed = base
+            .as_ref()
+            .is_some_and(|base| Self::fields_differ(config, base, page_fields(self.page)));
+        let all_changed = self.config.borrow().is_dirty();
+
+        // 菜单宽度给一个够用的定值：中文 / 英文的字宽差一倍，量不出一个通用的。
+        let width = 208.0_f32;
+        // 三颗窗口按钮各 24、间距 8、右边距 14：菜单右边缘对齐三横杠的右边缘，
+        // 于是它正好「挂」在那颗按钮下面，不会顶到屏幕外。
+        let right = 14.0 + 24.0 * 3.0 + 8.0 * 3.0;
+
+        let caption = |text: &'static str| {
+            div()
+                .px(px(10.))
+                .pt(px(6.))
+                .pb(px(2.))
+                .text_size(theme::fs(10.))
+                .text_color(theme::text_tertiary())
+                .child(text)
+        };
+
+        Some(
+            div()
+                .id("restore-menu-backdrop")
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size_full()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        this.restore_menu_open = false;
+                        window.refresh();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("restore-menu-panel")
+                        .absolute()
+                        .right(px(right))
+                        .top(px(44.))
+                        .w(px(width))
+                        .flex()
+                        .flex_col()
+                        .p(px(5.))
+                        .rounded(px(theme::RADIUS_ROW))
+                        .border_1()
+                        .border_color(theme::border_strong())
+                        .bg(theme::surface_elevated())
+                        // 点在面板上不算「点空白处」，否则点一下就关了。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation()
+                            }),
+                        )
+                        .child(caption(lang.pick("恢复更改", "Revert changes")))
+                        .child(self.restore_item(
+                            "restore-page",
+                            lang.pick("恢复本页更改", "Revert this page").to_string(),
+                            page_changed,
+                            Restore {
+                                factory: false,
+                                whole: false,
+                            },
+                            cx,
+                        ))
+                        .child(self.restore_item(
+                            "restore-all",
+                            lang.pick("恢复全部更改", "Revert all pages").to_string(),
+                            all_changed,
+                            Restore {
+                                factory: false,
+                                whole: true,
+                            },
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .h(px(1.))
+                                .flex_none()
+                                .my(px(4.))
+                                .mx(px(6.))
+                                .bg(theme::border()),
+                        )
+                        .child(caption(lang.pick("恢复出厂设置", "Factory reset")))
+                        .child(self.restore_item(
+                            "reset-page",
+                            lang.pick("本页恢复出厂设置", "Reset this page").to_string(),
+                            true,
+                            Restore {
+                                factory: true,
+                                whole: false,
+                            },
+                            cx,
+                        ))
+                        .child(self.restore_item(
+                            "reset-all",
+                            lang.pick("全部恢复出厂设置", "Reset everything").to_string(),
+                            true,
+                            Restore {
+                                factory: true,
+                                whole: true,
+                            },
+                            cx,
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 菜单里的一行。`enabled` = 这一条现在有东西可撤（没改过就点不动）。
+    fn restore_item(
+        &self,
+        id: &'static str,
+        label: String,
+        enabled: bool,
+        what: Restore,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let color = if enabled {
+            theme::text_primary()
+        } else {
+            theme::text_tertiary()
+        };
+        div()
+            .id(SharedString::from(id))
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .flex()
+            .items_center()
+            .text_size(theme::fs(12.))
+            .text_color(color)
+            .when(enabled, |style| {
+                style
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+            })
+            // 浮层里的行一律挂在按下阶段：`on_click` 会被背板的 `occlude` 吃掉。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    if !enabled {
+                        return;
+                    }
+                    this.restore(what, window, cx);
+                }),
+            )
+            .child(label)
+            .into_any_element()
+    }
+
+    /// `a` 和 `b` 在 `keys` 这些字段上有没有差别（`keys` 空 = 整份比）。
+    ///
+    /// 只是给菜单决定「这一条能不能点」，顺手比一遍 JSON 就够 ——
+    /// `Config` 没派生 `PartialEq`，为了这个去补一个也不值当。
+    fn fields_differ(a: &Config, b: &Config, keys: &[&str]) -> bool {
+        let (Ok(a), Ok(b)) = (serde_json::to_value(a), serde_json::to_value(b)) else {
+            return true;
+        };
+        if keys.is_empty() {
+            return a != b;
+        }
+        keys.iter().any(|key| a.get(*key) != b.get(*key))
+    }
+
+    /// 执行一条恢复：退回到上一次生效的配置，或者退回出厂默认；范围本页或全部。
+    ///
+    /// 只改草稿 —— 屏幕上立刻能看到结果（预览），但要按「应用 / 保存」才写进文件。
+    fn restore(&mut self, what: Restore, window: &mut Window, cx: &mut Context<Self>) {
+        let page = self.page;
+        let source = if what.factory {
+            Config::default()
+        } else {
+            match self.config.borrow().draft_base().cloned() {
+                Some(base) => base,
+                // 没在草稿模式里（理论上不会）：没什么可退的。
+                None => return,
+            }
+        };
+        let keys: &[&str] = if what.whole {
+            &[]
+        } else {
+            page_fields(page)
+        };
+        let applied = self
+            .config
+            .borrow_mut()
+            .edit_draft(&source, keys, &UNTOUCHED_FIELDS);
+
+        self.restore_menu_open = false;
+        if !applied {
+            window.refresh();
+            cx.notify();
+            return;
+        }
+        self.close_transient_popups();
+        let config = self.config.borrow().get().clone();
+        let scope = if what.whole { None } else { Some(page) };
+        // 预览不碰系统里的自启登记（那条删了再建、没提权就建不回来）。
+        self.apply_everything(&config, scope, false, window, cx);
+    }
+
+    /// 页面底部那条「应用 / 保存」：草稿模式的出口。
+    fn apply_bar(&self, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
+        let dirty = self.config.borrow().is_dirty();
+        let hint = if dirty {
+            lang.pick("有未保存的更改", "Unsaved changes")
+        } else {
+            ""
+        };
+        div()
+            .h(px(40.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(14.))
+            .border_t_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(theme::fs(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(hint),
+            )
+            .child(
+                div()
+                    .id("settings-apply")
+                    .px(px(12.))
+                    .py(px(4.))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(theme::track())
+                    .text_size(theme::fs(11.5))
+                    .text_color(if dirty {
+                        theme::text_secondary()
+                    } else {
+                        theme::text_tertiary()
+                    })
+                    .when(dirty, |style| {
+                        style
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::surface_hover()))
+                    })
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        if this.config.borrow().is_dirty() {
+                            this.save_draft(false, window, cx);
+                        }
+                    }))
+                    .child(lang.pick("应用", "Apply")),
+            )
+            .child(
+                div()
+                    .id("settings-save")
+                    .px(px(12.))
+                    .py(px(4.))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .bg(if dirty {
+                        theme::accent()
+                    } else {
+                        theme::track()
+                    })
+                    .text_size(theme::fs(11.5))
+                    .text_color(if dirty {
+                        theme::text_primary()
+                    } else {
+                        theme::text_tertiary()
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.88))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.save_draft(true, window, cx)
+                    }))
+                    .child(lang.pick("保存", "Save")),
+            )
+            .into_any_element()
+    }
+
+    /// 「应用 / 保存」：草稿写进文件，再把各子系统推一遍。
+    ///
+    /// `close` = 保存完顺手关窗（「保存」按钮）；否则留在原页（「应用」）。
+    fn save_draft(&mut self, close: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // 先把还挂在输入框里的东西落进草稿：gpui 是「最上面的元素先收到事件」，
+        // 点在「保存」上时根节点那个「点别处就提交」还没轮到，不补这一下，
+        // 最后一次输入（数值 / 改名 / 提示文字）会漏掉。
+        self.blur_rename(window, cx);
+        self.commit_osd_text(window, cx);
+        self.commit_tooltip_edit(window, cx);
+        self.commit_app_edit(window, cx);
+        self.commit_edit(window, cx);
+
+        // 自启那三项动过才去改系统登记：别的项（颜色、字体……）不该连带把任务
+        // 删了重建一遍。
+        let autostart_changed = {
+            let store = self.config.borrow();
+            store.draft_base().is_none_or(|base| {
+                Self::fields_differ(
+                    store.get(),
+                    base,
+                    &["launch_at_login", "launch_method", "run_as_admin"],
+                )
+            })
+        };
+
+        let _ = self.config.borrow_mut().commit_draft();
+        let config = self.config.borrow().get().clone();
+        self.apply_everything(&config, None, autostart_changed, window, cx);
+        if close {
+            self.close_window(window, cx);
+        } else {
+            window.refresh();
+            cx.notify();
+        }
+    }
+
+    /// 把一份配置推到各个子系统。
+    ///
+    /// 平时是「改一项顺手推一次」，这里是一次换掉一整页（或者整份），所以得推全：
+    /// 否则托盘图标 / 快捷键 / 主题会停在旧值上，看着像没生效。
+    /// `scope` 限定只在某一页动过时跳过有副作用的那几项（亮度会真去写显示器）。
+    fn apply_everything(
+        &mut self,
+        config: &Config,
+        scope: Option<Page>,
+        sync_autostart: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let touches = |page: Page| scope.is_none_or(|only| only == page);
+        crate::platform::hotkey::apply_config(config);
+        crate::gui::apply_theme_extras(config);
+        crate::gui::refresh_tray_icon(cx);
+        crate::gui::refresh_tray_menu(cx);
+        crate::gui::sync_tray_motion(cx);
+        crate::gui::refresh_volume_cap(cx);
+        // 只在面板开着时重排：这里是一次换掉一整页（甚至整份），按「调宽度」那条走
+        // 会把面板预览出来 —— 点一下恢复菜单就蹦一块面板，用户不知道哪来的。
+        crate::gui::refresh_flyout_size_if_visible(cx);
+        crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
+        if touches(Page::Volume) {
+            crate::gui::refresh_loudness(cx);
+        }
+        if touches(Page::Devices) {
+            // 亮度：配置里那份是「上次写下的值」，刷新一次让显示器那边重新对表。
+            crate::gui::refresh_displays(cx);
+            crate::gui::refresh_brightness(cx);
+        }
+        if touches(Page::General) && sync_autostart {
+            // 自启是系统里的登记，不是配置里一个布尔：开着就按当前这份重登记，
+            // 关着就把两档一起撤干净（`set_enabled` 自己管互斥）。
+            //
+            // 只在这一项真变过的时候动系统：`set_enabled` 是先删再建，没提权时
+            // 建不回去会顺手立一个「需要管理员」的招牌 —— 为了改个颜色就弹这条
+            // 提示纯属误伤。「恢复」那种预览更是一次都不碰。
+            crate::platform::autostart::set_enabled(
+                config.launch_method,
+                config.launch_at_login,
+                config.run_as_admin,
+            );
+        }
+        repaint_theme(window, cx);
+    }
+
+    /// 配置整块换掉之后，依附在具体控件上的弹层全收掉。
+    ///
+    /// 设备下拉、图标选择器、字体列表、色轮都是按「点在哪一行」定位的，
+    /// 那一行可能刚被恢复成别的样子，留着就是个悬空浮层。
+    fn close_transient_popups(&mut self) {
+        self.picker = None;
+        self.icon_picker = None;
+        self.font_menu = None;
+        self.font_pending_scroll = None;
+        self.color_wheel = None;
+        self.tray_menu_open = false;
+        self.donate_open = false;
+        self.capturing = None;
+    }
+
+    /// 点 × 的处理：有没保存的改动先问一句，没有就直接关。
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.borrow().is_dirty() {
+            self.confirm_close = true;
+            window.refresh();
+            cx.notify();
+        } else {
+            self.close_window(window, cx);
+        }
+    }
+
+    /// 真关窗：草稿模式到此结束（没提交的改动丢掉），窗口自己会触发清理订阅。
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.config.borrow_mut().discard_draft();
+        window.remove_window();
+        let _ = cx;
+    }
+
+    /// 「有未保存的更改」确认框：保存 / 不保存 / 取消。
+    fn confirm_close_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.confirm_close {
+            return None;
+        }
+        let button = |id: &'static str,
+                      label: &'static str,
+                      answer: CloseAnswer,
+                      cx: &mut Context<Self>| {
+            let primary = answer == CloseAnswer::Save;
+            let mut element = div()
+                .id(SharedString::from(id))
+                .px(px(12.))
+                .py(px(4.))
+                .rounded(px(theme::RADIUS_SMALL))
+                .text_size(theme::fs(11.5))
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.88));
+            element = if primary {
+                element.bg(theme::accent()).text_color(theme::text_primary())
+            } else {
+                element
+                    .bg(theme::track())
+                    .text_color(theme::text_secondary())
+            };
+            element
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    match answer {
+                        // 取消 = 什么都不做，接着改。
+                        CloseAnswer::Cancel => {
+                            this.confirm_close = false;
+                            window.refresh();
+                            cx.notify();
+                        }
+                        CloseAnswer::Save => {
+                            this.confirm_close = false;
+                            this.save_draft(true, window, cx);
+                        }
+                        CloseAnswer::Discard => {
+                            this.confirm_close = false;
+                            // 不保存 = 把草稿丢掉，界面上预览出去的东西也跟着弹回去。
+                            if this.config.borrow_mut().discard_draft() {
+                                let config = this.config.borrow().get().clone();
+                                this.apply_everything(&config, None, false, window, cx);
+                            }
+                            window.remove_window();
+                        }
+                    }
+                }))
+                .child(label)
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .id("close-confirm-backdrop")
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgb_to_hsla(rgba(0x00000059)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        // 点背板 = 取消（跟「取消」那颗一样），别把窗口关掉。
+                        cx.stop_propagation();
+                        this.confirm_close = false;
+                        window.refresh();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(324.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .p(px(16.))
+                        .rounded(px(theme::RADIUS_WINDOW))
+                        .border_1()
+                        .border_color(theme::border_strong())
+                        .bg(theme::opaque(theme::surface_elevated()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation()
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(13.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::text_primary())
+                                .child(lang.pick("有未保存的更改", "Unsaved changes")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(11.))
+                                .text_color(theme::text_secondary())
+                                .child(lang.pick(
+                                    "关掉设置窗，这些改动就没了。",
+                                    "Closing the settings window discards them.",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(button(
+                                    "close-save",
+                                    lang.pick("保存", "Save"),
+                                    CloseAnswer::Save,
+                                    cx,
+                                ))
+                                .child(button(
+                                    "close-discard",
+                                    lang.pick("不保存", "Don't save"),
+                                    CloseAnswer::Discard,
+                                    cx,
+                                ))
+                                .child(button(
+                                    "close-cancel",
+                                    lang.pick("取消", "Cancel"),
+                                    CloseAnswer::Cancel,
+                                    cx,
+                                )),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// 当前页的内容：每页一个滚动区，滚动位置各自记住。
     fn page_view(
         &self,
@@ -14601,6 +15341,9 @@ impl Render for Settings {
         let device_menu = self.device_menu_overlay(&config, lang, &snapshot, viewport, cx);
         let icon_picker = self.icon_picker_overlay(&config, lang, viewport, cx);
         let tray_menu = self.tray_menu_overlay(&config, lang, viewport, cx);
+        let restore_menu = self.restore_menu_overlay(&config, lang, cx);
+        let confirm_close = self.confirm_close_overlay(lang, cx);
+        let apply_bar = self.apply_bar(lang, cx);
         let donate = self.donate_overlay(lang, cx);
 
         div()
@@ -14768,6 +15511,31 @@ impl Render for Settings {
                             ),
                     )
                     .child(
+                        // 三横杠：恢复更改 / 恢复出厂设置。所有页都在同一个位置
+                        // （三颗窗口按钮左边），菜单里的「本页」跟着当前页走。
+                        div()
+                            .id("settings-restore-menu")
+                            .size(px(24.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_SMALL))
+                            .cursor_pointer()
+                            .when(self.restore_menu_open, |style| {
+                                style.bg(theme::accent_soft())
+                            })
+                            .hover(|style| style.bg(theme::surface_hover()))
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, window, cx| {
+                                    this.restore_menu_open = !this.restore_menu_open;
+                                    window.refresh();
+                                    cx.notify();
+                                },
+                            ))
+                            .child(icon("menu", 14.0, theme::text_secondary())),
+                    )
+                    .child(
                         // 窗口按钮：最小化 / 最大化-还原 / 关闭。
                         // 窗口是 `WindowDecorations::Client`（系统标题栏被去掉），
                         // 这三颗都得自己画、自己接。
@@ -14787,10 +15555,30 @@ impl Render for Settings {
                     )
                     .child(
                         titlebar_button("settings-close", "close")
-                            .on_click(|_, window, _| window.remove_window()),
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, window, cx| this.request_close(window, cx),
+                            )),
                     ),
             )
-            .child(div().flex().flex_1().min_h_0().child(sidebar).child(page))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(sidebar)
+                    // 右半边是「页面 + 底部应用栏」：栏只横跨内容区，
+                    // 侧栏那条从标题栏一直通到底，不被切开。
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(page)
+                            .child(apply_bar),
+                    ),
+            )
             // 弹出层永远在最后：盖在侧栏和页面上，但不改窗口尺寸。
             .children(font_menu)
             .children(device_menu)
@@ -14798,8 +15586,12 @@ impl Render for Settings {
             .children(tray_menu)
             // 色轮最后挂：它就是当前焦点，别的弹层都该被它盖住。
             .children(color_wheel)
+            // 恢复菜单挂在模态之下：捐赠浮层开着时不该还能点它。
+            .children(restore_menu)
             // 捐赠浮层是模态，压在所有弹层之上。
             .children(donate)
+            // 「有未保存的更改」是关窗前的最后一问，压在最上面。
+            .children(confirm_close)
     }
 }
 
@@ -15169,6 +15961,36 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 每页那份字段清单要把 `Config` 的字段**分完**，且一页只收一次。
+    ///
+    /// 漏一个，那一页「恢复本页」就会漏掉那一项（点了看着像没反应）；
+    /// 两页都收，重置别的页时会顺手把这页也改掉。加字段时这里会直接拦下来。
+    #[test]
+    fn page_fields_cover_every_config_key() {
+        let value = serde_json::to_value(Config::default()).unwrap();
+        let object = value.as_object().unwrap();
+        for key in object.keys() {
+            let owners = Page::ALL
+                .iter()
+                .filter(|page| page_fields(**page).contains(&key.as_str()))
+                .count();
+            if UNTOUCHED_FIELDS.contains(&key.as_str()) {
+                assert_eq!(owners, 0, "{key} 是不该被重置的字段");
+            } else {
+                assert_eq!(owners, 1, "{key} 正好要被一页收着，现在是 {owners} 页");
+            }
+        }
+        // 反过来：清单里不该有 `Config` 上不存在的名字（拼错 = 那一条永远不生效）。
+        for page in Page::ALL {
+            for key in page_fields(page) {
+                assert!(
+                    object.contains_key(*key),
+                    "{page:?} 的 {key} 不是 Config 的字段"
+                );
+            }
+        }
+    }
 
     /// 失焦落盘的规则：敲了字就一定写；空着只有按回车才算「恢复原名」。
     #[test]

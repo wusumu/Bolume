@@ -5393,11 +5393,83 @@ impl Config {
             target
         }
     }
+    /// 把 `src` 里列出的那几个顶层字段原样搬过来（`keys` 是 serde 的字段名）。
+    ///
+    /// 「恢复本页更改 / 恢复出厂设置」靠它把一份配置里的一整页搬回来。字段有
+    /// 一百多个，逐条写 `self.x = src.x` 既容易漏、以后加字段也没人记得补，
+    /// 走一遍 JSON 就不会漏 —— 两边都是 `Config`，形状天然一致，解析失败就当没改。
+    ///
+    /// 只碰 `keys` 里的字段：`config_rev` 不在任何一页的清单里，重置完得留着它，
+    /// 否则下次启动会当成老配置再迁移一遍（迁移里有「清空即填默认」那种逻辑）。
+    pub fn copy_fields(&mut self, src: &Config, keys: &[&str]) -> bool {
+        self.merge_from(src, &|key| keys.contains(&key))
+    }
+
+    /// 整份配置照搬，只跳过 `except`（窗口尺寸、`config_rev` 这类不该被重置的）。
+    pub fn copy_all(&mut self, src: &Config, except: &[&str]) -> bool {
+        self.merge_from(src, &|key| !except.contains(&key))
+    }
+
+    /// `copy_fields` / `copy_all` 共用的实现：`pick` 说哪些顶层字段要搬。
+    fn merge_from(&mut self, src: &Config, pick: &dyn Fn(&str) -> bool) -> bool {
+        // `tray_number_size` 是 `skip_serializing` 的（rev 67 之后只剩迁移读它），
+        // JSON 往返会把它抹成 0，所以先记下来、搬完再放回去。
+        let legacy_number_size = self.tray_number_size;
+        let (Ok(mut mine), Ok(theirs)) = (serde_json::to_value(&*self), serde_json::to_value(src))
+        else {
+            return false;
+        };
+        let (Some(dst), Some(source)) = (mine.as_object_mut(), theirs.as_object()) else {
+            return false;
+        };
+        let mut touched = false;
+        for (key, value) in source {
+            if pick(key) {
+                dst.insert(key.clone(), value.clone());
+                touched = true;
+            }
+        }
+        if !touched {
+            return false;
+        }
+        match serde_json::from_value::<Config>(mine) {
+            Ok(mut next) => {
+                next.tray_number_size = legacy_number_size;
+                *self = next;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// 比较「算不算改过」时忽略的字段：窗口尺寸是顺手记的，不是设置项。
+///
+/// 不忽略的话，进草稿之后窗口被拉一下（`update_now`）就永远显示「有未保存的更改」。
+const NOT_AN_EDIT: [&str; 2] = ["settings_width", "settings_height"];
+
+/// 去掉上面那几个字段的 JSON，只用来比「有没有差别」。
+fn comparable(config: &Config) -> Option<serde_json::Value> {
+    let mut value = serde_json::to_value(config).ok()?;
+    if let Some(object) = value.as_object_mut() {
+        for key in NOT_AN_EDIT {
+            object.remove(key);
+        }
+    }
+    Some(value)
 }
 
 pub struct ConfigStore {
     path: PathBuf,
     config: Config,
+    /// 草稿模式的参照点。
+    ///
+    /// `Some` = 设置页正开着在改东西：`update()` 只改内存、**不落盘**，等按了
+    /// 「应用 / 保存」才写文件；「恢复更改」就是把这个参照点搬回来。
+    /// 设置页关掉（或点了应用）就清掉，之后又回到「改一下存一下」。
+    draft_base: Option<Config>,
+    /// 草稿跟参照点有没有差别（界面上「有未保存的更改」和按钮亮不亮都看它）。
+    draft_dirty: bool,
 }
 
 impl ConfigStore {
@@ -5790,7 +5862,12 @@ impl ConfigStore {
         if config.footer.ensure_all() {
             migrated = true;
         }
-        let store = Self { path, config };
+        let store = Self {
+            path,
+            config,
+            draft_base: None,
+            draft_dirty: false,
+        };
         // 首次运行就把默认配置落盘，便携版目录里一眼能看到 config.json。
         if existing.is_none() || !store.path.exists() || migrated {
             let _ = store.save();
@@ -5808,7 +5885,84 @@ impl ConfigStore {
 
     pub fn update(&mut self, change: impl FnOnce(&mut Config)) -> io::Result<()> {
         change(&mut self.config);
+        if self.draft_base.is_some() {
+            // 草稿模式：改动只留在内存里，等「应用 / 保存」才落盘。
+            self.refresh_dirty();
+            return Ok(());
+        }
         self.save()
+    }
+
+    /// 不管草稿、改完立刻落盘。
+    ///
+    /// 窗口尺寸这类「顺手记一下」的东西用它：它不是用户在设置页做的改动，
+    /// 不该把草稿弄脏、更不该非要按一下「应用」才记住。
+    pub fn update_now(&mut self, change: impl FnOnce(&mut Config)) -> io::Result<()> {
+        change(&mut self.config);
+        self.save()
+    }
+
+    /// 进草稿模式：把当前配置记成参照点（已经在草稿里就什么都不做）。
+    pub fn begin_draft(&mut self) {
+        if self.draft_base.is_none() {
+            self.draft_base = Some(self.config.clone());
+            self.draft_dirty = false;
+        }
+    }
+
+    /// 草稿里有没有还没落盘的改动。
+    pub fn is_dirty(&self) -> bool {
+        self.draft_dirty
+    }
+
+    /// 草稿的参照点（「恢复更改」要退回的那一份）。
+    pub fn draft_base(&self) -> Option<&Config> {
+        self.draft_base.as_ref()
+    }
+
+    /// 把草稿写进文件，参照点往前挪到当前这一份（还在草稿模式里，可以接着改）。
+    pub fn commit_draft(&mut self) -> io::Result<()> {
+        self.save()?;
+        self.draft_base = Some(self.config.clone());
+        self.draft_dirty = false;
+        Ok(())
+    }
+
+    /// 退出草稿模式：没点「应用 / 保存」的改动就此作废，返回丢掉了没有。
+    pub fn discard_draft(&mut self) -> bool {
+        let Some(base) = self.draft_base.take() else {
+            return false;
+        };
+        let lost = self.draft_dirty;
+        self.config = base;
+        self.draft_dirty = false;
+        lost
+    }
+
+    /// 把 `src` 里这几个顶层字段搬进草稿（`keys` 空 = 整份，跳过 `except`）。
+    ///
+    /// 「恢复更改」搬参照点、「恢复出厂设置」搬 `Config::default()`，都是这一个动作。
+    /// 只改内存，照样要按「应用 / 保存」才落盘。
+    pub fn edit_draft(&mut self, src: &Config, keys: &[&str], except: &[&str]) -> bool {
+        let changed = if keys.is_empty() {
+            self.config.copy_all(src, except)
+        } else {
+            self.config.copy_fields(src, keys)
+        };
+        self.refresh_dirty();
+        changed
+    }
+
+    /// 重新算「草稿跟参照点有没有差别」。
+    ///
+    /// 走 JSON 比较：`Config` 没派生 `PartialEq`，为了这个给上百个字段补一个不值当。
+    /// 只在用户动一下设置时算一次，不在每帧里跑。
+    fn refresh_dirty(&mut self) {
+        let Some(base) = &self.draft_base else {
+            self.draft_dirty = false;
+            return;
+        };
+        self.draft_dirty = comparable(&self.config) != comparable(base);
     }
 
     fn save(&self) -> io::Result<()> {
@@ -5823,6 +5977,94 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 草稿模式：改动只留内存，`commit_draft` 才落盘；丢弃能退回参照点。
+    #[test]
+    fn draft_keeps_changes_out_of_the_file_until_committed() {
+        let dir = std::env::temp_dir().join(format!("bolume-draft-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut store = ConfigStore::load(path.clone());
+        let saved = std::fs::read_to_string(&path).unwrap();
+
+        store.begin_draft();
+        assert!(!store.is_dirty(), "刚进草稿模式什么都没改，不算脏");
+        store.update(|config| config.ui_opacity = 33).unwrap();
+        assert!(store.is_dirty());
+        // 文件还是进来的那份（`update()` 在草稿模式里不写盘）。
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+
+        store.commit_draft().unwrap();
+        assert!(!store.is_dirty());
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("\"ui_opacity\": 33"),
+            "提交之后才写进文件"
+        );
+
+        // 提交之后还是草稿模式，参照点已经挪过来了：再改再丢，退回的是刚才那份。
+        store.update(|config| config.ui_opacity = 66).unwrap();
+        assert!(store.is_dirty());
+        assert!(store.discard_draft(), "有改动，丢弃要返回 true");
+        assert_eq!(store.get().ui_opacity, 33);
+        assert!(!store.is_dirty());
+
+        // 窗口尺寸（update_now）不进草稿：拖一下窗口不该变成「有未保存的更改」。
+        store.begin_draft();
+        store.update_now(|config| config.settings_width = 999.0).unwrap();
+        assert!(!store.is_dirty());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"settings_width\": 999.0")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「恢复本页更改」只搬点名的字段：别的页一个字都不能动。
+    #[test]
+    fn copy_fields_touches_only_named_keys() {
+        let mut config = Config::default();
+        config.language = Lang::En;
+        config.ui_opacity = 55;
+        config.volume_cap.enabled = true;
+        let mut source = Config::default();
+        source.language = Lang::Zh;
+
+        assert!(config.copy_fields(&source, &["language"]));
+        assert_eq!(config.language, Lang::Zh, "点名的字段要搬过来");
+        assert_eq!(config.ui_opacity, 55, "没点名的字段不能动");
+        assert!(config.volume_cap.enabled, "嵌套结构里的字段也不能动");
+    }
+
+    /// 「全部恢复出厂设置」跳过窗口尺寸与 `config_rev`。
+    #[test]
+    fn copy_all_keeps_window_size_and_rev() {
+        let mut config = Config::default();
+        config.settings_width = 1234.0;
+        config.language = Lang::En;
+        config.config_rev = 7;
+
+        assert!(config.copy_all(&Config::default(), &["settings_width", "config_rev"]));
+        assert_eq!(config.settings_width, 1234.0, "窗口尺寸跟着重置会把窗缩掉");
+        assert_eq!(config.config_rev, 7, "rev 重置了下次启动会重跑迁移");
+        assert_eq!(config.language, Lang::Zh, "其余字段回到默认");
+    }
+
+    /// 搬过去的字段跟源配置逐字段相等（整页搬的时候最容易漏掉嵌套结构）。
+    #[test]
+    fn copy_fields_carries_nested_structs() {
+        let mut source = Config::default();
+        source.volume_cap.enabled = true;
+        source.volume_cap.percent = 42;
+        source.volume_cap.device_id = "speaker-1".into();
+        source.unmute = UnmuteOnChange::default();
+        let mut config = Config::default();
+
+        assert!(config.copy_fields(&source, &["volume_cap"]));
+        assert!(config.volume_cap.enabled);
+        assert_eq!(config.volume_cap.percent, 42);
+        assert_eq!(config.volume_cap.device_id, "speaker-1");
+    }
 
     /// 自启方式：默认注册表（跟以前的行为一致），老配置读进来也是注册表。
     ///

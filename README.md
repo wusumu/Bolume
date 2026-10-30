@@ -80,6 +80,11 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 - 屏幕提示的动画二选一：`淡入淡出` / `跟随系统`（滑上来 + 淡入，消失时滑回去）
 - 托盘图标：喇叭弧线跟随音量、或直接显示数字；单色样式可固定颜色，也可让色温随响度走；还能换成自己的 ico
 
+**设置**
+
+- 改动先留在窗口里：底部「应用」写进配置但不关窗，「保存」写进配置并关窗；直接点关闭会问保存 / 不保存 / 取消
+- 标题栏右上角的三横杠是恢复：`恢复本页更改` / `恢复全部更改`（退回上一次生效的样子）、`本页恢复出厂设置` / `全部恢复出厂设置`；恢复完同样要点「应用」才落盘，点错了可以再恢复回来
+
 ## 截图
 
 面板（右下角弹出）与亮度面板：
@@ -212,6 +217,7 @@ vendor/
 - Its own on-screen display for volume, mute, track changes and brightness, with a layout editor; the volume card and the media-key card can each have their own background (size, corners, opacity, color)
 - Global hotkeys for everything, including media keys taken over through a low-level keyboard hook, hold-to-repeat, and an app blocklist that gets out of the way in fullscreen games
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
+- Edits stay in the window until you press **Apply** (save, keep editing) or **Save** (save and close); closing with pending edits asks save / don't save / cancel. The ≡ menu in the title bar reverts this page or everything, or restores factory defaults, per page or wholesale
 - Popup animations can follow the system: the panel and the OSD both rise from the bottom edge of the screen from *behind* the taskbar, animated frame-by-frame in sync with the display refresh rate, matching how Windows 11 (and 10) animate their own volume surfaces
 
 Download the latest `Bolume_vX.XX.zip` from [Releases](../../releases), extract anywhere and run `Bolume.exe`. Windows 10/11 x64, no installer, no .NET.

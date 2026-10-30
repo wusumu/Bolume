@@ -73,6 +73,7 @@ icon_assets!(
     "restart",
     "dialog",
     "tray",
+    "menu",
 );
 
 pub struct Assets;

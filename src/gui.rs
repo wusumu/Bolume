@@ -1489,6 +1489,25 @@ pub fn refresh_flyout_size(cx: &mut App) {
     refresh_brightness_window(cx);
 }
 
+/// 同上，但**面板关着就什么都不做**。
+///
+/// 「恢复更改 / 恢复出厂 / 应用」是一次换掉一大片配置，里面未必碰了面板尺寸，也不
+/// 一定是用户正看着面板在调 —— 这时候按上面那条走会把面板预览出来，点一下菜单就
+/// 蹦出一块面板，纯属惊吓。下次真打开面板时它自己会按新配置排版。
+pub fn refresh_flyout_size_if_visible(cx: &mut App) {
+    let handle = cx.global::<AppState>().flyout.borrow().clone();
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |flyout, window, cx| {
+            if !flyout.is_visible() {
+                return;
+            }
+            flyout.sync_brightness_embed(cx);
+            flyout.refresh_layout(window, cx);
+        });
+    }
+    refresh_brightness_window(cx);
+}
+
 /// 设置页改了页脚按钮（放哪些、摆哪边、什么顺序）之后调一次。
 ///
 /// 只刷开着的面板；关着的时候不用管，下次弹出直接读新配置 ——
