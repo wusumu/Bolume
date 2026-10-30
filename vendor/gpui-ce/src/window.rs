@@ -4049,6 +4049,7 @@ impl Window {
                 element_corner_radii,
                 inset: 0,
                 pad: 0,
+                transformation: self.element_transformation(),
             });
         }
     }
@@ -4094,6 +4095,7 @@ impl Window {
                 element_corner_radii,
                 inset: 1,
                 pad: 0,
+                transformation: self.element_transformation(),
             });
         }
     }

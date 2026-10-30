@@ -826,26 +826,56 @@ fn preview_device(snapshot: &Snapshot, lang: Lang) -> DeviceInfo {
 /// OSD 预览里的示例内容：用固定的 42%，和实际音量无关，
 /// 免得一调音量预览就跟着跳。
 ///
-/// 标题只写「音量」—— 真实提示条也只报这一次操作，不显示设备名 / 正在播放的应用。
-fn preview_osd_state(lang: Lang, cfg: &OsdConfig) -> OsdState {
-    OsdState {
-        function: OsdFunction::Volume,
+/// 内容照着**这套模板平时那一次操作**来：音量 / 媒体键 / 亮度各是什么字、有没有条，
+/// 都和真机上一致（`function` 只影响这里的样例，不影响配置）。
+fn preview_osd_state(lang: Lang, cfg: &OsdConfig, function: OsdFunction) -> OsdState {
+    let mut state = OsdState {
+        function,
         target: OsdTarget::Device,
         icon: cfg.icon_style().icon,
-        // 用户填了标题就用它，和真实提示条一致。
-        title: if !cfg.title_text.trim().is_empty() {
-            cfg.title_text.clone()
-        } else {
-            lang.pick("音量", "Volume").to_string()
-        },
+        title: String::new(),
         subtitle: String::new(),
         // 示例直接用最长的那一档：100% 能放下，42% 自然也没问题。
-        percent: cfg.percent_display("100%"),
-        db: "-12.0 dB".to_string(),
+        percent: String::new(),
+        db: String::new(),
         fraction: 0.42,
         show_bar: true,
         muted: false,
         playing: None,
+    };
+    match function {
+        // 亮度只有百分比、没有分贝，图标固定是太阳。
+        OsdFunction::Brightness => {
+            state.icon = "sun";
+            state.title = lang.pick("亮度", "Brightness").to_string();
+            state.percent = cfg.percent_display("100%");
+        }
+        // 媒体键只报动作，不画条也不报读数。
+        f if f.is_media() => {
+            state.icon = "play";
+            state.title = f.label(lang).to_string();
+            state.fraction = 0.0;
+            state.show_bar = false;
+        }
+        _ => {
+            state.title = lang.pick("音量", "Volume").to_string();
+            state.percent = cfg.percent_display("100%");
+            state.db = "-12.0 dB".to_string();
+        }
+    }
+    // 用户填了标题就盖掉自动内容，和真实提示条一致。
+    if !cfg.title_text.trim().is_empty() {
+        state.title = cfg.title_text.clone();
+    }
+    state
+}
+
+/// 预览下面那行小字：这是哪一套模板。
+fn template_label(template: crate::config::OsdTemplate, lang: Lang) -> &'static str {
+    match template {
+        crate::config::OsdTemplate::Volume => lang.pick("音量", "Volume"),
+        crate::config::OsdTemplate::Media => lang.pick("媒体键", "Media keys"),
+        crate::config::OsdTemplate::Brightness => lang.pick("亮度", "Brightness"),
     }
 }
 
@@ -10173,36 +10203,111 @@ impl Settings {
         ]
     }
 
-    /// OSD 的缩略预览：只画卡片本身，点一下打开布局编辑器。
+    /// OSD 的缩略预览：三套模板各一张，点一下打开布局编辑器。
     ///
-    /// 真正调位置 / 大小都在那扇独立的、可以放大的窗口里做 —— 这里只要
-    /// 能一眼看出大概长什么样就够了。
+    /// 只画音量那一套的话，改完媒体键 / 亮度在这里根本看不出差别（而三套本来就各存各的）。
+    /// 真正调位置 / 大小还在那扇独立的、可以放大的窗口里做 —— 这里只要
+    /// 能一眼看出三套大概长什么样就够了。
     fn osd_preview(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
-        // 缩略预览固定按音量模板画（最常看到的那一套）；
-        // 编辑器当前在改哪套（`template()`）跟这里无关。
-        let cfg = config.osd.for_function(OsdFunction::Volume);
-        let (width, _) = crate::windows::osd::card_size(&cfg);
-        // 页面内容区大约 520px 宽，再宽的卡片按比例缩下来。
-        let scale = (520.0 / width).min(1.0).max(0.35);
-        let sample = preview_osd_state(lang, &cfg);
-        let card = crate::windows::osd::card_visual(
-            &cfg,
-            &sample,
-            scale,
-            None,
-            &crate::windows::osd::TextMeasure::approx(),
-            lang,
-        );
-        // 开了阴影就把影子该占的地方也留出来，不然它会糊到别的控件上。
-        let shadow_pad = crate::windows::osd::shadow_margin(&cfg) * scale;
+        use crate::config::OsdTemplate;
+        use crate::windows::osd;
+
+        // 顺序与编辑器里的模板按钮一致：音量 / 媒体键 / 亮度。
+        // 样例操作各取常见的那一次（音量、播放 / 暂停、亮度）。
+        let samples = [
+            (OsdTemplate::Volume, OsdFunction::Volume),
+            (OsdTemplate::Media, OsdFunction::PlayPause),
+            (OsdTemplate::Brightness, OsdFunction::Brightness),
+        ];
+        let cfgs: Vec<OsdConfig> = samples
+            .iter()
+            .map(|(_, function)| config.osd.for_function(*function))
+            .collect();
+        // 尺寸按**转后的包围盒**算：卡片转 45° 之后是它占的地方变大，不是卡片变大。
+        let boxes: Vec<(f32, f32)> = cfgs.iter().map(osd::rotated_bounds).collect();
+        let pads: Vec<f32> = cfgs.iter().map(osd::shadow_margin).collect();
+
+        // 三张横排放进内容区（大约 520px），按**同一个比例**缩：
+        // 三套模板的尺寸大小关系才跟真机一致，不会一张 1:1、一张缩一半。
+        const GAP: f32 = 14.0;
+        const AVAIL: f32 = 520.0;
+        // 缩略图上的影子不用留满：真机上离得远，这里挨得近，留四分之一到一半就够。
+        const PAD_MAX: f32 = 12.0;
+        let pad_max = pads.iter().copied().fold(0.0f32, f32::max).min(PAD_MAX);
+        let total_w: f32 = boxes.iter().map(|(w, _)| *w).sum();
+        let scale = ((AVAIL - GAP * (samples.len() - 1) as f32 - pad_max * 2.0 * samples.len() as f32)
+            / total_w)
+            .min(1.0)
+            .max(0.3);
+
+        let mut cells: Vec<AnyElement> = Vec::new();
+        for (index, &(template, function)) in samples.iter().enumerate() {
+            let cfg = &cfgs[index];
+            let (box_w, box_h) = boxes[index];
+            let pad = pads[index].min(PAD_MAX);
+            let sample = preview_osd_state(lang, cfg, function);
+            let content = osd::card_visual(
+                cfg,
+                &sample,
+                scale,
+                None,
+                &osd::TextMeasure::approx(),
+                lang,
+            );
+            // 背景卡的旋转靠 `card_frame` 套一层（外面按包围盒留位置，本体居中转），
+            // 元素自己的旋转在 `card_visual` 里就转了 —— 两处都得走同一条路，
+            // 预览才不会比真机少转一层。
+            let card = osd::card_frame(cfg, scale, content);
+            cells.push(
+                div()
+                    .id(SharedString::from(format!("osd-preview-{index}")))
+                    .flex()
+                    .flex_none()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(5.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            // 转后的包围盒 + 影子该占的一点地方。
+                            .w(px(box_w * scale + pad * 2.0))
+                            .h(px(box_h * scale + pad * 2.0))
+                            .child(card),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_tertiary())
+                            .child(template_label(template, lang)),
+                    )
+                    // 点哪一张就进哪一套：先把编辑器指到这套模板，再开窗口。
+                    // 不 stop 的话外层的「点预览开编辑器」也会触发一次（重复开）。
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        let _ = this
+                            .config
+                            .borrow_mut()
+                            .update(|config| config.osd.set_template(template));
+                        crate::gui::open_osd_editor(cx);
+                        cx.stop_propagation();
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         div()
             .id("osd-preview")
             .mx(px(5.))
             .my(px(4.))
-            .p(px(10. + shadow_pad))
+            .px(px(10.))
+            .py(px(8.))
             .flex()
+            .items_end()
             .justify_center()
+            .gap(px(GAP))
             .rounded(px(theme::RADIUS_SMALL))
             // 预览底色比卡片再暗一档：浅色主题下白卡片贴在浅底上也得有边。
             .bg(theme::surface_sunken())
@@ -10212,7 +10317,7 @@ impl Settings {
             .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
                 crate::gui::open_osd_editor(cx);
             }))
-            .child(card)
+            .children(cells)
             .into_any_element()
     }
 
@@ -15150,6 +15255,49 @@ mod tests {
         // 百分比字段还是只认整数。
         assert_eq!(NumberField::WheelStep.parse_edit("0.5", 2), 2);
         assert_eq!(NumberField::WheelStep.parse_edit("7", 2), 7);
+    }
+
+    /// 设置页那三张缩略预览各按自己那套的样例画：
+    /// 音量报百分比 + 分贝并画条，媒体键只报动作，亮度只报百分比。
+    #[test]
+    fn preview_samples_match_each_template() {
+        let cfg = OsdConfig::default();
+
+        let volume = preview_osd_state(Lang::Zh, &cfg, OsdFunction::Volume);
+        assert!(volume.show_bar);
+        assert!(!volume.percent.is_empty());
+        assert!(!volume.db.is_empty());
+
+        let media = preview_osd_state(Lang::Zh, &cfg, OsdFunction::PlayPause);
+        assert!(!media.show_bar);
+        assert!(media.percent.is_empty());
+        assert!(media.db.is_empty());
+
+        let brightness = preview_osd_state(Lang::Zh, &cfg, OsdFunction::Brightness);
+        assert!(brightness.show_bar);
+        assert!(!brightness.percent.is_empty());
+        // 亮度没有分贝这一说。
+        assert!(brightness.db.is_empty());
+    }
+
+    /// 三张预览各自取自己模板的卡片：亮度那张必须是亮度卡的尺寸，
+    /// 不能因为编辑器停在音量模板就拿音量的尺寸去画。
+    #[test]
+    fn preview_takes_each_template_own_card() {
+        let mut cfg = OsdConfig::default();
+        cfg.brightness_card = Some(crate::config::OsdCard {
+            width: 200,
+            height: 90,
+            corner: 10,
+            opacity: 100,
+            color: String::new(),
+            rotation: 0,
+        });
+        let brightness = cfg.for_function(OsdFunction::Brightness);
+        assert_eq!(crate::windows::osd::card_size(&brightness), (200.0, 90.0));
+        // 另外两套不受影响。
+        let volume = cfg.for_function(OsdFunction::Volume);
+        assert_ne!(crate::windows::osd::card_size(&volume), (200.0, 90.0));
     }
 
     /// 滚轮按哪套步进由开关决定，跟刻度开关是两件事。

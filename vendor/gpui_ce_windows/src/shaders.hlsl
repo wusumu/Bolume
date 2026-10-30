@@ -614,9 +614,9 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_Insta
     return output;
 }
 
-float4 quad_fragment(QuadFragmentInput input): SV_Target {
-    Quad quad = quads[input.quad_id];
-    float2 local_position = unrotate_position(input.position.xy, quad.transformation);
+// Bolume patch: 片子里的颜色计算按「元素自己坐标系里的一个点」算，
+// 好让上面那层（`quad_fragment`）对转着画的元素做亚像素超采样。
+float4 quad_color_at(Quad quad, QuadFragmentInput input, float2 local_position) {
     float4 background_color = gradient_color(quad.background, local_position, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
@@ -906,6 +906,40 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 
+// Bolume patch: 斜着画的 quad，边缘只按一个点算覆盖，45° 斜边看着发毛（细笔画、圆角更明显）。
+// 这种情况在元素自己的坐标系里做 4x4 超采样再取平均：采样点铺满 ±1 像素，
+// 相当于给边缘做一次约 1.5px 的覆盖估计 —— 比单点覆盖柔、又不像低通滤波那样糊。
+// 只对「斜着」的走这条路：转 90° 整数倍时位图逐像素对齐，单点覆盖本来就是准的，
+// 多采样只会把它抹糊。旋转是等距变换，局部 1 像素等于屏幕 1 像素，不用换算。
+float4 quad_fragment(QuadFragmentInput input): SV_Target {
+    Quad quad = quads[input.quad_id];
+    float2 local_position = unrotate_position(input.position.xy, quad.transformation);
+
+    float2x2 r = quad.transformation.rotation_scale;
+    bool axis_aligned =
+        (abs(r[0][0]) < 1e-4 || abs(abs(r[0][0]) - 1.0) < 1e-4) &&
+        (abs(r[0][1]) < 1e-4 || abs(abs(r[0][1]) - 1.0) < 1e-4) &&
+        (abs(r[1][0]) < 1e-4 || abs(abs(r[1][0]) - 1.0) < 1e-4) &&
+        (abs(r[1][1]) < 1e-4 || abs(abs(r[1][1]) - 1.0) < 1e-4);
+    if (!axis_aligned) {
+        const float radius = 1.0;
+        const float step_size = 2.0 * radius / 4.0;
+        float4 sum = 0.0;
+        [unroll]
+        for (int i = 0; i < 4; i++) {
+            [unroll]
+            for (int j = 0; j < 4; j++) {
+                float2 offset = float2(
+                    -radius + (float(i) + 0.5) * step_size,
+                    -radius + (float(j) + 0.5) * step_size);
+                sum += quad_color_at(quad, input, local_position + offset);
+            }
+        }
+        return sum * (1.0 / 16.0);
+    }
+    return quad_color_at(quad, input, local_position);
+}
+
 /*
 **
 **              Shadows
@@ -923,6 +957,7 @@ struct Shadow {
     Corners element_corner_radii;
     uint inset;
     uint pad; // align to 8 bytes
+    TransformationMatrix transformation;
 };
 
 struct ShadowVertexOutput {
@@ -955,8 +990,13 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint shadow_id: SV
         bounds.size += 2.0 * margin;
     }
 
-    float4 device_position = to_device_position(unit_vertex, bounds);
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask);
+    // Bolume patch: 影子跟着元素一起转。顶点按变换摆，片元再按逆矩阵转回来算距离场
+    // （不转回来的话，转 45° 的卡片配一块正的影子，边角全对不上）。
+    float4 device_position = to_device_position_transformed(unit_vertex, bounds, shadow.transformation);
+    float4 clip_distance = max(
+        distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask),
+        distance_from_clip_rect_transformed(unit_vertex, bounds, shadow.content_mask, shadow.transformation)
+    );
     float4 color = hsla_to_rgba(shadow.color);
 
     ShadowVertexOutput output;
@@ -971,14 +1011,18 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint shadow_id: SV
 float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
     Shadow shadow = shadows[input.shadow_id];
 
+    // Bolume patch: 片元拿到的是屏幕坐标，距离场与模糊都按阴影自己的坐标系算，
+    // 所以先按逆矩阵转回去。纯旋转 / 等比缩放下距离不变，模糊半径不用换算。
+    float2 local_position = unrotate_position(input.position.xy, shadow.transformation);
+
     float2 half_size = shadow.bounds.size / 2.;
     float2 center = shadow.bounds.origin + half_size;
-    float2 point0 = input.position.xy - center;
+    float2 point0 = local_position - center;
     float corner_radius = pick_corner_radius(point0, shadow.corner_radii);
 
     float alpha;
     if (shadow.blur_radius == 0.) {
-        float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        float distance = quad_sdf(local_position, shadow.bounds, shadow.corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -1003,7 +1047,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+        float element_distance = quad_sdf(local_position, shadow.element_bounds,
                                           shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
     }

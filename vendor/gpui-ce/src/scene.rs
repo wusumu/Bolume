@@ -740,6 +740,11 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    /// Bolume patch: 元素旋转时影子也得跟着转。
+    ///
+    /// 阴影是按「轴对齐矩形 + 圆角」画出来的，光给顶点加变换不够 —— 片元里的
+    /// 距离场还得先按逆矩阵转回阴影自己的坐标系（和 quad 同一套做法）。
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Shadow> for Primitive {
