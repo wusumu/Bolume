@@ -4,7 +4,7 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写 · 单文件 exe · 绿色免安装 · 配置就在 exe 旁边 · 中英双语界面**
 
-目前版本 **0.87** · [下载](../../releases) · [English](#english)
+目前版本 **0.88** · [下载](../../releases) · [English](#english)
 
 ---
 
