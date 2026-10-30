@@ -4033,11 +4033,30 @@ impl Window {
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
+        let transformation = self.element_transformation();
+        // Bolume patch: 投影的偏移量按**屏幕**方向算，不跟着元素转。
+        //
+        // 影子是「卡片浮在桌面上」的暗示，光永远从上面来 —— 卡片转 90° 时影子该照样
+        // 落在下边。照字面把偏移量一起转过去的话，90° 会整个改成往左/往右投，看着
+        // 就像卡片旁边多出一块；转 180° 还会跑到上面去。
+        //
+        // 这里把偏移量按逆变换转回元素自己的坐标系，片元那一步（`unrotate_position`）
+        // 再转回来，落到屏幕上就还是用户设的那个方向。
         for shadow in shadows {
             if shadow.inset {
                 continue;
             }
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            let offset = if transformation == TransformationMatrix::unit() {
+                shadow.offset
+            } else {
+                // 纯旋转 / 镜像 / 等比缩放下，2x2 的逆就是转置。
+                let r = transformation.rotation_scale;
+                Point::new(
+                    Pixels(r[0][0] * shadow.offset.x.0 + r[1][0] * shadow.offset.y.0),
+                    Pixels(r[0][1] * shadow.offset.x.0 + r[1][1] * shadow.offset.y.0),
+                )
+            };
+            let shadow_bounds = (bounds + offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
@@ -4049,7 +4068,7 @@ impl Window {
                 element_corner_radii,
                 inset: 0,
                 pad: 0,
-                transformation: self.element_transformation(),
+                transformation,
             });
         }
     }
