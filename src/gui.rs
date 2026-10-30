@@ -279,6 +279,29 @@ pub fn run(
         display_engine.send(crate::display::DisplayCommand::Refresh);
     }
 
+    // 「系统启动时启动」这一档已下线（要管理员注册、还要跨会话交接，问题多）。
+    // 旧配置里记着它的，改按「用户登录时启动」走；原来开着就仍开着，只是换成登录任务
+    // —— 不能因为下线一个选项就把用户的自启悄悄关掉。残留的 `BolumeBoot` 任务一并清。
+    let legacy_boot = config.borrow().get().launch_method == crate::config::LaunchMethod::Boot;
+    if legacy_boot {
+        use crate::config::LaunchMethod;
+        let (was_on, admin) = {
+            let store = config.borrow();
+            (
+                store.get().launch_at_login
+                    || crate::platform::autostart::is_enabled(LaunchMethod::Boot),
+                store.get().run_as_admin,
+            )
+        };
+        crate::platform::autostart::remove(LaunchMethod::Boot);
+        if was_on {
+            crate::platform::autostart::set_enabled(LaunchMethod::Task, true, admin);
+        }
+        let _ = config
+            .borrow_mut()
+            .update(|config| config.launch_method = LaunchMethod::Task);
+    }
+
     // 自启动状态与系统对账：**系统里登记的才是事实**，配置只跟着记一笔。
     //
     // 三件事都在这里做：
@@ -296,7 +319,7 @@ pub fn run(
         let method = crate::platform::autostart::detected()
             .unwrap_or(config.borrow().get().launch_method);
         let admin = config.borrow().get().run_as_admin;
-        // 三档里只留一档（老版本残留、或者用户自己加过注册表那一条）：
+        // 只留一档（老版本残留、已下线的系统启动、或者用户自己加过注册表那一条）：
         // 不去重的话会启动两次 —— 第二次虽然被单实例挡掉，但会平白弹一下面板。
         for other in crate::config::LaunchMethod::ALL {
             if other != method {

@@ -4415,11 +4415,14 @@ impl LoudnessConfig {
 
 /// 开机自启的落地方式。
 ///
-/// 三条路的时机差得不少：注册表 `Run` 要等资源管理器把启动项逐个拉起来；
-/// 计划任务在**会话一建立**时就被任务计划程序拉起来 —— 早一两秒；
-/// 系统启动走开机触发的 SYSTEM 任务，用户会话一出现就把主程序送进去。
+/// 两条路的时机差得不少：注册表 `Run` 要等资源管理器把启动项逐个拉起来；
+/// 计划任务在**会话一建立**时就被任务计划程序拉起来 —— 早一两秒。
 ///
 /// 只保留一种，同时存在就是启动两次（第二次被单实例挡掉，但白跑一遍）。
+///
+/// [`Self::Boot`]（开机触发、SYSTEM 身份跑）已经下线：那一档要管理员注册、
+/// 还得跨会话把自己送进来，远端机器上问题多。这里留着这个变体只为**读得懂旧配置**，
+/// 启动时会把它换成 [`Self::Task`] 并把残留的 `BolumeBoot` 任务清掉。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LaunchMethod {
@@ -4428,26 +4431,30 @@ pub enum LaunchMethod {
     RunKey,
     /// 计划任务：登录时触发。
     Task,
-    /// 计划任务：开机时触发（SYSTEM），登录后把自己送进用户会话。
+    /// 已下线（`BolumeBoot`）。只为读旧配置保留，见上面的说明。
     Boot,
 }
 
 impl LaunchMethod {
-    /// 优先级从早到晚：清理多余登记时按这个顺序决定留哪一条。
+    /// 所有变体（含已下线的 `Boot`）：序列化往返、清理残留登记时按这份走。
     pub const ALL: [Self; 3] = [Self::Boot, Self::Task, Self::RunKey];
+
+    /// 界面上可选的两档，也是「现在实际登记在哪一档」的判定范围。
+    pub const SELECTABLE: [Self; 2] = [Self::Task, Self::RunKey];
 
     pub fn index(self) -> u32 {
         match self {
             Self::RunKey => 0,
-            Self::Task => 1,
-            Self::Boot => 2,
+            // 旧配置里记着 `Boot` 的，界面上按登录那条显示（启动时会迁过去）。
+            Self::Task | Self::Boot => 1,
         }
     }
 
     pub fn from_index(value: u32) -> Self {
         match value {
             1 => Self::Task,
-            2 => Self::Boot,
+            // 第 3 个按钮（系统启动）已经拿掉了，序号 2 不再产生；真收到就按登录走。
+            2 => Self::Task,
             _ => Self::RunKey,
         }
     }
@@ -5849,9 +5856,11 @@ mod tests {
     /// 分段按钮用序号换回来，两边必须对得上（写错了点一下会跳回注册表）。
     #[test]
     fn launch_method_index_round_trips() {
-        for method in LaunchMethod::ALL {
+        for method in LaunchMethod::SELECTABLE {
             assert_eq!(LaunchMethod::from_index(method.index()), method);
         }
+        // 序号 2（已下线的「系统启动时启动」）按登录那条算。
+        assert_eq!(LaunchMethod::from_index(2), LaunchMethod::Task);
         // 认不出来的序号按注册表算 —— 那是老行为，最保守。
         assert_eq!(LaunchMethod::from_index(9), LaunchMethod::RunKey);
     }

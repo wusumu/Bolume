@@ -1,18 +1,20 @@
-//! 开机自启动：三种落地方式，同一套对外接口。
+//! 开机自启动：两种落地方式，同一套对外接口。
 //!
 //! * **注册表**（`LaunchMethod::RunKey`，默认）：`HKCU\...\CurrentVersion\Run` 里一条
 //!   启动项。不需要任何权限，但资源管理器要一路加载到「跑启动项」那一步才轮到它，
 //!   托盘图标因此总慢半拍。
 //! * **计划任务**（`LaunchMethod::Task`）：登录时触发的任务计划程序任务。会话一建立
 //!   就被拉起来（不用等资源管理器把启动项过一遍），是**界面能出现**的最早时机。
-//! * **系统启动**（`LaunchMethod::Boot`）：开机触发、以 SYSTEM 身份跑的任务。
-//!   它自己不画界面 —— 开机时用户会话还不存在，托盘图标无处可挂。它在会话 0 里
-//!   等到用户会话出现，再用**那个会话里 explorer 的令牌**把主程序 CreateProcessAsUser
-//!   送进去，然后自己退场。所以拿到的权限和用户自己双击**完全一样**
-//!   （UAC 开着的机器就是普通权限，不会凭空提权，也不会弹 UAC）。
-//!   注册这条任务要管理员；没有管理员权限时设置页不提供这个选项。
 //!
-//! 三种方式**只保留一种**：同时存在就是启动两次（第二个会被单实例挡掉，
+//! ## 已下线的「系统启动」
+//!
+//! 以前还有一档 `LaunchMethod::Boot`：开机触发、SYSTEM 身份跑，在会话 0 里等到用户
+//! 会话出现，再用那个会话里 explorer 的令牌把主程序送进去。它要管理员才能注册，
+//! 还要跨会话交接，远端机器上问题多，现在不再提供 —— 枚举变体留着只为读旧配置
+//! （见 `crate::config::LaunchMethod`），启动时迁到 [`LaunchMethod::Task`] 并清掉
+//! 残留的 `BolumeBoot` 任务；`bootstart` 模块只剩「接住残留任务」这一条路。
+//!
+//! 剩下的两种方式**只保留一种**：同时存在就是启动两次（第二个会被单实例挡掉，
 //! 但白跑一遍、还多一次唤醒已有实例的弹面板）。
 //!
 //! ## 注册表那条坑（老版本踩过）
@@ -622,10 +624,16 @@ fn exists(method: LaunchMethod) -> bool {
 /// 任务被停用、注册表那条还在的时候，实际生效的是注册表 —— 这时候要报注册表，
 /// 不能让页面显示一个停用的任务。
 pub fn detected() -> Option<LaunchMethod> {
-    LaunchMethod::ALL
+    // 只看界面上还在的两档：`Boot` 已下线，残留的任务由调用方清理，不参与判定 ——
+    // 否则设置页会把「用户登录时启动」显示成选中，实际跑的却是开机那条。
+    LaunchMethod::SELECTABLE
         .into_iter()
         .find(|method| is_enabled(*method))
-        .or_else(|| LaunchMethod::ALL.into_iter().find(|method| exists(*method)))
+        .or_else(|| {
+            LaunchMethod::SELECTABLE
+                .into_iter()
+                .find(|method| exists(*method))
+        })
 }
 
 /// 指定方式下，是不是**真的**会随登录启动。

@@ -4880,20 +4880,24 @@ impl Settings {
             }),
         );
 
-        // 三档：注册表 / 计划任务（登录）/ 计划任务（开机，SYSTEM 接管）。
+        // 两档：注册表 / 计划任务（登录）。「系统启动时启动」已下线 —— 那一档要管理员
+        // 注册、还要跨会话交接，远端机器上问题多，不做了。
         let launch_method = {
             let store = self.config.clone();
             self.choice_row_owned(
                 "launch-method",
                 lang.pick("选择开机自启方式", "Pick the launch method"),
                 lang.pick(
-                    "速度：系统启动时启动最快，用户登录时启动次之，普通开机启动最慢",
-                    "Speed: boot start is fastest, then sign-in start, then the standard startup entry",
+                    "用户登录时启动由任务计划程序在会话建立时拉起，比普通开机启动快一两秒",
+                    "Sign-in start is launched by Task Scheduler as soon as your session exists — a second or two ahead of the standard startup entry",
                 ),
                 vec![
                     (0u32, lang.pick("普通开机启动", "Standard start").to_string()),
-                    (1u32, lang.pick("用户登录时启动", "At sign-in").to_string()),
-                    (2u32, lang.pick("系统启动时启动", "At system boot").to_string()),
+                    (
+                        1u32,
+                        lang.pick("用户登录时启动[任务计划程序]", "At sign-in [Task Scheduler]")
+                            .to_string(),
+                    ),
                 ],
                 method.index(),
                 move |value, window, cx| {
@@ -4924,7 +4928,7 @@ impl Settings {
             )
         };
 
-        // 启动时以管理员运行。任务那两档靠 RunLevel（任务计划程序静默提权），
+        // 启动时以管理员运行。计划任务那一档靠 RunLevel（任务计划程序静默提权），
         // 注册表那档只能自己 runas 重开一次。
         let run_as_admin = {
             let store = self.config.clone();
