@@ -644,6 +644,23 @@ pub struct OsdEditor {
     history: RefCell<History>,
 }
 
+/// 两份 OSD 配置算不算「同一份设置」—— 切换在调哪套模板不算。
+///
+/// `detailed` / `brightness_template` 只说明编辑器停在哪个模板上，三套模板的
+/// 内容各自存在自己的字段里；拿它们参与比较，换个模板就会被当成「改了设置」，
+/// 标题栏跳出「未保存的更改」，关窗口还要问一句。
+fn same_look(a: &crate::config::OsdConfig, b: &crate::config::OsdConfig) -> bool {
+    if a == b {
+        return true;
+    }
+    let (mut a, mut b) = (a.clone(), b.clone());
+    a.detailed = false;
+    a.brightness_template = false;
+    b.detailed = false;
+    b.brightness_template = false;
+    a == b
+}
+
 impl OsdEditor {
     pub fn new(config: Rc<RefCell<ConfigStore>>, cx: &mut Context<Self>) -> Self {
         let baseline = config.borrow().get().osd.clone();
@@ -827,21 +844,30 @@ impl OsdEditor {
     /// 这次打开编辑器之后有没有改过。
     ///
     /// 不另设「脏标记」：编辑器里所有修改都是即时落盘的，直接和打开时那份比最准，
-    /// 也不会漏掉某条没标记的路径。
+    /// 也不会漏掉某条没标记的路径。比的是**原始配置**（不是按模板铺过的那层），
+    /// 也不把「现在在调哪套模板」算进去 —— 三套模板各存各的，换一套不是改动。
     fn is_dirty(&self) -> bool {
-        self.cfg() != self.baseline
+        !same_look(&self.raw_cfg(), &self.baseline)
     }
 
     /// 保存：把当前样子记成新的基准（值其实早就写进配置了，这一步只是「确认」）。
     fn accept_changes(&mut self, cx: &mut Context<Self>) {
-        self.baseline = self.cfg();
+        self.baseline = self.raw_cfg();
         cx.notify();
     }
 
     /// 放弃：整份还原成打开编辑器那一刻的样子，并写回配置。
+    ///
+    /// 「现在在调哪套模板」不算改动，放弃时保留 —— 不然点了放弃，人还被踢回
+    /// 另一套模板去。
     fn discard_changes(&mut self, cx: &mut Context<Self>) {
         let base = self.baseline.clone();
-        let _ = self.config.borrow_mut().update(|config| config.osd = base);
+        let template = self.raw_cfg().template();
+        let _ = self.config.borrow_mut().update(|config| {
+            let mut next = base;
+            next.set_template(template);
+            config.osd = next;
+        });
         // 都「放弃」了，就别让 Ctrl+Z 再把人送回刚才丢掉的那一堆改动里。
         self.history.borrow_mut().clear();
         self.picker = None;
@@ -5661,6 +5687,31 @@ fn sample_state(cfg: &crate::config::OsdConfig, lang: Lang, preview: Option<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 在音量 / 媒体键 / 亮度之间切换**不算**改了设置：三套模板各存各的，
+    /// 换一套只是换个地方看，不该跳出「未保存的更改」。
+    #[test]
+    fn switching_template_is_not_an_edit() {
+        let opened = crate::config::OsdConfig::default();
+        for template in [
+            crate::config::OsdTemplate::Media,
+            crate::config::OsdTemplate::Brightness,
+            crate::config::OsdTemplate::Volume,
+        ] {
+            let mut now = opened.clone();
+            now.set_template(template);
+            assert!(
+                same_look(&now, &opened),
+                "{template:?} 只是切了模板，不该算改动"
+            );
+        }
+
+        // 真的动了亮度那一套（比如把亮度条改成红的），才算改过。
+        let mut edited = opened.clone();
+        edited.set_template(crate::config::OsdTemplate::Brightness);
+        edited.set_part_color(OsdPart::Bar, "#ff0000".to_string());
+        assert!(!same_look(&edited, &opened), "亮度条改了色应该算改动");
+    }
 
     /// 加了数值项忘记把 `NUM_FIELDS` 加上去，会在 `slider_bounds[index]` 上 panic。
     #[test]
