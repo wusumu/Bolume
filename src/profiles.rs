@@ -59,7 +59,12 @@ pub const MAIN_BACKUP: &str = "主配置";
 
 /// `根目录/Configs/主配置.json`。
 pub fn main_backup(root: &Path) -> PathBuf {
-    dir(root).join(format!("{MAIN_BACKUP}.{EXTENSION}"))
+    main_backup_of(&dir(root))
+}
+
+/// `Configs/` 目录里的那份快照路径（`unique` 里判保留名用）。
+fn main_backup_of(dir: &Path) -> PathBuf {
+    dir.join(format!("{MAIN_BACKUP}.{EXTENSION}"))
 }
 
 fn ensure_dir(root: &Path) -> std::io::Result<PathBuf> {
@@ -142,9 +147,12 @@ pub fn clean_name(raw: &str) -> String {
 /// 在 `dir` 里找一个不撞名的路径：`名字.json`、`名字 (2).json`…
 fn unique(dir: &Path, stem: &str) -> PathBuf {
     let stem = if stem.is_empty() { "config" } else { stem };
+    // 「主配置」这个名字留给 `main_backup` 那份快照：新档要是占了它，
+    // 下次启用副配置就会把用户这份当快照直接覆盖掉。
+    let reserved = main_backup_of(dir);
     let mut candidate = dir.join(format!("{stem}.{EXTENSION}"));
     let mut n = 2;
-    while candidate.exists() && n < 1000 {
+    while (candidate.exists() || candidate == reserved) && n < 1000 {
         candidate = dir.join(format!("{stem} ({n}).{EXTENSION}"));
         n += 1;
     }
@@ -196,6 +204,9 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     let stem = clean_name(new_name);
     if stem.is_empty() {
         return Err("empty name".into());
+    }
+    if stem == MAIN_BACKUP {
+        return Err("reserved".into());
     }
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let target = dir.join(format!("{stem}.{EXTENSION}"));
@@ -250,6 +261,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn snapshot_name_is_reserved() {
+        let root = temp_root("reserved");
+        let config = Config::default();
+        // 新档占不了快照的名字，否则下次启用会把它当快照直接覆盖。
+        let path = create(&root, MAIN_BACKUP, &config).unwrap();
+        assert_eq!(path.file_name().unwrap(), "主配置 (2).json");
+        // 改名到快照名也要拦住。
+        let other = create(&root, "x", &config).unwrap();
+        assert_eq!(rename(&other, MAIN_BACKUP).unwrap_err(), "reserved");
+        // 快照自己照常写，且不参与副配置列表。
+        write(&main_backup(&root), &config).unwrap();
+        assert!(main_backup(&root).exists());
+        assert!(list(&root).iter().all(|profile| profile.name != MAIN_BACKUP));
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

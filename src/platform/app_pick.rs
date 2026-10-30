@@ -276,7 +276,7 @@ unsafe fn show_save_dialog(owner: isize, default_name: &str) -> Option<String> {
         FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FileSaveDialog,
         IFileSaveDialog, SIGDN_FILESYSPATH,
     };
-    use windows::core::{HSTRING, w};
+    use windows::core::w;
 
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     // 后面几条提前返回的路都要顺手收尾，写成闭包省得每处抄一遍。

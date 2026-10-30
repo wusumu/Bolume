@@ -15151,6 +15151,16 @@ impl Settings {
                 refresh_ui(window, cx);
                 return;
             }
+            Err(error) if error == "reserved" => {
+                self.set_profile_notice(
+                    lang.pick(
+                        "「主配置」这个名字留给上一次的主配置快照",
+                        "That name is kept for the previous main config",
+                    )
+                    .to_string(),
+                    cx,
+                );
+            }
             Err(error) if error == "exists" => {
                 self.set_profile_notice(
                     lang.pick("已经有同名的配置了", "A profile with that name exists")
@@ -15197,19 +15207,15 @@ impl Settings {
             }
         };
         let before = self.config.borrow().get().clone();
-        // 启用是「整份盖掉主配置」，盖上就没了 —— 所以先给现在这套留一份。
-        // 已经在 Configs 里有一模一样的一份（或者目标本身就是它自己）就不留，
-        // 免得来回切几次攒出一堆内容重复的档。
-        let already_saved = Self::same_config(&before, &source)
-            || crate::profiles::list(&self.profiles_root())
-                .iter()
-                .any(|profile| {
-                    crate::profiles::read(&profile.path)
-                        .map(|config| Self::same_config(&config, &before))
-                        .unwrap_or(false)
-                });
+        // 启用是「整份盖掉主配置」，盖上就没了 —— 所以每次都先给现在这套留一份。
+        //
+        // 只有两种情况不写：内容跟要启用的那份一模一样（点了个寂寞，别把
+        // 上一次的回退点顶掉），以及目标本身就是这份快照（写了就是自己盖自己）。
+        // 早先还有一条「Configs 里已经有一模一样的一份就不留」—— 那会让
+        // 主配置的「启用」在常见流程里变灰（比如先「副本」备份过再切档），去掉。
         let backup_path = crate::profiles::main_backup(&self.profiles_root());
-        let kept = if already_saved || path == backup_path {
+        let same = Self::same_config(&before, &source);
+        let kept = if same || path == backup_path {
             None
         } else {
             crate::profiles::write(&backup_path, &before)
