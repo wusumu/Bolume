@@ -14651,9 +14651,14 @@ impl Settings {
             return None;
         }
         let base = self.config.borrow().draft_base().cloned();
-        let page_changed = base
-            .as_ref()
-            .is_some_and(|base| Self::fields_differ(config, base, page_fields(self.page)));
+        // 「关于」页没有配置项：这一页的两条「本页」都该是灰的 —— 否则点了会变成
+        // 「整份恢复默认」，改个皮肤都找不到是谁动的。
+        let page_keys = page_fields(self.page);
+        let page_has_fields = !page_keys.is_empty();
+        let page_changed = page_has_fields
+            && base
+                .as_ref()
+                .is_some_and(|base| Self::fields_differ(config, base, Some(page_keys)));
         let all_changed = self.config.borrow().is_dirty();
 
         // 菜单宽度给一个够用的定值：中文 / 英文的字宽差一倍，量不出一个通用的。
@@ -14742,7 +14747,7 @@ impl Settings {
                         .child(self.restore_item(
                             "reset-page",
                             lang.pick("本页恢复出厂设置", "Reset this page").to_string(),
-                            true,
+                            page_has_fields,
                             Restore {
                                 factory: true,
                                 whole: false,
@@ -14807,17 +14812,17 @@ impl Settings {
             .into_any_element()
     }
 
-    /// `a` 和 `b` 在 `keys` 这些字段上有没有差别（`keys` 空 = 整份比）。
+    /// `a` 和 `b` 在 `keys` 这些字段上有没有差别（`None` = 整份比）。
     ///
     /// 只是给菜单决定「这一条能不能点」，顺手比一遍 JSON 就够 ——
     /// `Config` 没派生 `PartialEq`，为了这个去补一个也不值当。
-    fn fields_differ(a: &Config, b: &Config, keys: &[&str]) -> bool {
+    fn fields_differ(a: &Config, b: &Config, keys: Option<&[&str]>) -> bool {
         let (Ok(a), Ok(b)) = (serde_json::to_value(a), serde_json::to_value(b)) else {
             return true;
         };
-        if keys.is_empty() {
+        let Some(keys) = keys else {
             return a != b;
-        }
+        };
         keys.iter().any(|key| a.get(*key) != b.get(*key))
     }
 
@@ -14835,10 +14840,19 @@ impl Settings {
                 None => return,
             }
         };
-        let keys: &[&str] = if what.whole {
-            &[]
+        // `None` = 整份；本页就是这一页的字段清单（可能为空，比如「关于」——
+        // 空清单只代表这一页没有配置项，绝不能当成「整份恢复」）。
+        let keys = if what.whole {
+            None
         } else {
-            page_fields(page)
+            let keys = page_fields(page);
+            if keys.is_empty() {
+                self.restore_menu_open = false;
+                window.refresh();
+                cx.notify();
+                return;
+            }
+            Some(keys)
         };
         let applied = self
             .config
@@ -14955,7 +14969,7 @@ impl Settings {
                 Self::fields_differ(
                     store.get(),
                     base,
-                    &["launch_at_login", "launch_method", "run_as_admin"],
+                    Some(&["launch_at_login", "launch_method", "run_as_admin"]),
                 )
             })
         };

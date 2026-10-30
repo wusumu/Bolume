@@ -5939,15 +5939,18 @@ impl ConfigStore {
         lost
     }
 
-    /// 把 `src` 里这几个顶层字段搬进草稿（`keys` 空 = 整份，跳过 `except`）。
+    /// 把 `src` 里的字段搬进草稿：`keys = None` 是整份（跳过 `except`），
+    /// `Some` 只搬点名的那些。
     ///
     /// 「恢复更改」搬参照点、「恢复出厂设置」搬 `Config::default()`，都是这一个动作。
     /// 只改内存，照样要按「应用 / 保存」才落盘。
-    pub fn edit_draft(&mut self, src: &Config, keys: &[&str], except: &[&str]) -> bool {
-        let changed = if keys.is_empty() {
-            self.config.copy_all(src, except)
-        } else {
-            self.config.copy_fields(src, keys)
+    ///
+    /// 这里**不能**拿「空清单」表示整份：有一页（关于）本来就没有配置项，传空清单
+    /// 过去就会变成「整份恢复默认」—— 点一下「本页恢复出厂设置」，皮肤跟着变。
+    pub fn edit_draft(&mut self, src: &Config, keys: Option<&[&str]>, except: &[&str]) -> bool {
+        let changed = match keys {
+            None => self.config.copy_all(src, except),
+            Some(keys) => self.config.copy_fields(src, keys),
         };
         self.refresh_dirty();
         changed
@@ -6048,6 +6051,33 @@ mod tests {
         assert_eq!(config.settings_width, 1234.0, "窗口尺寸跟着重置会把窗缩掉");
         assert_eq!(config.config_rev, 7, "rev 重置了下次启动会重跑迁移");
         assert_eq!(config.language, Lang::Zh, "其余字段回到默认");
+    }
+
+    /// 空清单不是「整份」：`Some(&[])` 一个字段都不搬，也不会变脏。
+    ///
+    /// 「关于」页本来就没有配置项。空清单曾经被当成「整份恢复默认」——
+    /// 在那一页点「本页恢复出厂设置」，皮肤跟着被换掉了。
+    #[test]
+    fn edit_draft_with_empty_keys_touches_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("bolume-empty-keys-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = ConfigStore::load(dir.join("config.json"));
+        store.begin_draft();
+        store.update(|config| config.ui_opacity = 42).unwrap();
+        assert!(store.is_dirty());
+
+        assert!(
+            !store.edit_draft(&Config::default(), Some(&[]), &[]),
+            "空清单不该搬任何字段"
+        );
+        assert_eq!(
+            store.get().ui_opacity,
+            42,
+            "刚改的那一项不能被打回默认（那就成了整份恢复）"
+        );
+        assert!(store.is_dirty(), "什么都没动过，还是原来那条改动");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 搬过去的字段跟源配置逐字段相等（整页搬的时候最容易漏掉嵌套结构）。
