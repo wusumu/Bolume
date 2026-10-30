@@ -1053,11 +1053,13 @@ pub fn card_frame(cfg: &OsdConfig, scale: f32, content: impl IntoElement) -> Div
         .child(
             div()
                 .absolute()
-                // 摆到整像素上：差半个像素的话，转 90° 之后卡片边缘会压在像素中心，
-                // 单点覆盖算出两个半透明像素 —— 看着就是边上多出一条细线、而且
-                // 各处深浅不一。取整之后四周都是干净的锐边。
-                .left(px(((box_w - width) * 0.5 * scale).round()))
-                .top(px(((box_h - height) * 0.5 * scale).round()))
+                // 摆到**正中间**，一个像素都不要挪：转轴就是卡片中心，
+                // 这里偏半个像素的话，转 90° 之后卡片那条直边正好压在像素中心，
+                // 抗锯齿会算出两个半透明像素 —— 衬着投影看就是边上一道灰线。
+                // 想让直边落在整像素上，靠的是外面把窗口留边取整（`Osd::place`），
+                // 不是在这里凑。
+                .left(px((box_w - width) * 0.5 * scale))
+                .top(px((box_h - height) * 0.5 * scale))
                 .child(core),
         )
 }
@@ -1611,7 +1613,6 @@ impl Osd {
         // 窗口比卡片本体再大一圈：卡片的**布局矩形**也得装得下，否则转头
         // 顶点裁剪会把整块内容裁掉（见 `window_extent`）。
         let (extent_w, extent_h) = window_extent(cfg);
-        let (width, height) = (extent_w + pad * 2.0, extent_h + pad * 2.0);
         let area = target_area(self.monitor.unwrap_or(cfg.monitor));
         let margin = 24.0;
         let (ax, ay) = (area.origin.x.as_f32(), area.origin.y.as_f32());
@@ -1635,12 +1636,17 @@ impl Osd {
         // 被裁一点，也不能因为扩散变大就把卡片往里推（以前 pad 一涨，卡片就跳着走）。
         x = x.clamp(ax, (ax + aw - card_w).max(ax));
         y = y.clamp(ay, (ay + ah - card_h).max(ay));
-        // 卡片在窗口里居中，所以窗口再往左上让出 pad + 「比卡片多出来的那一圈」，
-        // 卡片本体才落在锚点上。
-        let (x, y) = (
-            x - pad - (extent_w - card_w) * 0.5,
-            y - pad - (extent_h - card_h) * 0.5,
-        );
+        // 卡片在窗口里是**居中**摆的，所以「窗口 - 卡片」这一圈必须落在整像素上。
+        // 差半个像素的话，卡片转 90° 之后边缘正好压在像素中心，抗锯齿会算出两个
+        // 半透明像素 —— 后面衬着投影时就是沿着边的一条灰线（正着摆时窗口刚好合身，
+        // 那半个像素不存在，所以只有转起来才看得见）。
+        let scale = window.scale_factor();
+        let snap = |v: f32| (v * scale).round() / scale;
+        let inset_x = snap(pad + (extent_w - card_w) * 0.5);
+        let inset_y = snap(pad + (extent_h - card_h) * 0.5);
+        let (width, height) = (card_w + inset_x * 2.0, card_h + inset_y * 2.0);
+        // 卡片本体落在整像素上，窗口再按这个偏移反推出去。
+        let (x, y) = (snap(x) - inset_x, snap(y) - inset_y);
         self.base = (x, y, width, height);
         // 强制写一遍：新位置可能刚好和上一次的位移抵消成同一个值。
         self.last_offset = f32::NAN;
