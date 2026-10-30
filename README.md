@@ -89,8 +89,9 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 **配置档**
 
 - `配置` 页可以存好几套设置：根目录 `Configs/` 里每个 `.json` 就是一份，主配置仍然是根目录的 `config.json`
-- 新建 / 改名 / 导出 / 导入都在这一页；`.json` 文件直接拖到这一页上也会导入
-- 点某份的「启用」就整份换过来、立刻生效（写进主配置），有未保存的改动时会先拦住
+- 新建的一份从出厂设置开始；新建 / 副本 / 改名 / 导出 / 导入都在这一页，`.json` 文件直接拖到这一页上也会导入
+- 「启用」切换过去、立刻生效，原来那套会留一份，主配置那行的「启用」随时能切回来；列表里用「使用中」标出当前生效的是哪一份
+- 「设为主配置」是直接覆盖主配置，会先弹一句警告 —— 原来那套不再保留（想留着就先「副本」）
 
 ## 截图
 
@@ -177,6 +178,7 @@ cargo test --release
 - `config_rev` 是配置格式版本，程序升级时会自动迁移旧配置
 - 设备名、应用音量上限、黑名单等都记在里面，换机器直接拷这个文件
 - `Configs/` 里放的是副配置（设置页 `配置` 那一页）：每份一个 `.json`，格式和 `config.json` 一模一样，里面缺的字段按默认补齐；点「启用」就是把它整份装进 `config.json`，所以切换完直接生效
+- `Configs/主配置.json` 是「上一次的主配置」快照：每次启用别的配置之前自动存一份，主配置那行的「启用」读的就是它，所以切走之后还能切回来；它不出现在副配置列表里
 
 ## 目录结构
 
@@ -227,7 +229,7 @@ vendor/
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
 - Edits stay in the window until you press **Apply** (save, keep editing) or **Save** (save and close); closing with pending edits asks save / don't save / cancel. The ≡ menu in the title bar reverts this page or everything, or restores factory defaults, per page or wholesale
 - The same ≡ menu can `Replace this page only…`: pick a backed-up `config.json` and only the fields that page owns are copied into the current draft, nothing else moves
-- Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. Create / rename / export / import there, or just drop a `.json` onto the page; **Use** installs a profile into the main config and applies it immediately
+- Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. A new profile starts from the factory defaults; create / copy / rename / export / import there, or just drop a `.json` onto the page. **Use** switches to a profile and keeps what you had (the main config row's **Use** switches back, and the list marks the active one); **Make main** overwrites the main config after a warning and keeps nothing
 - Popup animations can follow the system: the panel and the OSD both rise from the bottom edge of the screen from *behind* the taskbar, animated frame-by-frame in sync with the display refresh rate, matching how Windows 11 (and 10) animate their own volume surfaces
 
 Download the latest `Bolume_vX.XX.zip` from [Releases](../../releases), extract anywhere and run `Bolume.exe`. Windows 10/11 x64, no installer, no .NET.

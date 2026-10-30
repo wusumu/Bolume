@@ -50,6 +50,18 @@ pub fn dir(root: &Path) -> PathBuf {
     root.join(DIR_NAME)
 }
 
+/// 「上一次的主配置」那份快照的文件名（在 `Configs/` 里）。
+///
+/// 启用副配置是整份盖掉 `config.json`，盖之前先把当前这套写到这里，
+/// 所以主配置行永远有东西可以点「启用」切回去。它不参与副配置列表 ——
+/// 名字固定（不跟界面语言走），过滤也好写。
+pub const MAIN_BACKUP: &str = "主配置";
+
+/// `根目录/Configs/主配置.json`。
+pub fn main_backup(root: &Path) -> PathBuf {
+    dir(root).join(format!("{MAIN_BACKUP}.{EXTENSION}"))
+}
+
 fn ensure_dir(root: &Path) -> std::io::Result<PathBuf> {
     let dir = dir(root);
     fs::create_dir_all(&dir)?;
@@ -72,6 +84,10 @@ pub fn list(root: &Path) -> Vec<Profile> {
         let Some(name) = file_stem(&path) else {
             continue;
         };
+        // 主配置快照归主配置那行管，不算一份副配置。
+        if name == MAIN_BACKUP {
+            continue;
+        }
         let meta = entry.metadata().ok();
         out.push(Profile {
             name,

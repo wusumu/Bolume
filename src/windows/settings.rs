@@ -530,6 +530,16 @@ pub struct Settings {
     donate_image: RefCell<Option<Arc<RenderImage>>>,
     /// 标题栏那个三横杠菜单是不是开着（恢复更改 / 恢复出厂设置都在里面）。
     restore_menu_open: bool,
+    /// 当前生效的是哪一份副配置：内容跟主配置一模一样的那一份。
+    ///
+    /// 启用 / 设为主配置之后要能一眼看出「现在用的是这份」，所以不留记号，
+    /// 直接在列表里比内容 —— 重启、手动改文件都不会让标注变假。
+    profile_active: RefCell<Option<PathBuf>>,
+    /// 「上一次的主配置」快照（`Configs/主配置.json`），存在且跟当前不同才有值。
+    ///
+    /// 主配置那行的「启用」就靠它切回去 —— 启用副配置会把 `config.json` 整份盖掉，
+    /// 不留这一份就再也回不来了。
+    profile_main_backup: RefCell<Option<PathBuf>>,
     /// 配置页的列表缓存。
     ///
     /// 不在每帧里读目录（那是 IO）：进这一页、以及增删改导入之后自己刷一次。
@@ -540,6 +550,11 @@ pub struct Settings {
     profile_new: Option<String>,
     /// 点过一次「删除」的那一档：再点一次才真删（文件删了可找不回来）。
     profile_pending_delete: Option<PathBuf>,
+    /// 等确认「和主配置互换」的那一档。
+    ///
+    /// 互换会改写两个文件（主配置 + 那一份），不是随手能撤回来的动作，
+    /// 所以点「设为主配置」先弹一句问，确认了才动。
+    profile_swap: Option<PathBuf>,
     /// 配置页的临时提示（成功 / 失败），2.6 秒后自己消失。
     profile_notice: Option<(String, u64)>,
     /// 提示的序号：连着操作几次时，只有最后那条到点才把自己清掉。
@@ -2124,9 +2139,12 @@ impl Settings {
             restore_menu_open: false,
             confirm_close: false,
             profiles: RefCell::new(Vec::new()),
+            profile_active: RefCell::new(None),
+            profile_main_backup: RefCell::new(None),
             profile_rename: None,
             profile_new: None,
             profile_pending_delete: None,
+            profile_swap: None,
             profile_notice: None,
             profile_notice_seq: 0,
         }
@@ -4983,6 +5001,11 @@ impl Settings {
                     this.profile_rename = None;
                     this.profile_new = None;
                     this.profile_pending_delete = None;
+                    this.profile_swap = None;
+                }
+                // 别的页也有「设为主配置」的确认框开着走过场的情况：换页就收掉。
+                if page != Page::Profiles {
+                    this.profile_swap = None;
                 }
                 refresh_ui(window, cx);
             }))
@@ -14509,7 +14532,37 @@ impl Settings {
     /// 进这一页、以及每次增删改导入之后调一次。不在渲染里读目录：那是 IO，
     /// 一帧一次纯属浪费；外面手动改文件的话，切走再切回来就能看到。
     fn reload_profiles(&self) {
-        *self.profiles.borrow_mut() = crate::profiles::list(&self.profiles_root());
+        let list = crate::profiles::list(&self.profiles_root());
+        let live = self.config.borrow().get().clone();
+        let active = list
+            .iter()
+            .find(|profile| {
+                crate::profiles::read(&profile.path)
+                    .map(|config| Self::same_config(&config, &live))
+                    .unwrap_or(false)
+            })
+            .map(|profile| profile.path.clone());
+        let backup = crate::profiles::main_backup(&self.profiles_root());
+        let backup_usable = crate::profiles::read(&backup)
+            .map(|config| !Self::same_config(&config, &live))
+            .unwrap_or(false);
+        *self.profiles.borrow_mut() = list;
+        *self.profile_active.borrow_mut() = active;
+        *self.profile_main_backup.borrow_mut() = backup_usable.then_some(backup);
+    }
+
+    /// 两份配置是不是同一套（宽高、格式版本这种谁都不许动的字段不算）。
+    fn same_config(a: &Config, b: &Config) -> bool {
+        let (Ok(mut a), Ok(mut b)) = (serde_json::to_value(a), serde_json::to_value(b)) else {
+            return false;
+        };
+        if let (Some(a), Some(b)) = (a.as_object_mut(), b.as_object_mut()) {
+            for key in UNTOUCHED_FIELDS {
+                a.remove(key);
+                b.remove(key);
+            }
+        }
+        a == b
     }
 
     /// 配置页底部那句临时提示（2.6 秒后自己消失）。
@@ -14602,7 +14655,7 @@ impl Settings {
             .into_any_element()
     }
 
-    /// 主配置那一行：它永远在用，只能导出。
+    /// 主配置那一行：可以切回去（上一次的主配置留着快照），也能生成副本 / 导出。
     fn main_profile_row(&self, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
         let source = PathBuf::from(self.config_path.as_ref());
         let name = PathBuf::from(self.config_path.as_ref())
@@ -14610,6 +14663,27 @@ impl Settings {
             .and_then(|name| name.to_str())
             .unwrap_or("config.json")
             .to_string();
+        // 有没有「上一次的主配置」可以切回去：启用副配置时留下的那份快照，
+        // 内容跟现在一样就没意义（灰着）。
+        let backup = self.profile_main_backup.borrow().clone();
+        let has_backup = backup.is_some();
+        let restore_path = backup.unwrap_or_default();
+        let activate = self.profile_chip(
+            "profile-main-activate".into(),
+            lang.pick("启用", "Use"),
+            true,
+            has_backup,
+            cx,
+            move |this, window, cx| this.activate_profile(restore_path.clone(), window, cx),
+        );
+        let copy = self.profile_chip(
+            "profile-main-copy".into(),
+            lang.pick("副本", "Copy"),
+            false,
+            true,
+            cx,
+            |this, window, cx| this.duplicate_profile(None, window, cx),
+        );
         let export = self.profile_chip(
             "profile-main-export".into(),
             lang.pick("导出…", "Export…"),
@@ -14650,23 +14724,27 @@ impl Settings {
                             .text_color(theme::text_tertiary())
                             .child(name),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .px(px(5.))
-                            .py(px(1.))
-                            .rounded(px(theme::RADIUS_SMALL))
-                            .bg(theme::accent_soft())
-                            .text_size(theme::fs(9.5))
-                            .text_color(theme::accent())
-                            .child(lang.pick("正在使用", "In use")),
-                    ),
+                    .when(self.profile_active.borrow().is_none(), |style| {
+                        style.child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .py(px(1.))
+                                .rounded(px(theme::RADIUS_SMALL))
+                                .bg(theme::accent_soft())
+                                .text_size(theme::fs(9.5))
+                                .text_color(theme::accent())
+                                .child(lang.pick("正在使用", "In use")),
+                        )
+                    }),
             )
+            .child(activate)
+            .child(copy)
             .child(export)
             .into_any_element()
     }
 
-    /// 一份副配置：名字（点一下就地改名）+ 多久之前 + 四个动作。
+    /// 一份副配置：名字（点一下就地改名）+ 多久之前 + 五个动作。
     fn profile_row(
         &self,
         profile: &crate::profiles::Profile,
@@ -14704,6 +14782,17 @@ impl Settings {
             }))
             .child(title);
 
+        let active = self.profile_active.borrow().as_deref() == Some(path.as_path());
+        let active_badge = div()
+            .flex_none()
+            .px(px(5.))
+            .py(px(1.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::accent_soft())
+            .text_size(theme::fs(9.5))
+            .text_color(theme::accent())
+            .child(lang.pick("使用中", "Active"));
+
         let age = div()
             .flex_none()
             .text_size(theme::fs(10.))
@@ -14718,6 +14807,28 @@ impl Settings {
             !dirty,
             cx,
             move |this, window, cx| this.activate_profile(activate_path.clone(), window, cx),
+        );
+
+        let swap_path = path.clone();
+        let swap = self.profile_chip(
+            format!("profile-swap-{key}"),
+            lang.pick("设为主配置", "Make main"),
+            false,
+            !dirty,
+            cx,
+            move |this, window, cx| this.begin_main_replace(swap_path.clone(), window, cx),
+        );
+
+        let copy_path = path.clone();
+        let copy = self.profile_chip(
+            format!("profile-copy-{key}"),
+            lang.pick("副本", "Copy"),
+            false,
+            true,
+            cx,
+            move |this, window, cx| {
+                this.duplicate_profile(Some(copy_path.clone()), window, cx)
+            },
         );
 
         let rename_path = path.clone();
@@ -14782,8 +14893,11 @@ impl Settings {
             .rounded(px(theme::RADIUS_ROW))
             .when(pending_delete, |style| style.bg(theme::track()))
             .child(name)
+            .when(active, |style| style.child(active_badge))
             .child(age)
             .child(activate)
+            .child(swap)
+            .child(copy)
             .child(rename)
             .child(export)
             .child(if pending_delete {
@@ -14806,8 +14920,8 @@ impl Settings {
                 .text_size(theme::fs(10.5))
                 .text_color(theme::text_tertiary())
                 .child(lang.pick(
-                    "主配置永远是程序目录下的 config.json。下面每一份都放在 Configs 文件夹里，点「启用」就整份换过来、立刻生效，也会留在主配置里。",
-                    "The main config is always config.json next to the program. Every profile below lives in the Configs folder; “Use” swaps it in whole, applies it right away and keeps it as the main config.",
+                    "主配置永远是程序目录下的 config.json；下面每一份都放在 Configs 文件夹里。点「启用」切换过去，原来那套会留着，主配置那行能切回来；点「设为主配置」是直接覆盖，不再保留。",
+                    "The main config is always config.json next to the program; every profile below lives in the Configs folder. “Use” switches to it and keeps what you had, so the main config row can switch back; “Make main” overwrites the main config and keeps nothing.",
                 ))
                 .into_any_element(),
         );
@@ -14831,8 +14945,8 @@ impl Settings {
                     .text_size(theme::fs(11.))
                     .text_color(theme::text_tertiary())
                     .child(lang.pick(
-                        "还没有别的配置。点「新建」把当前这套存一份，或者把 .json 文件拖进来。",
-                        "No other profiles yet. Use New to save the current setup, or drop a .json file here.",
+                        "还没有别的配置。点「新建」另起一套（从出厂设置开始），或者把 .json 文件拖进来。",
+                        "No other profiles yet. Use New to start a fresh one from the factory defaults, or drop a .json file here.",
                     ))
                     .into_any_element(),
             );
@@ -14902,8 +15016,8 @@ impl Settings {
                     .text_size(theme::fs(10.))
                     .text_color(theme::text_tertiary())
                     .child(lang.pick(
-                        "有未保存的更改：先应用或保存，才能切配置",
-                        "Unsaved changes: apply or save before switching",
+                        "有未保存的更改：先应用或保存，才能切换配置",
+                        "Unsaved changes: apply or save before switching the main config",
                     )),
             );
         }
@@ -14995,7 +15109,9 @@ impl Settings {
             return;
         }
         self.profile_pending_delete = None;
-        let config = self.config.borrow().get().clone();
+        // 新建的一档从**出厂默认**开始，不是当前配置的复印件：
+        // 存一份跟现在一模一样的档，再「设为主配置」等于什么都没发生。
+        let config = crate::config::Config::default();
         match crate::profiles::create(&self.profiles_root(), &name, &config) {
             Ok(path) => {
                 self.reload_profiles();
@@ -15005,9 +15121,9 @@ impl Settings {
                     .unwrap_or(&name)
                     .to_string();
                 let text = if lang.is_en() {
-                    format!("Saved {saved}")
+                    format!("Created {saved} (factory defaults)")
                 } else {
-                    format!("已保存 {saved}")
+                    format!("已新建 {saved}（出厂设置）")
                 };
                 self.set_profile_notice(text, cx);
             }
@@ -15048,6 +15164,8 @@ impl Settings {
     }
 
     /// 「启用」：把这一档整份装进主配置，立刻生效。
+    ///
+    /// 这一份文件本身不动 —— 想「拿它换掉主配置、把旧的存回来」用「设为主配置」。
     fn activate_profile(
         &mut self,
         path: PathBuf,
@@ -15058,7 +15176,7 @@ impl Settings {
         if self.config.borrow().is_dirty() {
             self.set_profile_notice(
                 lang.pick(
-                    "先应用或保存当前更改，再切配置",
+                    "先应用或保存当前更改，再启用别的配置",
                     "Apply or save your changes before switching",
                 )
                 .to_string(),
@@ -15066,6 +15184,114 @@ impl Settings {
             );
             return;
         }
+        let source = match crate::profiles::read(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                let text = if lang.is_en() {
+                    format!("Cannot read this profile: {error}")
+                } else {
+                    format!("这份配置读不进来：{error}")
+                };
+                self.set_profile_notice(text, cx);
+                return;
+            }
+        };
+        let before = self.config.borrow().get().clone();
+        // 启用是「整份盖掉主配置」，盖上就没了 —— 所以先给现在这套留一份。
+        // 已经在 Configs 里有一模一样的一份（或者目标本身就是它自己）就不留，
+        // 免得来回切几次攒出一堆内容重复的档。
+        let already_saved = Self::same_config(&before, &source)
+            || crate::profiles::list(&self.profiles_root())
+                .iter()
+                .any(|profile| {
+                    crate::profiles::read(&profile.path)
+                        .map(|config| Self::same_config(&config, &before))
+                        .unwrap_or(false)
+                });
+        let backup_path = crate::profiles::main_backup(&self.profiles_root());
+        let kept = if already_saved || path == backup_path {
+            None
+        } else {
+            crate::profiles::write(&backup_path, &before)
+                .ok()
+                .map(|()| {
+                    backup_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+        };
+        let installed = self
+            .config
+            .borrow_mut()
+            .install(&source, &UNTOUCHED_FIELDS);
+        if let Err(error) = installed {
+            self.set_profile_notice(error.to_string(), cx);
+            return;
+        }
+        let after = self.config.borrow().get().clone();
+        // 切过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
+        let autostart_changed = Self::fields_differ(
+            &before,
+            &after,
+            Some(&["launch_at_login", "launch_method", "run_as_admin"]),
+        );
+        self.profile_rename = None;
+        self.profile_new = None;
+        self.profile_pending_delete = None;
+        self.profile_swap = None;
+        self.close_transient_popups();
+        self.apply_everything(&after, None, autostart_changed, window, cx);
+        self.reload_profiles();
+        let lang = after.language;
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let text = match (&kept, lang.is_en()) {
+            (Some(file), true) => format!("Switched to {name}; the previous setup is kept in {file}"),
+            (Some(file), false) => format!("已切换到 {name}，原来那套存进了 {file}"),
+            (None, true) => format!("Switched to {name}"),
+            (None, false) => format!("已切换到 {name}"),
+        };
+        self.set_profile_notice(text, cx);
+        refresh_ui(window, cx);
+    }
+
+    /// 「设为主配置」：先弹一句确认。
+    ///
+    /// 这一步是**直接覆盖**主配置 —— 原来那套不再单独保留，所以不给「点一下就换」。
+    fn begin_main_replace(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let lang = self.config.borrow().get().language;
+        if self.config.borrow().is_dirty() {
+            self.set_profile_notice(
+                lang.pick(
+                    "先应用或保存当前更改，再设为主配置",
+                    "Apply or save your changes before switching",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        self.profile_rename = None;
+        self.profile_new = None;
+        self.profile_pending_delete = None;
+        self.profile_swap = Some(path);
+        refresh_ui(window, cx);
+    }
+
+    /// 真覆盖：这一份整份装进主配置，原来那套不再单独保留（所以上面要问一句）。
+    fn replace_main_with(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.profile_swap = None;
+        let lang = self.config.borrow().get().language;
         let source = match crate::profiles::read(&path) {
             Ok(source) => source,
             Err(error) => {
@@ -15088,30 +15314,86 @@ impl Settings {
             return;
         }
         let after = self.config.borrow().get().clone();
-        // 切过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
+        // 换过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
         let autostart_changed = Self::fields_differ(
             &before,
             &after,
             Some(&["launch_at_login", "launch_method", "run_as_admin"]),
         );
-        self.profile_rename = None;
-        self.profile_new = None;
-        self.profile_pending_delete = None;
         self.close_transient_popups();
         self.apply_everything(&after, None, autostart_changed, window, cx);
         self.reload_profiles();
         let lang = after.language;
-        let name = path
+        let stem = path
             .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or("")
             .to_string();
         let text = if lang.is_en() {
-            format!("Switched to {name}")
+            format!("{stem} replaced the main config")
         } else {
-            format!("已切换到 {name}")
+            format!("{stem} 已覆盖主配置")
         };
         self.set_profile_notice(text, cx);
+        refresh_ui(window, cx);
+    }
+
+    /// 「副本」：把某一档（`None` = 当前主配置）复制成新的一份，不动原件。
+    fn duplicate_profile(
+        &mut self,
+        from: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lang = self.config.borrow().get().language;
+        let (source, base) = match from {
+            Some(path) => {
+                let stem = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                match crate::profiles::read(&path) {
+                    Ok(config) => (config, stem),
+                    Err(error) => {
+                        let text = if lang.is_en() {
+                            format!("Cannot read this profile: {error}")
+                        } else {
+                            format!("这份配置读不进来：{error}")
+                        };
+                        self.set_profile_notice(text, cx);
+                        return;
+                    }
+                }
+            }
+            None => (
+                self.config.borrow().get().clone(),
+                lang.pick("主配置", "Main config").to_string(),
+            ),
+        };
+        let name = if lang.is_en() {
+            format!("{base} copy")
+        } else {
+            format!("{base} 副本")
+        };
+        match crate::profiles::create(&self.profiles_root(), &name, &source) {
+            Ok(path) => {
+                self.reload_profiles();
+                let saved = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&name)
+                    .to_string();
+                let text = if lang.is_en() {
+                    format!("Copied to {saved}")
+                } else {
+                    format!("已生成副本 {saved}")
+                };
+                self.set_profile_notice(text, cx);
+            }
+            Err(error) => self.set_profile_notice(error.to_string(), cx),
+        }
+        refresh_ui(window, cx);
     }
 
     /// 删除：点第一次只是变成「确认删除」，再点一次才真删。
@@ -16012,6 +16294,119 @@ impl Settings {
         let _ = cx;
     }
 
+    /// 「设为主配置」的确认框：这一步直接覆盖 config.json，问一句再动。
+    fn profile_swap_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let path = self.profile_swap.clone()?;
+        let stem = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let file = format!("{stem}.json");
+        let target = path.clone();
+        let confirm = div()
+            .id("profile-swap-confirm")
+            .px(px(12.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::accent())
+            .text_color(theme::text_primary())
+            .text_size(theme::fs(11.5))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.88))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.replace_main_with(target.clone(), window, cx);
+            }))
+            .child(lang.pick("替换", "Replace"));
+        let cancel = div()
+            .id("profile-swap-cancel")
+            .px(px(12.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::track())
+            .text_color(theme::text_secondary())
+            .text_size(theme::fs(11.5))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.88))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.profile_swap = None;
+                window.refresh();
+                cx.notify();
+            }))
+            .child(lang.pick("取消", "Cancel"));
+
+        Some(
+            div()
+                .id("profile-swap-backdrop")
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgb_to_hsla(rgba(0x00000059)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.profile_swap = None;
+                        window.refresh();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(360.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .p(px(16.))
+                        .rounded(px(theme::RADIUS_WINDOW))
+                        .border_1()
+                        .border_color(theme::border_strong())
+                        .bg(theme::opaque(theme::surface_elevated()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation()
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(13.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::text_primary())
+                                .child(lang.pick("设为主配置", "Make it the main config")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(11.))
+                                .text_color(theme::danger())
+                                .child(if lang.is_en() {
+                                    format!(
+                                        "This overwrites config.json with everything in {file}. The current main config is not kept."
+                                    )
+                                } else {
+                                    format!(
+                                        "会用 {file} 整份覆盖 config.json，当前主配置不再保留。"
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(confirm)
+                                .child(cancel),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// 「有未保存的更改」确认框：保存 / 不保存 / 取消。
     fn confirm_close_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.confirm_close {
@@ -16304,6 +16699,7 @@ impl Render for Settings {
         let tray_menu = self.tray_menu_overlay(&config, lang, viewport, cx);
         let restore_menu = self.restore_menu_overlay(&config, lang, cx);
         let confirm_close = self.confirm_close_overlay(lang, cx);
+        let profile_swap = self.profile_swap_overlay(lang, cx);
         let apply_bar = self.apply_bar(lang, cx);
         let donate = self.donate_overlay(lang, cx);
 
@@ -16555,6 +16951,8 @@ impl Render for Settings {
             .children(restore_menu)
             // 捐赠浮层是模态，压在所有弹层之上。
             .children(donate)
+            // 互换配置的确认框也是模态，压在捐赠浮层之上。
+            .children(profile_swap)
             // 「有未保存的更改」是关窗前的最后一问，压在最上面。
             .children(confirm_close)
     }
