@@ -226,6 +226,18 @@ pub fn rotated_bounds(cfg: &OsdConfig) -> (f32, f32) {
     if angle == 0.0 {
         return (width, height);
     }
+    // 90° 的整数倍直接换宽高。`sin_cos` 给出的 cos 在 f32 下不是精确的 0
+    // （转成弧度再算约 6e-8），乘上 191 之后包围盒就成了 50.000008 —— 卡片在
+    // 盒子里的偏移跟着变成 -70.499996，边缘压整像素还是压半格全看浮点运气，
+    // 转出来的边于是有的角度干净、有的角度糊。整数倍没有斜边，用不着三角函数。
+    let quarter = angle.rem_euclid(360.0);
+    if quarter % 90.0 == 0.0 {
+        return if (quarter / 90.0) as i32 % 2 == 0 {
+            (width, height)
+        } else {
+            (height, width)
+        };
+    }
     let (sin, cos) = angle.to_radians().sin_cos();
     (
         (width * cos).abs() + (height * sin).abs(),

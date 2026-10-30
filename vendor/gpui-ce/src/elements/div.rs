@@ -26,6 +26,7 @@ use crate::{
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     radians, size,
 };
+use crate::util::round_to_device_pixel;
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;
@@ -2055,10 +2056,21 @@ impl Element for Div {
                 paint(self, window, cx);
             } else {
                 // 顺时针度数 → 弧度；绕元素自己的中心。
+                //
+                // Bolume patch: 中心按设备像素取整，和绘制用的 bounds 对齐。
+                // `paint_quad` 会先把 bounds 四舍五入到设备像素（`snap_bounds`，
+                // 半像素向零），顶点由取整后的 bounds 生成；中心要是还用未取整的
+                // `bounds.center()`，两者就差半个像素 —— 转 90° 之后卡片那条直边
+                // 正好压在像素中心，抗锯齿算出一列半透明像素，衬着投影就是沿着
+                // 边的一条灰线（而且左右深浅还不一样）。
+                let scale_factor = window.scale_factor();
+                let center = bounds.center();
+                let center = point(
+                    px(round_to_device_pixel(center.x.0, scale_factor) / scale_factor),
+                    px(round_to_device_pixel(center.y.0, scale_factor) / scale_factor),
+                );
                 let angle = radians(rotation.to_radians());
-                window.with_element_rotation(bounds.center(), angle, |window| {
-                    paint(self, window, cx)
-                });
+                window.with_element_rotation(center, angle, |window| paint(self, window, cx))
             }
         });
     }
