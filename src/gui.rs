@@ -184,6 +184,18 @@ pub fn displays_snapshot(cx: &App) -> Vec<DisplayInfo> {
     cx.global::<AppState>().displays.borrow().clone()
 }
 
+/// 有没有一台真调得动的显示器（DDC/CI 通、没开 HDR）。
+///
+/// 一台都没有的时候亮度面板整个不出场，设置页那两个开关也置灰 ——
+/// 弹一扇只能说「没有可调的显示器」的窗，不如干脆不弹。
+pub fn any_adjustable_display(cx: &App) -> bool {
+    cx.global::<AppState>()
+        .displays
+        .borrow()
+        .iter()
+        .any(|display| display.adjustable())
+}
+
 /// 融合模式那块亮度块（音量面板里的子视图）要用的几样东西。
 ///
 /// 它读的显示器列表、DDC 线程和错误信息都和独立亮度窗口是同一份 —— 放在面板里
@@ -1280,8 +1292,10 @@ pub fn sync_brightness(cx: &mut App) {
                 .unwrap_or(false)
         })
         .unwrap_or(false);
+    // 一台调的都没有（全是 HDR / DDC/CI 不通）就别开这扇窗：打开也只是干看着。
+    let usable = any_adjustable_display(cx);
     // 融合模式：亮度块长在音量面板里，独立那扇窗一直收着（建出来也浪费一份合成表面）。
-    if enabled && visible && !merged {
+    if enabled && usable && visible && !merged {
         show_brightness(cx);
     } else {
         hide_brightness(cx);
@@ -2209,6 +2223,10 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
     let mut shown: Option<f32> = None;
     for index in targets {
         let info = &list[index];
+        // 开着 HDR / DDC/CI 不通的跳过：写下去画面不变，界面却记下了新值。
+        if !info.adjustable() {
+            continue;
+        }
         let Some(current) = info.brightness else {
             continue;
         };

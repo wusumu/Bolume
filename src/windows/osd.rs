@@ -2220,7 +2220,8 @@ impl Osd {
         let channel = displays
             .borrow()
             .get(index)
-            .filter(|info| info.brightness.is_some())
+            // 开着 HDR 的屏调了也看不出来，当它没通道 —— 条照旧跟手，只是不写下去。
+            .filter(|info| info.adjustable())
             .map(|info| info.key.clone());
         if let Some(key) = channel {
             engine.send(crate::display::DisplayCommand::SetBrightness {

@@ -58,6 +58,46 @@ const FLASH_MS: u64 = 320;
 /// 闪光最亮那一下的不透明度（之后二次缓出淡掉）。
 const FLASH_PEAK: f32 = 0.45;
 
+/// 一台显示器在这一屏上的状态：能调 / 开了 HDR / DDC/CI 不通。
+///
+/// 三种状态长得不一样：能调的是百分比读数、条也是活的；后两种读数位置换成
+/// 一句原因（`HDR` / `不支持`），条和步进钮一并变灰 —— 拖了没反应比直接说
+/// 「调不了」难受得多。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// 能调，值是百分比。
+    Ready(u32),
+    /// 开着 HDR：DDC/CI 照写不误，画面被色调映射吃掉。
+    Hdr,
+    /// DDC/CI 读不通（笔记本内屏、转接线、显示器里没开 DDC/CI）。
+    Unsupported,
+}
+
+impl Slot {
+    fn of(display: &DisplayInfo, percent: Option<u32>) -> Self {
+        if display.hdr {
+            Slot::Hdr
+        } else {
+            match percent {
+                Some(value) => Slot::Ready(value),
+                None => Slot::Unsupported,
+            }
+        }
+    }
+
+    /// 拖得动才给值，否则条摆到 0 也无所谓（反正是灰的）。
+    fn value(self) -> u32 {
+        match self {
+            Slot::Ready(value) => value,
+            Slot::Hdr | Slot::Unsupported => 0,
+        }
+    }
+
+    fn editable(self) -> bool {
+        matches!(self, Slot::Ready(_))
+    }
+}
+
 /// 竖向排版的一列有多宽、节奏怎么走。
 ///
 /// 一列要同时装下「− 100% +」这一排和几个预设格子，所以宽度不是随便压的：
@@ -434,9 +474,22 @@ impl Brightness {
         }
     }
 
+    /// 面板里真会画出来的那几台：DDC/CI 不通、开着 HDR 的都不进面板。
+    ///
+    /// 这两种是「拖了没反应」的屏，留在面板里只能让人怀疑是不是坏了 ——
+    /// 显示器页的列表里会写清原因，面板只管能调的那几台。
+    fn panel_displays(&self) -> Vec<DisplayInfo> {
+        self.displays
+            .borrow()
+            .iter()
+            .filter(|display| display.adjustable())
+            .cloned()
+            .collect()
+    }
+
     /// 窗口高度：横排是标题 + 每台一行；竖排是标题 + 一列。
     pub fn desired_height(&self) -> f32 {
-        panel_size(&self.cfg(), self.displays.borrow().len()).1
+        panel_size(&self.cfg(), self.panel_displays().len()).1
     }
 
     /// 点数值格：进入手动输入。
@@ -467,6 +520,16 @@ impl Brightness {
     }
 
     fn set_brightness(&self, key: &str, value: u32, cx: &mut App) {
+        // 调不动的（开着 HDR、DDC/CI 不通）一律不发：工作线程那边虽然也会拦，
+        // 但这里先挡住就不会记一笔假的预测值，条也不会自己跳一下。
+        if !self
+            .displays
+            .borrow()
+            .iter()
+            .any(|display| display.key == key && display.adjustable())
+        {
+            return;
+        }
         self.engine.send(DisplayCommand::SetBrightness {
             key: key.to_string(),
             value: value.min(100),
@@ -571,16 +634,15 @@ impl Brightness {
         }
         let index = crate::display::monitor_index_at_cursor().min(displays.len() - 1);
         let display = displays.get(index)?;
-        display.brightness?;
-        Some(display.key.clone())
+        display.adjustable().then(|| display.key.clone())
     }
 
-    /// 所有能读亮度的显示器（DDC/CI 不通的跳过）。
+    /// 所有调得动的显示器（DDC/CI 不通、开着 HDR 的都跳过）。
     fn lit_display_keys(&self) -> Vec<String> {
         self.displays
             .borrow()
             .iter()
-            .filter(|display| display.brightness.is_some())
+            .filter(|display| display.adjustable())
             .map(|display| display.key.clone())
             .collect()
     }
@@ -1037,7 +1099,7 @@ impl Brightness {
             return;
         }
         let cfg = self.cfg();
-        let displays = self.displays.borrow().len();
+        let displays = self.panel_displays().len();
         let (width, height) = panel_size(&cfg, displays);
         self.last_height = height;
         let area = cx
@@ -1130,7 +1192,8 @@ impl Render for Brightness {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cfg = self.cfg();
         let lang = cfg.language;
-        let displays = self.displays.borrow().clone();
+        // 只画能调的那几台：HDR / DDC/CI 不通的不是「灰条」，是根本不出现。
+        let displays = self.panel_displays();
         let error = self.error.borrow().clone();
         let embedded = self.embed.is_some();
 
@@ -1314,13 +1377,14 @@ impl Brightness {
     fn value_slot(
         &self,
         key: &str,
-        value: u32,
-        editable: bool,
+        slot: Slot,
         width: f32,
         align_end: bool,
         lang: Lang,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let editable = slot.editable();
+        let value = slot.value();
         let editing = matches!(&self.editing, Some((edit_key, _)) if edit_key == key);
         let edit_text = match &self.editing {
             Some((edit_key, buffer)) if edit_key == key => buffer.clone(),
@@ -1350,10 +1414,11 @@ impl Brightness {
             .when(!editable, |style| style.text_color(theme::text_tertiary()))
             .when(editable, |style| style.text_color(theme::text_primary()))
             .when(!editing, |style| {
-                style.child(if editable {
-                    format!("{value}%")
-                } else {
-                    lang.pick("不支持", "N/A").to_string()
+                style.child(match slot {
+                    Slot::Ready(value) => format!("{value}%"),
+                    // HDR 单占一个词：这台的 DDC 读数是有的，但调了不生效。
+                    Slot::Hdr => lang.pick("HDR", "HDR").to_string(),
+                    Slot::Unsupported => lang.pick("不支持", "N/A").to_string(),
                 })
             })
             .when(editing, |style| {
@@ -1475,15 +1540,15 @@ impl Brightness {
         let key = display.key.clone();
         let config = self.cfg();
         let name = config.display_label(&key, &display.name);
-        let percent = self.current_percent(&key);
-        let editable = percent.is_some();
-        let value = percent.unwrap_or(0);
+        // 开了 HDR / DDC/CI 不通都不可调：读数位置换成原因，条和步进钮一起变灰。
+        let slot = Slot::of(display, self.current_percent(&key));
+        let editable = slot.editable();
         let slider_value = self
             .drag_values
             .borrow()
             .get(&key)
             .copied()
-            .unwrap_or(value as f32 / 100.0);
+            .unwrap_or(display.brightness.unwrap_or(0) as f32 / 100.0);
 
         // 名称行：名字 + 步进 + 保存预设。读数挪到下面跟亮度条同一排去了，
         // 这一行空出来的右端正好摆「保存预设」—— 从前它独占一行，白占 21px。
@@ -1520,7 +1585,7 @@ impl Brightness {
             .pl(px(H_BAR_INSET))
             .gap(px(H_READOUT_GAP))
             .child(div().flex_1().min_w_0().child(slider))
-            .child(self.value_slot(&key, value, editable, H_READOUT_WIDTH, true, lang, cx));
+            .child(self.value_slot(&key, slot, H_READOUT_WIDTH, true, lang, cx));
 
         // 这一块的矩形：拖预设过来时按它认落点（`drag_sensors` 里读）。
         let rects = self.block_rects.clone();
@@ -1577,21 +1642,20 @@ impl Brightness {
     ) -> gpui::AnyElement {
         let cfg = self.cfg();
         let key = display.key.clone();
-        let percent = self.current_percent(&key);
-        let editable = percent.is_some();
-        let value = percent.unwrap_or(0);
+        let slot = Slot::of(display, self.current_percent(&key));
+        let editable = slot.editable();
         let slider_value = self
             .drag_values
             .borrow()
             .get(&key)
             .copied()
-            .unwrap_or(value as f32 / 100.0);
+            .unwrap_or(display.brightness.unwrap_or(0) as f32 / 100.0);
 
         let label = self.column_label(display, index, cfg.brightness.name_mode, window);
 
         // 一列能用的高度：总高扣掉标题（独立窗才有）和底部的预设排，再扣掉固定的几段。
         let m = metrics(&cfg);
-        let displays = self.displays.borrow().len();
+        let displays = self.panel_displays().len();
         let fader = (columns_height(&cfg, displays, self.embed.is_some())
             - column_fixed_height(&cfg))
         .max(V_FADER_MIN);
@@ -1615,7 +1679,7 @@ impl Brightness {
             .h(px(m.step_row))
             .flex_none()
             .child(self.step_button(&key, editable, "−", -1, 16.0, cx))
-            .child(self.value_slot(&key, value, editable, 30.0, false, lang, cx))
+            .child(self.value_slot(&key, slot, 30.0, false, lang, cx))
             .child(self.step_button(&key, editable, "+", 1, 16.0, cx));
 
         // 列底只留「保存预设」：预设本体挪到整块底部那一排共用了。

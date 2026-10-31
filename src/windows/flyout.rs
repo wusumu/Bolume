@@ -650,6 +650,10 @@ impl Flyout {
         if !cfg.brightness.merged_with_audio() {
             return None;
         }
+        // 一台调的都没有就不占地方：融合块只画能调的那几台，空着不如不长。
+        if self.display_count() == 0 {
+            return None;
+        }
         let vertical = cfg.panel_layout.is_vertical();
         Some(crate::windows::brightness::Embed {
             vertical,
@@ -721,8 +725,13 @@ impl Flyout {
         self.brightness_room = (height, width);
     }
 
+    /// 亮度块里会画几台：和亮度面板同一份口径（调不动的屏不进面板）。
     fn display_count(&self) -> usize {
-        self.displays.borrow().len()
+        self.displays
+            .borrow()
+            .iter()
+            .filter(|display| display.adjustable())
+            .count()
     }
 
     fn display_volume(&self, raw: f32) -> f32 {

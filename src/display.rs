@@ -15,9 +15,16 @@ use std::{
 
 use ddc::Ddc;
 use ddc_winapi::Monitor;
-use windows::Win32::Foundation::{LPARAM, POINT, RECT};
+use windows::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+};
+use windows::Win32::Foundation::{ERROR_SUCCESS, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MONITORINFOEXW, MonitorFromPoint,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::BOOL;
@@ -89,6 +96,110 @@ pub const VCP_BRIGHTNESS: u8 = 0x10;
 /// MCCS 的对比度 VCP 码：现在就留好，将来加对比度只需多一条命令。
 pub const VCP_CONTRAST: u8 = 0x12;
 
+/// 这块屏（`HMONITOR`）的 GDI 设备名，形如 `\\.\DISPLAY1`。
+fn gdi_device_name(handle: HMONITOR) -> Option<String> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    // `MONITORINFOEXW` 的头一段就是 `MONITORINFO`，所以这里能直接转过去。
+    let ok = unsafe { GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) };
+    if !ok.as_bool() {
+        return None;
+    }
+    let len = info
+        .szDevice
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(info.szDevice.len());
+    Some(String::from_utf16_lossy(&info.szDevice[..len]))
+}
+
+/// 开着 HDR（Windows 的「高级色彩」）的屏，返回它们的 GDI 设备名。
+///
+/// HDR 打开之后系统的色调映射会把背光那点变化吃掉，DDC/CI 的亮度照写不误，
+/// 画面上却看不出变化。与其让人拖着条怀疑坏没坏，不如照实标一句「开不了」。
+///
+/// 走 `QueryDisplayConfig` 那套：每条**活动**路径的源设备名（`\\.\DISPLAY1`）
+/// 能直接和 `GetMonitorInfoW` 报的名字对上，目标那头问一次高级色彩状态。
+/// 老系统不认这个查询会返回失败，那就当没开 HDR —— 不误伤能调的机器。
+fn hdr_screens() -> Vec<String> {
+    let mut names = Vec::new();
+    let mut paths = 0u32;
+    let mut modes = 0u32;
+    unsafe {
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) != ERROR_SUCCESS
+        {
+            return names;
+        }
+    }
+    if paths == 0 {
+        return names;
+    }
+    // 拿完大小的这一瞬间拓扑可能变了，`QueryDisplayConfig` 会报 INSUFFICIENT_BUFFER
+    // 并把需要的量写回来；再试一次就够，真拿不到就按「都没开 HDR」处理。
+    let mut path_buf = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+    let mut mode_buf = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+    let status = unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut paths,
+            path_buf.as_mut_ptr(),
+            &mut modes,
+            mode_buf.as_mut_ptr(),
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return names;
+    }
+    path_buf.truncate(paths as usize);
+
+    for path in &path_buf {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        source.header.adapterId = path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
+            continue;
+        }
+
+        let mut color = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+        color.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        color.header.size = std::mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+        color.header.adapterId = path.targetInfo.adapterId;
+        color.header.id = path.targetInfo.id;
+        if unsafe { DisplayConfigGetDeviceInfo(&mut color.header) } != 0 {
+            continue;
+        }
+        // 位 0 = 这台支持高级色彩，位 1 = 现在开着。只认「开着」。
+        if unsafe { color.Anonymous.value } & 0b10 == 0 {
+            continue;
+        }
+        let len = source
+            .viewGdiDeviceName
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(source.viewGdiDeviceName.len());
+        names.push(String::from_utf16_lossy(&source.viewGdiDeviceName[..len]));
+    }
+    names
+}
+
+/// 按 `EnumDisplayMonitors` 的顺序标一遍：这块屏开没开 HDR。
+fn hdr_flags() -> Vec<bool> {
+    let screens = hdr_screens();
+    if screens.is_empty() {
+        return Vec::new();
+    }
+    screen_handles()
+        .iter()
+        .map(|handle| {
+            gdi_device_name(*handle)
+                .is_some_and(|name| screens.iter().any(|screen| screen.eq_ignore_ascii_case(&name)))
+        })
+        .collect()
+}
+
 /// 界面发往工作线程的命令。
 #[derive(Clone, Debug)]
 pub enum DisplayCommand {
@@ -111,6 +222,19 @@ pub struct DisplayInfo {
     /// 亮度百分比（0..=100）。`None` = 这台显示器的 DDC/CI 不通（笔记本内屏、
     /// 便宜转接线、或者显示器关着 DDC/CI）。
     pub brightness: Option<u32>,
+    /// 这台开着 HDR。开着的时候 DDC/CI 的亮度照写不误，可画面被系统的色调映射
+    /// 吃掉了 —— 界面上一律标出来，并且不给调。
+    pub hdr: bool,
+}
+
+impl DisplayInfo {
+    /// 能不能调亮度：DDC/CI 读得通、并且没开 HDR。
+    ///
+    /// 界面上凡是「拖得动 / 点得动 / 套得到」的地方都按它判，别再单独看
+    /// `brightness`，否则 HDR 那台会照旧给出一个拖了没反应的条。
+    pub fn adjustable(&self) -> bool {
+        self.brightness.is_some() && !self.hdr
+    }
 }
 
 /// 工作线程发回界面的事件。
@@ -172,6 +296,8 @@ struct Entry {
     readable: bool,
     /// 连续读空了几轮：决定下一次补读隔多久（指数退避）。
     misses: u32,
+    /// 这块屏开着 HDR（枚举时问一次；窗口重新枚举会再问）。
+    hdr: bool,
 }
 
 impl Entry {
@@ -180,6 +306,7 @@ impl Entry {
             key: self.key.clone(),
             name: self.name.clone(),
             brightness: self.readable.then(|| percent_of(self.raw, self.max)),
+            hdr: self.hdr,
         }
     }
 
@@ -356,6 +483,7 @@ fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
     };
 
     let mut entries = Vec::with_capacity(monitors.len());
+    let hdr = hdr_flags();
     for (index, monitor) in monitors.into_iter().enumerate() {
         let name = monitor.description();
         let name = if name.trim().is_empty() {
@@ -372,6 +500,8 @@ fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
             raw: 0,
             readable: false,
             misses: 0,
+            // 序号和 `EnumDisplayMonitors` 一致（见 `monitor_index_at_cursor`）。
+            hdr: hdr.get(index).copied().unwrap_or(false),
         };
         entry.reread();
         entries.push(entry);
@@ -419,6 +549,11 @@ fn apply(entries: &mut [Entry], key: &str, percent: u32) {
     let Some(entry) = entries.iter_mut().find(|entry| entry.key == key) else {
         return;
     };
+    // 开着 HDR 的屏不让写：写下去画面不变，界面却显示「已调到 40%」，等于骗人。
+    // （界面那边本来就按 `adjustable()` 禁掉了，这里是第二道闸。）
+    if entry.hdr {
+        return;
+    }
     // 上一次扫描没读到，不代表这台不能写：写之前先补读一次。
     // （显示器刚醒、显卡刚初始化完的那一下读不到很正常，直接放弃就是「拖不动」。）
     if !entry.readable && !entry.reread() {

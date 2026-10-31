@@ -291,6 +291,15 @@ pub fn run_display(write: Option<(&str, u32)>, rounds: u32) {
             Some(DisplayEvent::Monitors(list)) => {
                 println!("第 {} 轮枚举：{} 台", round + 1, list.len());
                 for info in &list {
+                    if info.hdr {
+                        println!(
+                            "  {:<34}  开 HDR（不可调）{:<5}  key={}",
+                            info.name,
+                            info.brightness.map(|p| format!("{p}%")).unwrap_or_default(),
+                            info.key
+                        );
+                        continue;
+                    }
                     match info.brightness {
                         Some(percent) => {
                             println!("  {:<34} {percent:>3}%  key={}", info.name, info.key)

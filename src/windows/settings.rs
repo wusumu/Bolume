@@ -2402,8 +2402,24 @@ impl Settings {
         value: bool,
         on_toggle: impl Fn(&mut Window, &mut App) + 'static,
     ) -> AnyElement {
-        let knob_x = if value { 16.0 } else { 2.0 };
-        let track_color = if value {
+        self.toggle_row_when(id, title, description, value, true, on_toggle)
+    }
+
+    /// 带「能不能点」的开关行：条件不成立时整行置灰、点了也不动。
+    ///
+    /// 用在「这台机器根本不支持」的开关上（比如没有一台能调亮度的显示器时的
+    /// 亮度面板开关）：点了翻转一下配置、面板还是不出现，比灰着更让人糊涂。
+    fn toggle_row_when(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        description: &'static str,
+        value: bool,
+        usable: bool,
+        on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let knob_x = if value && usable { 16.0 } else { 2.0 };
+        let track_color = if value && usable {
             theme::accent()
         } else {
             theme::track()
@@ -2417,9 +2433,11 @@ impl Settings {
             .px(px(9.))
             .py(px(5.))
             .rounded(px(theme::RADIUS_ROW))
-            .cursor_pointer()
-            .hover(|style| style.bg(theme::surface_hover()))
-            .on_click(move |_, window, cx| on_toggle(window, cx))
+            .when(usable, |row| {
+                row.cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(move |_, window, cx| on_toggle(window, cx))
+            })
             .child(
                 div()
                     .flex()
@@ -2430,7 +2448,11 @@ impl Settings {
                     .child(
                         div()
                             .text_size(theme::fs(13.))
-                            .text_color(theme::text_primary())
+                            .text_color(if usable {
+                                theme::text_primary()
+                            } else {
+                                theme::text_tertiary()
+                            })
                             .child(title),
                     )
                     // 描述留空就不占位置：有些开关一眼就懂，不需要第二行解释。
@@ -2458,7 +2480,11 @@ impl Settings {
                             .left(px(knob_x))
                             .size(px(16.))
                             .rounded(px(8.))
-                            .bg(theme::text_primary()),
+                            .bg(if usable {
+                                theme::text_primary()
+                            } else {
+                                theme::text_tertiary()
+                            }),
                     ),
             )
             .into_any_element()
@@ -13994,10 +14020,28 @@ impl Settings {
             .into_any_element()
     }
 
-    /// 显示器页：亮度调节总开关、步进、预设管理。
+    /// 调不动的原因，做成一颗小标签：和右边的百分比读数一眼分得开。
     ///
-    /// 亮度窗口本身在音量面板旁边，这里只管「开不开」和「存了哪些预设」。
-    /// 对比度之类的调节将来会挂在这一页下面（VCP 0x12 常量已经在 display 里留好）。
+    /// 开着 HDR 的时候 DDC/CI 读数是有的，但写下去画面被系统的色调映射吃掉，
+    /// 所以两种原因都写清楚，别只丢一个「不支持」让人去猜。
+    fn display_flag(&self, display: &DisplayInfo, lang: Lang) -> AnyElement {
+        let text = if display.hdr {
+            lang.pick("HDR 已开启，不能调", "HDR on, can't adjust")
+        } else {
+            lang.pick("不支持 DDC/CI，不能调", "No DDC/CI, can't adjust")
+        };
+        div()
+            .flex_none()
+            .px(px(5.))
+            .py(px(1.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::track())
+            .text_size(theme::fs(9.5))
+            .text_color(theme::text_tertiary())
+            .child(text)
+            .into_any_element()
+    }
+
     /// 显示器列表里的一行：图标 + 名字（可就地改名）+ 亮度读数 + 「改名」。
     ///
     /// 交互和音频设备行是同一套：点「改名」从空白开始输入，回车或点别处落盘。
@@ -14124,30 +14168,33 @@ impl Settings {
                         )
                     }),
             )
-            .child(
-                div()
+            .child(match display.brightness {
+                Some(percent) if !display.hdr => div()
                     .flex_none()
                     .text_size(theme::fs(11.5))
-                    .text_color(if display.brightness.is_some() {
-                        theme::text_secondary()
-                    } else {
-                        theme::text_tertiary()
-                    })
-                    .child(match display.brightness {
-                        Some(percent) => format!("{percent}%"),
-                        None => lang.pick("不支持", "N/A").to_string(),
-                    }),
-            )
+                    .text_color(theme::text_secondary())
+                    .child(format!("{percent}%"))
+                    .into_any_element(),
+                // 开着 HDR 的读数是真有的，但调了画面不变；DDC/CI 不通的连读数都没有。
+                _ => self.display_flag(display, lang),
+            })
             .child(rename)
             .into_any_element()
     }
 
+    /// 显示器页：亮度调节总开关、步进、预设管理。
+    ///
+    /// 亮度窗口本身在音量面板旁边，这里只管「开不开」和「存了哪些预设」。
+    /// 对比度之类的调节将来会挂在这一页下面（VCP 0x12 常量已经在 display 里留好）。
     fn display_page(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let store = self.config.clone();
         let enabled = config.brightness.enabled;
 
         // 显示器列表：名字能就地改（和音频设备同款），亮度读数顺带露一眼。
         let display_list = crate::gui::displays_snapshot(cx);
+        // 一台调的都没有（全是 HDR、或者根本没接 DDC/CI）时，下面两个开关没有意义：
+        // 点了也只是翻一下配置，面板不会出现 —— 直接置灰，并在说明里写清原因。
+        let adjustable = display_list.iter().any(|display| display.adjustable());
         let mut display_rows: Vec<AnyElement> = Vec::new();
         if display_list.is_empty() {
             display_rows.push(
@@ -14165,10 +14212,15 @@ impl Settings {
         }
 
         let merged = config.brightness.merged;
-        let toggle = self.toggle_row(
+        let toggle = self.toggle_row_when(
             "display-brightness",
             lang.pick("启用显示器亮度面板", "Enable display brightness panel"),
-            if merged {
+            if !adjustable {
+                lang.pick(
+                    "没有能调的显示器：DDC/CI 不通、或者开着 HDR 的都不行",
+                    "No display can be adjusted: DDC/CI is unreachable, and HDR screens can't be",
+                )
+            } else if merged {
                 lang.pick(
                     "亮度块长在音量面板里（DDC/CI）",
                     "The brightness block lives inside the volume panel (DDC/CI)",
@@ -14180,6 +14232,7 @@ impl Settings {
                 )
             },
             enabled,
+            adjustable,
             move |window, cx| {
                 let _ = store.borrow_mut().update(|config| {
                     config.brightness.enabled = !config.brightness.enabled;
@@ -14192,7 +14245,7 @@ impl Settings {
 
         // 融合：亮度块不再是旁边一扇小窗，而是长进音量面板里，排版跟着音频走。
         let merge_store = self.config.clone();
-        let merge_toggle = self.toggle_row(
+        let merge_toggle = self.toggle_row_when(
             "display-brightness-merge",
             lang.pick("与音量面板融合", "Merge with the volume panel"),
             lang.pick(
@@ -14200,6 +14253,7 @@ impl Settings {
                 "The brightness block lives inside the volume panel and follows its layout: a strip above or below when horizontal, a column beside it when vertical",
             ),
             merged,
+            adjustable,
             move |window, cx| {
                 let _ = merge_store.borrow_mut().update(|config| {
                     config.brightness.merged = !config.brightness.merged;
@@ -14779,6 +14833,8 @@ impl Settings {
         let rename_path = path.clone();
         let name = div()
             .id(SharedString::from(format!("profile-name-{key}")))
+            // 改了名要挂输入法通道：画布是绝对定位的，父节点得是 relative。
+            .relative()
             .truncate()
             .text_size(theme::fs(12.))
             .text_color(theme::text_primary())
@@ -14792,7 +14848,10 @@ impl Settings {
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.begin_profile_rename(rename_path.clone(), window, cx)
             }))
-            .child(title);
+            .child(title)
+            // 中文走输入法：这一格得挂上 `ElementInputHandler`，
+            // 不然平台只在 `WM_CHAR` 里给到英文，拼音打不出来。
+            .when(renaming, |style| style.child(self.text_edit_canvas(cx)));
 
         // 「正在使用」和主配置那行长得一模一样、位置也一样：紧挨着名字后头。
         let active = self.profile_active.borrow().as_deref() == Some(path.as_path());
@@ -14971,6 +15030,7 @@ impl Settings {
                     .bg(theme::accent_soft())
                     .child(
                         div()
+                            .relative()
                             .flex_1()
                             .min_w(px(0.))
                             .truncate()
@@ -14979,7 +15039,9 @@ impl Settings {
                             .bg(theme::track())
                             .text_size(theme::fs(12.))
                             .text_color(theme::text_primary())
-                            .child(format!("{buffer}▏")),
+                            .child(format!("{buffer}▏"))
+                            // 新建那一格同样要输入法通道（中文名）。
+                            .child(self.text_edit_canvas(cx)),
                     )
                     .child(
                         div()
@@ -15062,6 +15124,9 @@ impl Settings {
             n += 1;
         }
         self.profile_new = Some(candidate);
+        self.text_marked = None;
+        // 同上：先拿焦点，输入法才会挂到这一格。
+        self.focus.focus(window, cx);
         refresh_ui(window, cx);
     }
 
@@ -15084,6 +15149,9 @@ impl Settings {
         self.profile_new = None;
         self.profile_pending_delete = None;
         self.profile_rename = Some((path, profile.name));
+        self.text_marked = None;
+        // 拿到焦点：输入法通道（`window.handle_input`）只对着焦点的输入框注册。
+        self.focus.focus(window, cx);
         refresh_ui(window, cx);
     }
 
