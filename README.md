@@ -91,6 +91,7 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 - `配置` 页里主配置和副配置是平级的一份份设置，只是主配置那份在根目录叫 `config.json`，其余放在 `Configs/` 里（每个 `.json` 一份）
 - 新建的一份从出厂设置开始；新建 / 副本 / 改名 / 导出 / 导入都在这一页，`.json` 文件直接拖到这一页上也会导入
 - 「启用」临时切过去、立刻生效，主配置那行的「启用」随时切回来；列表里用「正在使用」标出当前生效的是哪一份
+- 启用期间在设置页改的东西，保存时也写回那份档（`config.json` 只是它的影子），所以下次再启用还是改过的样子
 - 「设为主配置」把那份**提升**成主配置：内容写进 `config.json`、它的 `.json` 从 `Configs/` 里消失，原来的主配置不再保留（会先弹一句红字警告；想留着就先「副本」）
 
 ## 截图
@@ -199,7 +200,7 @@ vendor/
 ## 已知限制
 
 - 只支持 64 位 Windows
-- 亮度走 DDC/CI：笔记本内屏、部分转接线和关了 DDC 的显示器读不到，那台屏的亮度快捷键会静默跳过；开着 HDR 的屏同理（系统的色调映射会吃掉背光变化），显示器和面板里都会标出来、不给调
+- 亮度走 DDC/CI：笔记本内屏、部分转接线和关了 DDC 的显示器读不到，那台屏的亮度快捷键会静默跳过；开着 HDR 的屏同理（系统的色调映射会吃掉背光变化），显示器和面板里都会标出来、不给调。系统里开关 HDR 不用重启也不用重开面板，两秒内自己跟上
 - 「按应用调音量」只对通过音频会话出声的应用有效（有些游戏用独占模式就抓不到）
 - 界面完全自绘，不跟随系统高对比度模式
 
@@ -230,7 +231,7 @@ vendor/
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
 - Edits stay in the window until you press **Apply** (save, keep editing) or **Save** (save and close); closing with pending edits asks save / don't save / cancel. The ≡ menu in the title bar reverts this page or everything, or restores factory defaults, per page or wholesale
 - The same ≡ menu can `Replace this page only…`: pick a backed-up `config.json` and only the fields that page owns are copied into the current draft, nothing else moves
-- Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. A new profile starts from the factory defaults; create / copy / rename / export / import there, or just drop a `.json` onto the page. **Use** switches to a profile temporarily and the main config row's **Use** switches back (the list marks the active one); **Make main** promotes that profile — its content becomes `config.json`, its `.json` leaves the `Configs` list, and the old main config is gone (a red warning comes first)
+- Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. A new profile starts from the factory defaults; create / copy / rename / export / import there, or just drop a `.json` onto the page. **Use** switches to a profile temporarily and the main config row's **Use** switches back (the list marks the active one); anything you save while it is in use goes back into that profile as well, so it keeps your edits; **Make main** promotes that profile — its content becomes `config.json`, its `.json` leaves the `Configs` list, and the old main config is gone (a red warning comes first)
 - Popup animations can follow the system: the panel and the OSD both rise from the bottom edge of the screen from *behind* the taskbar, animated frame-by-frame in sync with the display refresh rate, matching how Windows 11 (and 10) animate their own volume surfaces
 
 Download the latest `Bolume_vX.XX.zip` from [Releases](../../releases), extract anywhere and run `Bolume.exe`. Windows 10/11 x64, no installer, no .NET.

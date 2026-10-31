@@ -5470,6 +5470,12 @@ pub struct ConfigStore {
     draft_base: Option<Config>,
     /// 草稿跟参照点有没有差别（界面上「有未保存的更改」和按钮亮不亮都看它）。
     draft_dirty: bool,
+    /// 现在这套实际属于哪份配置档（`Some` = `Configs/xxx.json`，`None` = 主配置）。
+    ///
+    /// 启用某份档之后，`config.json` 只是它的影子：每次落盘两边一起写。不然在设置页
+    /// 改点东西按「保存」，改动只进 `config.json`，档文件还是旧的 —— 下次启用那份档
+    /// 改动就没了，「正在使用」的徽章也认不出当前是哪一份。
+    mirror: Option<PathBuf>,
 }
 
 impl ConfigStore {
@@ -5867,6 +5873,7 @@ impl ConfigStore {
             config,
             draft_base: None,
             draft_dirty: false,
+            mirror: None,
         };
         // 首次运行就把默认配置落盘，便携版目录里一眼能看到 config.json。
         if existing.is_none() || !store.path.exists() || migrated {
@@ -5881,6 +5888,19 @@ impl ConfigStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 现在这套是哪份配置档（`None` = 主配置本身）。
+    pub fn mirror(&self) -> Option<&Path> {
+        self.mirror.as_deref()
+    }
+
+    /// 指定「这套属于哪份配置档」，之后每次落盘都会顺手把它写回去。
+    ///
+    /// 只在切档的当下设（启用某份 / 切回主配置 / 设为主配置）—— 别拿内容比对去猜，
+    /// 草稿里有未保存的改动时谁都对不上。
+    pub fn set_mirror(&mut self, path: Option<PathBuf>) {
+        self.mirror = path;
     }
 
     pub fn update(&mut self, change: impl FnOnce(&mut Config)) -> io::Result<()> {
@@ -5984,11 +6004,25 @@ impl ConfigStore {
     }
 
     fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
+        self.write_file(&self.path)?;
+        // 主配置只是那份档的影子：两边一起写，档文件才不会落在后面。
+        // 档写不进去不算保存失败 —— 主配置已经落盘、程序照跑，顶多这份档落后一步。
+        if let Some(mirror) = self.mirror.as_deref() {
+            if mirror != self.path {
+                if let Err(error) = self.write_file(mirror) {
+                    log::warn!("配置档写回失败（{}）：{error}", mirror.display());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_file(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(&self.config).map_err(io::Error::other)?;
-        std::fs::write(&self.path, json)
+        std::fs::write(path, json)
     }
 }
 
@@ -6035,6 +6069,30 @@ mod tests {
                 .unwrap()
                 .contains("\"settings_width\": 999.0")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 挂了镜像（启用某份配置档）之后，保存要同时写 `config.json` 和那份档。
+    #[test]
+    fn mirror_profile_is_written_along_with_the_main_config() {
+        let dir = std::env::temp_dir().join(format!("bolume-mirror-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let profile = dir.join("Configs").join("工作.json");
+        let mut store = ConfigStore::load(path.clone());
+
+        store.set_mirror(Some(profile.clone()));
+        store.begin_draft();
+        store.update(|config| config.ui_opacity = 44).unwrap();
+        // 草稿阶段谁都不写。
+        assert!(!profile.exists());
+        store.commit_draft().unwrap();
+        assert!(std::fs::read_to_string(&profile).unwrap().contains("\"ui_opacity\": 44"));
+
+        // 摘掉镜像（切回主配置）之后就只写主配置。
+        store.set_mirror(None);
+        store.update(|config| config.ui_opacity = 55).unwrap();
+        assert!(!std::fs::read_to_string(&profile).unwrap().contains("\"ui_opacity\": 55"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

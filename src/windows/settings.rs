@@ -14616,8 +14616,13 @@ impl Settings {
                 .map(|profile| profile.path.clone())
         };
         *self.profiles.borrow_mut() = list;
-        *self.profile_active.borrow_mut() = active;
+        *self.profile_active.borrow_mut() = active.clone();
         *self.profile_main_backup.borrow_mut() = (!on_main).then_some(backup);
+        // 草稿里有没保存的改动时别动镜像：这会儿内容跟谁都对不上，
+        // 一改就会让「保存」写不到正确的那份档里去。
+        if !self.config.borrow().is_dirty() {
+            self.config.borrow_mut().set_mirror(active);
+        }
     }
 
     /// 两份配置是不是同一套（宽高、格式版本这种谁都不许动的字段不算）。
@@ -15210,7 +15215,12 @@ impl Settings {
         let (path, buffer) = self.profile_rename.take()?;
         let lang = self.config.borrow().get().language;
         let text = match crate::profiles::rename(&path, &buffer) {
-            Ok(_) => {
+            Ok(moved) => {
+                // 改的就是「正在用」的那份：镜像跟着换到新名字，不然下次保存
+                // 会把旧名字的文件又写出来（等于凭空多一份）。
+                if self.config.borrow().mirror() == Some(path.as_path()) {
+                    self.config.borrow_mut().set_mirror(Some(moved));
+                }
                 self.reload_profiles();
                 lang.pick("已改名", "Renamed").to_string()
             }
@@ -15301,6 +15311,9 @@ impl Settings {
                         .to_string()
                 })
         };
+        // 装之前先摘掉镜像：`install` 会立刻落盘，镜像还挂着旧的那份的话，
+        // 就会把新内容写进旧的档文件里（切 A→B 时把 A 冲掉）。
+        self.config.borrow_mut().set_mirror(None);
         let installed = self
             .config
             .borrow_mut()
@@ -15309,6 +15322,10 @@ impl Settings {
             self.set_profile_notice(error.to_string(), cx);
             return;
         }
+        // 这套现在属于那份档（切回主配置的快照除外）：之后每次落盘两边一起写。
+        self.config
+            .borrow_mut()
+            .set_mirror((path != backup_path).then(|| path.clone()));
         let after = self.config.borrow().get().clone();
         // 切过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
         let autostart_changed = Self::fields_differ(
@@ -15392,6 +15409,7 @@ impl Settings {
             }
         };
         let before = self.config.borrow().get().clone();
+        self.config.borrow_mut().set_mirror(None);
         let installed = self
             .config
             .borrow_mut()
@@ -15518,6 +15536,10 @@ impl Settings {
     ) {
         self.profile_pending_delete = None;
         let lang = self.config.borrow().get().language;
+        // 删掉的是「正在用」的那份：镜像一并摘掉，否则下次保存会把它又写回来。
+        if self.config.borrow().mirror() == Some(path.as_path()) {
+            self.config.borrow_mut().set_mirror(None);
+        }
         match crate::profiles::remove(&path) {
             Ok(()) => {
                 self.reload_profiles();
@@ -16316,6 +16338,8 @@ impl Settings {
 
         let _ = self.config.borrow_mut().commit_draft();
         let config = self.config.borrow().get().clone();
+        // 落盘之后档文件也更新过了（镜像），列表里的「正在使用」与「多久之前」跟着重算。
+        self.reload_profiles();
         self.apply_everything(&config, None, autostart_changed, window, cx);
         if close {
             self.close_window(window, cx);

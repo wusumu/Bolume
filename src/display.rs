@@ -15,19 +15,16 @@ use std::{
 
 use ddc::Ddc;
 use ddc_winapi::Monitor;
-use windows::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
-    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+use windows::Win32::Foundation::{LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, DXGI_OUTPUT_DESC1, IDXGIFactory1, IDXGIOutput, IDXGIOutput6,
 };
-use windows::Win32::Foundation::{ERROR_SUCCESS, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     MONITORINFOEXW, MonitorFromPoint,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-use windows::core::BOOL;
+use windows::core::{BOOL, Interface as _};
 
 unsafe extern "system" fn collect_handles(
     monitor: HMONITOR,
@@ -113,76 +110,71 @@ fn gdi_device_name(handle: HMONITOR) -> Option<String> {
     Some(String::from_utf16_lossy(&info.szDevice[..len]))
 }
 
-/// 开着 HDR（Windows 的「高级色彩」）的屏，返回它们的 GDI 设备名。
+/// 正在输出 HDR 信号的屏，返回它们的 GDI 设备名（形如 `\\\\.\\DISPLAY1`）。
 ///
 /// HDR 打开之后系统的色调映射会把背光那点变化吃掉，DDC/CI 的亮度照写不误，
 /// 画面上却看不出变化。与其让人拖着条怀疑坏没坏，不如照实标一句「开不了」。
 ///
-/// 走 `QueryDisplayConfig` 那套：每条**活动**路径的源设备名（`\\.\DISPLAY1`）
-/// 能直接和 `GetMonitorInfoW` 报的名字对上，目标那头问一次高级色彩状态。
-/// 老系统不认这个查询会返回失败，那就当没开 HDR —— 不误伤能调的机器。
+/// 判定看 DXGI 报的**当前色彩空间**：HDR 那几档都是 PQ（`G2084`）/ HLG / 线性
+/// （`G10`）传输曲线。这里不用 `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` ——
+/// 实测那一位在 Win11 上常年是「开」：系统给普通 SDR 屏也开着高级色彩（自动色彩
+/// 管理），开 / 关 HDR 它都不变，拿它判断会一直标成「开着 HDR」。
 fn hdr_screens() -> Vec<String> {
     let mut names = Vec::new();
-    let mut paths = 0u32;
-    let mut modes = 0u32;
-    unsafe {
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) != ERROR_SUCCESS
-        {
-            return names;
-        }
-    }
-    if paths == 0 {
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
         return names;
-    }
-    // 拿完大小的这一瞬间拓扑可能变了，`QueryDisplayConfig` 会报 INSUFFICIENT_BUFFER
-    // 并把需要的量写回来；再试一次就够，真拿不到就按「都没开 HDR」处理。
-    let mut path_buf = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
-    let mut mode_buf = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
-    let status = unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut paths,
-            path_buf.as_mut_ptr(),
-            &mut modes,
-            mode_buf.as_mut_ptr(),
-            None,
-        )
     };
-    if status != ERROR_SUCCESS {
-        return names;
-    }
-    path_buf.truncate(paths as usize);
-
-    for path in &path_buf {
-        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        source.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-        source.header.adapterId = path.sourceInfo.adapterId;
-        source.header.id = path.sourceInfo.id;
-        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
-            continue;
+    let mut adapter_index = 0;
+    loop {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(adapter_index) }) else {
+            break;
+        };
+        adapter_index += 1;
+        let mut output_index = 0;
+        loop {
+            let Ok(output) = (unsafe { adapter.EnumOutputs(output_index) }) else {
+                // 枚举到头（`DXGI_ERROR_NOT_FOUND`）或者这块适配器不肯给，都往下一位。
+                break;
+            };
+            output_index += 1;
+            if let Some(name) = hdr_output_name(&output) {
+                names.push(name);
+            }
         }
-
-        let mut color = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
-        color.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
-        color.header.size = std::mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
-        color.header.adapterId = path.targetInfo.adapterId;
-        color.header.id = path.targetInfo.id;
-        if unsafe { DisplayConfigGetDeviceInfo(&mut color.header) } != 0 {
-            continue;
-        }
-        // 位 0 = 这台支持高级色彩，位 1 = 现在开着。只认「开着」。
-        if unsafe { color.Anonymous.value } & 0b10 == 0 {
-            continue;
-        }
-        let len = source
-            .viewGdiDeviceName
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(source.viewGdiDeviceName.len());
-        names.push(String::from_utf16_lossy(&source.viewGdiDeviceName[..len]));
     }
     names
+}
+
+/// 这台输出开着 HDR 就返回它的 GDI 设备名。
+fn hdr_output_name(output: &IDXGIOutput) -> Option<String> {
+    let six: IDXGIOutput6 = output.cast().ok()?;
+    let desc: DXGI_OUTPUT_DESC1 = unsafe { six.GetDesc1() }.ok()?;
+    if !desc.AttachedToDesktop.as_bool() || !is_hdr_color_space(desc.ColorSpace) {
+        return None;
+    }
+    let len = desc
+        .DeviceName
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(desc.DeviceName.len());
+    Some(String::from_utf16_lossy(&desc.DeviceName[..len]))
+}
+
+/// 这个色彩空间是不是在走 HDR 那条曲线（PQ / HLG / 线性 scRGB）。
+fn is_hdr_color_space(space: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE;
+    // HDR 只有这几档：PQ（2084）的四种封装、HLG 的两种、以及 scRGB 线性。
+    // 广色域的 SDR（P2020 + gamma 2.2 / 2.4）不算 —— 那种画面亮度照旧跟着背光走。
+    matches!(
+        space,
+        DXGI_COLOR_SPACE_TYPE(1)
+            | DXGI_COLOR_SPACE_TYPE(12)
+            | DXGI_COLOR_SPACE_TYPE(13)
+            | DXGI_COLOR_SPACE_TYPE(14)
+            | DXGI_COLOR_SPACE_TYPE(16)
+            | DXGI_COLOR_SPACE_TYPE(18)
+            | DXGI_COLOR_SPACE_TYPE(19)
+    )
 }
 
 /// 按 `EnumDisplayMonitors` 的顺序标一遍：这块屏开没开 HDR。
@@ -198,6 +190,24 @@ fn hdr_flags() -> Vec<bool> {
                 .is_some_and(|name| screens.iter().any(|screen| screen.eq_ignore_ascii_case(&name)))
         })
         .collect()
+}
+
+/// HDR 开关变了没有：按 `EnumDisplayMonitors` 的顺序对一遍。
+///
+/// 空列表（还没扫过、或者亮度面板压根没开）直接算没变 —— 不能因为「没扫过」
+/// 就替人扫一轮，那会白白摸一遍 DDC/CI。
+fn hdr_changed(entries: &[Entry]) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+    let flags = hdr_flags();
+    // 台数对不上就不比：这种时候（显示器刚插拔）按「没变」处理，等面板打开
+    // 那次 `Refresh` 重扫 —— 每两秒白摸一轮 DDC/CI 更糟。
+    entries.len() == flags.len()
+        && entries
+            .iter()
+            .zip(&flags)
+            .any(|(entry, flag)| entry.hdr != *flag)
 }
 
 /// 界面发往工作线程的命令。
@@ -395,33 +405,50 @@ fn retry_unreadable(entries: &mut [Entry]) {
     }
 }
 
+/// HDR 开关多久对一次。
+///
+/// 系统设置里那个「使用 HDR」不会给任何窗口发消息，只能自己定时看一眼；
+/// 只查色彩空间不碰 DDC/CI，一次一毫秒以内，两秒一轮不算负担。
+const HDR_POLL: Duration = Duration::from_millis(2_000);
+
 fn run_worker(commands: Receiver<DisplayCommand>, events: async_channel::Sender<DisplayEvent>) {
     let mut entries: Vec<Entry> = Vec::new();
     // 排着一次补读；`None` = 所有显示器都读得通，不用补。
     let mut retry_at: Option<Instant> = None;
+    let mut hdr_at = Instant::now() + HDR_POLL;
 
     loop {
-        // 有显示器读不到就先排个补读：到点了就算没有命令也要醒一次。
-        let command = match retry_at {
-            Some(at) => {
-                let wait = at.saturating_duration_since(Instant::now());
-                match commands.recv_timeout(wait) {
-                    Ok(command) => Some(command),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return,
+        // 有显示器读不到就先排个补读、HDR 状态要定时对：到点了就算没有命令也醒一次。
+        let wait = {
+            let now = Instant::now();
+            let mut next = hdr_at;
+            if let Some(at) = retry_at {
+                if at < next {
+                    next = at;
                 }
             }
-            None => match commands.recv() {
-                Ok(command) => Some(command),
-                Err(_) => return,
-            },
+            next.saturating_duration_since(now)
+        };
+        let command = match commands.recv_timeout(wait) {
+            Ok(command) => Some(command),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
         };
 
         match command {
-            // 补读到点：读到了就把新读数推给界面，读不到就等下一档退避。
+            // 定时醒：补读到点就补读，HDR 状态变了就整轮重扫。
             None => {
-                retry_unreadable(&mut entries);
-                emit(&events, &entries);
+                let now = Instant::now();
+                if retry_at.is_some_and(|at| at <= now) {
+                    retry_unreadable(&mut entries);
+                    emit(&events, &entries);
+                }
+                if now >= hdr_at {
+                    hdr_at = now + HDR_POLL;
+                    if hdr_changed(&entries) {
+                        entries = scan(&events);
+                    }
+                }
             }
             Some(DisplayCommand::Shutdown) => return,
             Some(DisplayCommand::Refresh) => {
