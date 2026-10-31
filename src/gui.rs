@@ -97,20 +97,34 @@ struct AppState {
     brightness_override: Rc<RefCell<HashMap<String, BrightnessNote>>>,
 }
 
-/// 亮度「先声夺人」的记录：刚写下去的目标 + 时间。
+/// 亮度「先声夺人」的记录：刚写下去的目标 + 时间 + 这笔要顶多久。
 #[derive(Clone, Copy)]
 struct BrightnessNote {
     want: u32,
     at: Instant,
+    /// 顶多久。一次 DDC 写六十毫秒，单台按默认的 `BRIGHTNESS_OVERRIDE_FOR` 就够；
+    /// 一次套给好几台时是**串行**写的，排在后头的要等前头写完，得按位次放宽 ——
+    /// 不然回读会先把那条拉回旧值、过一会儿再跳上去，看着像「点了没反应」。
+    hold: std::time::Duration,
 }
 
 /// 回读一直对不上时最多顶多久。DDC/CI 一次写六十毫秒、加上排队，留足余量。
-const BRIGHTNESS_OVERRIDE_FOR: std::time::Duration = std::time::Duration::from_millis(800);
+pub const BRIGHTNESS_OVERRIDE_FOR: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// 记一笔「这一台刚被写成多少」：回读回来之前，下一档按这个值算。
 ///
 /// 快捷键和亮度面板共用这张表 —— 拖完滑条紧接着按快捷键，也接得上。
 pub fn note_brightness(cx: &App, key: &str, value: u32) {
+    note_brightness_for(cx, key, value, BRIGHTNESS_OVERRIDE_FOR);
+}
+
+/// 同上，但自己指定顶多久（批量写的时候排在后头的台要顶久一点）。
+pub fn note_brightness_for(
+    cx: &App,
+    key: &str,
+    value: u32,
+    hold: std::time::Duration,
+) {
     cx.global::<AppState>()
         .brightness_override
         .borrow_mut()
@@ -119,6 +133,7 @@ pub fn note_brightness(cx: &App, key: &str, value: u32) {
             BrightnessNote {
                 want: value.min(100),
                 at: Instant::now(),
+                hold,
             },
         );
 }
@@ -132,7 +147,7 @@ fn resolve_brightness(map: &mut HashMap<String, BrightnessNote>, key: &str, real
     let Some(note) = map.get(key) else {
         return real;
     };
-    let settle = note.want == real || note.at.elapsed() > BRIGHTNESS_OVERRIDE_FOR;
+    let settle = note.want == real || note.at.elapsed() > note.hold;
     if settle {
         map.remove(key);
         return real;
@@ -3167,7 +3182,20 @@ mod tests {
             at: Instant::now()
                 .checked_sub(age)
                 .expect("测试里的时间差不会超过开机时长"),
+            hold: BRIGHTNESS_OVERRIDE_FOR,
         }
+    }
+
+    /// 一次套给好几台时，后头的台是排在前头的 DDC 写后面才轮到：那一笔的时限
+    /// 按位次放宽。过了默认的 800ms、还没到自己的时限，条就该停在目标值上 ——
+    /// 否则会先弹回旧值、过一会儿再跳上去，看着像「点了没反应」。
+    #[test]
+    fn batch_note_holds_past_the_single_write_window() {
+        let mut map = HashMap::new();
+        let mut batch = note(60, BRIGHTNESS_OVERRIDE_FOR + Duration::from_millis(60));
+        batch.hold = BRIGHTNESS_OVERRIDE_FOR + Duration::from_millis(400);
+        map.insert("1:XG27".to_string(), batch);
+        assert_eq!(resolve_brightness(&mut map, "1:XG27", 20), 60);
     }
 
     /// 长按时的正题：回读报的是**上一档**，不能拿它把目标盖回去。

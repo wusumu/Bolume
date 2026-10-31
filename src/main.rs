@@ -269,6 +269,7 @@ fn main() {
         // 用法：--probe-display [轮数] [名字:百分比]
         // 例：--probe-display 3           只读三遍
         //     --probe-display 1 XG279Q:40 再写一次亮度
+        //     --probe-display 1 '*:50'    一次写给所有屏（要带引号，别让 shell 展开）
         let rounds = args
             .get(index + 1)
             .and_then(|value| value.parse::<u32>().ok())

@@ -323,32 +323,44 @@ pub fn run_display(write: Option<(&str, u32)>, rounds: u32) {
             engine.send(DisplayCommand::Shutdown);
             return;
         };
-        let Some(target) = list
+        // `*` = 所有调得动的台。一次给好几台写，正是「中键把预设套给所有屏」的形态。
+        let targets: Vec<(String, String)> = list
             .iter()
-            .find(|info| info.name.contains(needle) || info.key.contains(needle))
-        else {
-            println!("没有名字含 {needle:?} 的显示器：");
+            .filter(|info| {
+                info.adjustable()
+                    && (needle == "*"
+                        || info.name.contains(needle)
+                        || info.key.contains(needle))
+            })
+            .map(|info| (info.key.clone(), info.name.clone()))
+            .collect();
+        if targets.is_empty() {
+            println!("没有匹配 {needle:?} 的可调显示器：");
             for info in &list {
-                println!("  {}", info.name);
+                println!("  {} （{}）", info.name, info.key);
             }
             engine.send(DisplayCommand::Shutdown);
             return;
-        };
-        println!("写入 {} -> {percent}%", target.name);
-        engine.send(DisplayCommand::SetBrightness {
-            key: target.key.clone(),
-            value: percent,
-        });
-        if let Some(DisplayEvent::Monitors(after)) = next(&events, Duration::from_secs(8)) {
-            for info in after.iter().filter(|info| info.key == target.key) {
-                println!("  写入后界面拿到的：{:?}", info.brightness);
-            }
         }
-        // 再真读一遍：确认不是只改了本地缓存。
+        println!("写入 {} 台 -> {percent}%", targets.len());
+        // 连着发，中间不留缝：工作线程会一口气收下。
+        for (key, name) in &targets {
+            println!("  {name}");
+            engine.send(DisplayCommand::SetBrightness {
+                key: key.clone(),
+                value: percent,
+            });
+        }
+        // 每台一次 DDC 写几十毫秒，个别屏要几百毫秒，留够再回读。
+        std::thread::sleep(Duration::from_millis(600 + 900 * targets.len() as u64));
         engine.send(DisplayCommand::Refresh);
         if let Some(DisplayEvent::Monitors(after)) = next(&events, Duration::from_secs(8)) {
-            for info in after.iter().filter(|info| info.key == target.key) {
-                println!("  重新枚举回读：{:?}", info.brightness);
+            for (key, name) in &targets {
+                let value = after
+                    .iter()
+                    .find(|info| info.key == *key)
+                    .and_then(|info| info.brightness);
+                println!("  {name} 回读：{value:?}");
             }
         }
     }

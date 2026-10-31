@@ -449,6 +449,35 @@ fn retry_unreadable(entries: &mut [Entry]) {
 /// 只查色彩空间不碰 DDC/CI，一次一毫秒以内，两秒一轮不算负担。
 const HDR_POLL: Duration = Duration::from_millis(2_000);
 
+/// 把队列里攒着的亮度命令并进 `pending` —— **按 key 分开攒**。
+///
+/// 同一个 key 只留最后一档：拖动滑条、长按快捷键时队列里会压着好几档，一次
+/// DDC 写要几十毫秒，中间那些落下去就已经过时了。不同的 key 各留一条：中键把
+/// 预设套给所有屏时，那是**同时要写的好几台**，谁也不能顶掉谁 —— 一个槽位全
+/// 装成「最后一条」，就会出现「界面都变了、屏幕只动了一台」。
+///
+/// 返回 `None` = 收到 `Shutdown`，调用方直接退出；`Some(true)` = 后面还压着
+/// 一次 `Refresh`。
+fn merge_pending(
+    commands: &Receiver<DisplayCommand>,
+    pending: &mut Vec<(String, u32)>,
+) -> Option<bool> {
+    let mut refresh = false;
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            DisplayCommand::SetBrightness { key, value } => {
+                match pending.iter_mut().find(|(queued, _)| *queued == key) {
+                    Some(slot) => slot.1 = value,
+                    None => pending.push((key, value)),
+                }
+            }
+            DisplayCommand::Refresh => refresh = true,
+            DisplayCommand::Shutdown => return None,
+        }
+    }
+    Some(refresh)
+}
+
 fn run_worker(commands: Receiver<DisplayCommand>, events: async_channel::Sender<DisplayEvent>) {
     let mut entries: Vec<Entry> = Vec::new();
     // 排着一次补读；`None` = 所有显示器都读得通，不用补。
@@ -493,38 +522,32 @@ fn run_worker(commands: Receiver<DisplayCommand>, events: async_channel::Sender<
                 entries = scan(&events);
             }
             Some(DisplayCommand::SetBrightness { key, value }) => {
-                let mut target = (key, value);
-                let mut refresh_after = false;
                 // 写之前先并一次：连按快捷键时队列里会压着好几档，一次 DDC 写要
                 // 六十毫秒，中间那些值落下去就已经过时了 —— 白写，而且亮度会
                 // 一格一格地追、越落越远（长按时那种「拖不动」的手感就是这么来的）。
-                while let Ok(command) = commands.try_recv() {
-                    match command {
-                        DisplayCommand::SetBrightness { key, value } => target = (key, value),
-                        DisplayCommand::Refresh => refresh_after = true,
-                        DisplayCommand::Shutdown => return,
-                    }
-                }
+                let mut pending = vec![(key, value)];
+                let mut refresh_after = false;
+                let Some(refresh) = merge_pending(&commands, &mut pending) else {
+                    return;
+                };
+                refresh_after |= refresh;
                 loop {
-                    apply(&mut entries, &target.0, target.1);
-                    // 先把新值回给界面：DDC 写入有延迟，等下一次读回再刷新会明显滞后。
-                    emit(&events, &entries);
-
-                    // 拖动滑条时队列里会压着一串值，只写最后一个 —— 一次 DDC 写
-                    // 就要几十毫秒，逐条写等于让亮度追着鼠标跑却越落越远。
-                    let mut next = None;
-                    while let Ok(command) = commands.try_recv() {
-                        match command {
-                            DisplayCommand::SetBrightness { key, value } => {
-                                next = Some((key, value));
-                            }
-                            DisplayCommand::Refresh => refresh_after = true,
-                            DisplayCommand::Shutdown => return,
-                        }
+                    // 攒下的每一台都写掉，一台都不能少。
+                    for (key, value) in pending.iter() {
+                        apply(&mut entries, key, *value);
+                        // 先把新值回给界面：DDC 写入有延迟，等下一次读回再刷新会明显滞后。
+                        emit(&events, &entries);
                     }
-                    match next {
-                        Some(next) => target = next,
-                        None => break,
+
+                    // 拖动滑条 / 长按时队列里会继续压着一串值，同一个 key 只写最后一个
+                    // —— 一次 DDC 写就要几十毫秒，逐条写等于让亮度追着鼠标跑却越落越远。
+                    pending.clear();
+                    let Some(refresh) = merge_pending(&commands, &mut pending) else {
+                        return;
+                    };
+                    refresh_after |= refresh;
+                    if pending.is_empty() {
+                        break;
                     }
                 }
                 if refresh_after {
@@ -961,8 +984,47 @@ fn emit(events: &async_channel::Sender<DisplayEvent>, entries: &[Entry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        RETRY_CAP, RETRY_FIRST, display_name, is_internal_panel, percent_of, raw_of, retry_delay,
+        DisplayCommand, RETRY_CAP, RETRY_FIRST, display_name, is_internal_panel, merge_pending,
+        percent_of, raw_of, retry_delay,
     };
+    use std::sync::mpsc::channel;
+
+    /// 中键把预设套给所有屏：队列里会连着压好几台，**每台都得留下**，
+    /// 只有同一个 key 的后续档位才可以互相顶掉。
+    #[test]
+    fn merging_brightness_commands_keeps_one_value_per_display() {
+        let (tx, rx) = channel();
+        for (key, value) in [("0:a", 30), ("0:a", 40), ("1:b", 60)] {
+            tx.send(DisplayCommand::SetBrightness {
+                key: key.to_string(),
+                value,
+            })
+            .unwrap();
+        }
+        // 第一条已经出队了（就是触发 worker 的那条），从这里开始并。
+        let mut pending = vec![("0:a".to_string(), 20)];
+        assert_eq!(merge_pending(&rx, &mut pending), Some(false));
+        assert_eq!(
+            pending,
+            vec![("0:a".to_string(), 40), ("1:b".to_string(), 60)]
+        );
+    }
+
+    /// 只按一台的快捷键时，仍然只留最后一档（长按不回弹靠的就是这个）。
+    #[test]
+    fn merging_collapses_rapid_steps_on_the_same_display() {
+        let (tx, rx) = channel();
+        for value in [12, 14, 16, 18] {
+            tx.send(DisplayCommand::SetBrightness {
+                key: "0:a".to_string(),
+                value,
+            })
+            .unwrap();
+        }
+        let mut pending = vec![("0:a".to_string(), 10)];
+        assert_eq!(merge_pending(&rx, &mut pending), Some(false));
+        assert_eq!(pending, vec![("0:a".to_string(), 18)]);
+    }
 
     /// 笔记本合盖后的实况（用户诊断报告）：唯一一块屏是外接 4K，DDC/CI 读得出，
     /// 但那个源下面挂的还是笔记本面板的节点 —— 这条以前会被认成内置屏。

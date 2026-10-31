@@ -654,8 +654,19 @@ impl Brightness {
         }
         // 手动输入框留着会让读数看起来没变，先收掉。
         self.editing = None;
-        for key in &keys {
+        for (index, key) in keys.iter().enumerate() {
             self.set_brightness(key, value, cx);
+            // 多台是串行写的：后头那几台要等前头的 DDC 写完成才轮到，一两百毫秒
+            // 很常见。默认那笔「顶住目标值」只有一次写的余量，排后面的屏会在回读
+            // 时先弹回旧值、过一会儿再跳上去 —— 按位次往后放宽，条就一直在目标上。
+            if index > 0 {
+                crate::gui::note_brightness_for(
+                    cx,
+                    key,
+                    value,
+                    crate::gui::BRIGHTNESS_OVERRIDE_FOR + Duration::from_millis(400 * index as u64),
+                );
+            }
         }
         // 落定那一下：被套用的块闪一下，眼睛能确认「套到的是这台」。
         self.flash_blocks(keys, cx);
