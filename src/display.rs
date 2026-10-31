@@ -499,6 +499,23 @@ fn run_worker(commands: Receiver<DisplayCommand>, events: async_channel::Sender<
     }
 }
 
+/// 界面上这台屏叫什么：驱动报的能用就用，只报通用名时换成 EDID 里的型号
+/// （`friendly` 是按枚举顺序取的 `platform::monitors::friendly_names()`）。
+fn display_name(index: usize, reported: &str, friendly: Option<&str>) -> String {
+    if reported.trim().is_empty() {
+        return format!("显示器 {}", index + 1);
+    }
+    match friendly {
+        Some(friendly)
+            if crate::platform::monitors::is_generic_name(reported.trim())
+                && !friendly.trim().is_empty() =>
+        {
+            friendly.to_string()
+        }
+        _ => reported.to_string(),
+    }
+}
+
 /// 枚举显示器并读出各自亮度。句柄留在 `Entry` 里，下次写就不用重新枚举。
 fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
     let monitors = match Monitor::enumerate() {
@@ -511,14 +528,18 @@ fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
 
     let mut entries = Vec::with_capacity(monitors.len());
     let hdr = hdr_flags();
+    // 驱动有时只报「Generic Monitor」这种通用名；真型号在 EDID 里，
+    // `platform::monitors` 那边已经做过这件事（顺序和这里一致）。
+    let friendly = crate::platform::monitors::friendly_names();
     for (index, monitor) in monitors.into_iter().enumerate() {
-        let name = monitor.description();
-        let name = if name.trim().is_empty() {
-            format!("显示器 {}", index + 1)
+        let reported = monitor.description();
+        let name = display_name(index, &reported, friendly.get(index).map(String::as_str));
+        // key 一直用驱动报的原文：名字换成型号之后，以前存的别名还认得出来。
+        let key = if reported.trim().is_empty() {
+            format!("{index}:{name}")
         } else {
-            name
+            format!("{index}:{reported}")
         };
-        let key = format!("{index}:{name}");
         let mut entry = Entry {
             monitor,
             key,
@@ -603,7 +624,32 @@ fn emit(events: &async_channel::Sender<DisplayEvent>, entries: &[Entry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RETRY_CAP, RETRY_FIRST, percent_of, raw_of, retry_delay};
+    use super::{RETRY_CAP, RETRY_FIRST, display_name, percent_of, raw_of, retry_delay};
+
+    #[test]
+    fn generic_driver_names_take_the_edid_model() {
+        assert_eq!(display_name(0, "Generic Monitor", Some("XG279Q")), "XG279Q");
+        assert_eq!(
+            display_name(1, "Generic PnP Monitor", Some("DELL U2412M")),
+            "DELL U2412M"
+        );
+        // EDID 也读不出来就照驱动给的写，别显示成空白。
+        assert_eq!(
+            display_name(0, "Generic Monitor", Some("")),
+            "Generic Monitor"
+        );
+        assert_eq!(display_name(0, "Generic Monitor", None), "Generic Monitor");
+    }
+
+    #[test]
+    fn real_model_names_are_left_alone() {
+        assert_eq!(
+            display_name(0, "ASUS ROG XG279Q(DisplayPort)", Some("ROG XG279Q")),
+            "ASUS ROG XG279Q(DisplayPort)"
+        );
+        assert_eq!(display_name(0, "  ", Some("XG279Q")), "显示器 1");
+        assert_eq!(display_name(2, "", None), "显示器 3");
+    }
 
     #[test]
     fn percent_and_raw_round_trip_on_hundred() {

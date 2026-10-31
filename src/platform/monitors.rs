@@ -17,6 +17,7 @@ use windows::{
             DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC,
             HMONITOR, MONITORINFO, MONITORINFOEXW,
         },
+        System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RegGetValueW},
         UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
     },
     core::{BOOL, PCWSTR},
@@ -85,15 +86,7 @@ pub fn index_at_cursor() -> Option<u32> {
 ///
 /// 设置页里「显示器 1/2/…」和 OSD 的 `monitor` 序号都用这个顺序。
 pub fn monitors() -> Vec<MonitorInfo> {
-    let mut list: Vec<MonitorInfo> = Vec::new();
-    unsafe {
-        let _ = EnumDisplayMonitors(
-            None,
-            None,
-            Some(collect),
-            LPARAM(&mut list as *mut Vec<MonitorInfo> as isize),
-        );
-    }
+    let mut list = collect_all();
     list.sort_by(|left, right| {
         left.work
             .0
@@ -106,6 +99,28 @@ pub fn monitors() -> Vec<MonitorInfo> {
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
     });
+    list
+}
+
+/// 显示器友好名，按 `EnumDisplayMonitors` 的原始顺序（**不**排序）。
+///
+/// 亮度那边（`display::scan`）的 `Monitor::enumerate()` 就是照 `EnumDisplayMonitors`
+/// 的顺序走的，所以按序号取名字要这一份；`monitors()` 排过序，不能拿来对号。
+/// 驱动只报通用名（`Generic Monitor`）时里面是 EDID 里的型号。
+pub fn friendly_names() -> Vec<String> {
+    collect_all().into_iter().map(|info| info.name).collect()
+}
+
+fn collect_all() -> Vec<MonitorInfo> {
+    let mut list: Vec<MonitorInfo> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut list as *mut Vec<MonitorInfo> as isize),
+        );
+    }
     list
 }
 
@@ -162,24 +177,144 @@ unsafe extern "system" fn collect(
     BOOL(1)
 }
 
-/// 显示器的友好名（`EnumDisplayDevices` 的第二档：显示器本身那一层）。
-fn friendly_name(device: &str) -> Option<String> {
-    if device.is_empty() {
-        return None;
-    }
+/// `EnumDisplayDevicesW` 的 `EDD_GET_DEVICE_INTERFACE_NAME`：把这层的 `DeviceID`
+/// 换成设备接口路径（`\\?\DISPLAY#…`）。只有这种写法能对到注册表里的 EDID ——
+/// 默认返回的 `MONITOR\…\{类 GUID}\0001` 在 `Enum` 底下并不存在。
+const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
+
+/// 枚举某台 GDI 设备的显示器那一层（`flags` 就是 `EnumDisplayDevicesW` 的第四个参数）。
+fn enumerate_monitor(device: &str, flags: u32) -> Option<DISPLAY_DEVICEW> {
     let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
     let mut display = DISPLAY_DEVICEW {
         cb: size_of::<DISPLAY_DEVICEW>() as u32,
         ..Default::default()
     };
-    let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut display, 0) };
-    if !ok.as_bool() {
+    let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut display, flags) };
+    ok.as_bool().then_some(display)
+}
+
+/// 显示器的友好名（`EnumDisplayDevices` 的第二档：显示器本身那一层）。
+///
+/// 驱动给的 `DeviceString` 经常只是通用名（`Generic PnP Monitor` /
+/// `Generic Monitor`），真正型号在 EDID 的 `0xFC` descriptor 里 ——
+/// 设备管理器那串「Generic Monitor (型号)」的括号内容就是从这儿拿的。
+/// 所以通用名才去读 EDID，驱动认得出型号就直接用它的。
+fn friendly_name(device: &str) -> Option<String> {
+    if device.is_empty() {
         return None;
     }
-    let name = wide_to_string(&display.DeviceString).trim().to_string();
+    let plain = enumerate_monitor(device, 0)?;
+    let reported = wide_to_string(&plain.DeviceString).trim().to_string();
+    if !is_generic_name(&reported) {
+        return Some(reported);
+    }
+    let interface = enumerate_monitor(device, EDD_GET_DEVICE_INTERFACE_NAME)
+        .map(|display| wide_to_string(&display.DeviceID))
+        .unwrap_or_default();
+    if let Some(model) = edid_monitor_name(&interface) {
+        return Some(model);
+    }
     // 没装显示器驱动时会回「Generic PnP Monitor」，比设备名还难认，宁可不要。
-    let generic = name.is_empty() || name.eq_ignore_ascii_case("Generic PnP Monitor");
-    (!generic).then_some(name)
+    (!reported.is_empty()).then_some(reported)
+}
+
+/// 驱动没认出具体型号时给的名字。`Generic Monitor (XXX)` 这种也算 ——
+/// 括号里那截型号是设备管理器自己拼的，`DeviceString` 里常常只有前面一半。
+pub fn is_generic_name(name: &str) -> bool {
+    name.is_empty() || name.to_lowercase().starts_with("generic")
+}
+
+/// EDID 里厂商写的型号名（`0xFC` descriptor），例如 `XG279Q`。
+///
+/// EDID 挂在显示器设备实例的注册表下面：`Enum\<设备 ID>\Device Parameters\EDID`。
+/// 设备 ID 有两种写法，`MONITOR\AUS27B1\{类 GUID}\0001` 直接就是键路径；
+/// 设备接口写法 `\\?\DISPLAY#AUS27B1#5&…#{接口 GUID}` 要把 `#` 换成 `\`、
+/// 去掉末尾的接口 GUID。读不到就 `None` —— 这不是关键路径，不值得为它报错。
+fn edid_monitor_name(device_id: &str) -> Option<String> {
+    let key = format!(
+        "SYSTEM\\CurrentControlSet\\Enum\\{}\\Device Parameters",
+        enum_key(device_id)?
+    );
+    let key: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
+    let value: Vec<u16> = "EDID".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut size = 0u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    if status.is_err() || size == 0 || size > 4096 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size as usize];
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    buffer.truncate(size as usize);
+    monitor_name_descriptor(&buffer)
+}
+
+/// 把设备 ID 变成 `Enum\` 底下的子键路径。
+fn enum_key(device_id: &str) -> Option<String> {
+    let trimmed = device_id.trim();
+    let id = trimmed.strip_prefix(r"\\?\").unwrap_or(trimmed);
+    if id.is_empty() {
+        return None;
+    }
+    // 设备接口写法：`DISPLAY#AUS27B1#5&…#{接口 GUID}`。
+    if let Some(cut) = id.rfind("#{") {
+        let body = &id[..cut];
+        if body.contains('#') {
+            return Some(body.replace('#', "\\"));
+        }
+    }
+    Some(id.to_string())
+}
+
+/// 从 EDID 主块里找型号名。
+///
+/// 头 8 字节是固定签名，之后第 54 字节起是四个 18 字节的 descriptor；
+/// 头五个字节 `00 00 00 FC 00` 的那个，后面 13 字节是型号（`0x0A` 收尾、
+/// 补空格）。CEA 扩展块里没有型号 descriptor，所以只看主块。
+fn monitor_name_descriptor(edid: &[u8]) -> Option<String> {
+    const HEADER: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+    if edid.len() < 128 || edid[..8] != HEADER {
+        return None;
+    }
+    for slot in 0..4 {
+        let start = 54 + slot * 18;
+        let descriptor = &edid[start..start + 18];
+        if descriptor[..5] != [0x00, 0x00, 0x00, 0xFC, 0x00] {
+            continue;
+        }
+        let text: Vec<u8> = descriptor[5..]
+            .iter()
+            .copied()
+            .take_while(|byte| *byte != 0x0A && *byte != 0x00)
+            .collect();
+        let name = String::from_utf8_lossy(&text).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn wide_to_string(buffer: &[u16]) -> String {
@@ -208,5 +343,90 @@ mod tests {
             list.iter().any(|info| info.is_primary),
             "必须有一台是主显示器"
         );
+        // 顺带把「驱动给的名字 / 设备 ID / EDID 型号」三样摊开，方便核对回退链路。
+        let mut index = 0;
+        loop {
+            let mut adapter = DISPLAY_DEVICEW {
+                cb: size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut adapter, 0) };
+            if !ok.as_bool() {
+                break;
+            }
+            index += 1;
+            let device = wide_to_string(&adapter.DeviceName);
+            let wide_device: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut monitor = DISPLAY_DEVICEW {
+                cb: size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide_device.as_ptr()), 0, &mut monitor, 0) };
+            if !ok.as_bool() {
+                continue;
+            }
+            let reported = wide_to_string(&monitor.DeviceString);
+            let id = wide_to_string(&monitor.DeviceID);
+            let mut interface = DISPLAY_DEVICEW {
+                cb: size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            let iface_ok =
+                unsafe { EnumDisplayDevicesW(PCWSTR(wide_device.as_ptr()), 0, &mut interface, 1) };
+            let iface_id = if iface_ok.as_bool() {
+                wide_to_string(&interface.DeviceID)
+            } else {
+                String::new()
+            };
+            println!(
+                "{device}: reported={reported:?} id={id:?} iface_id={iface_id:?} enum_key={:?} edid_name={:?} final={:?}",
+                enum_key(&iface_id),
+                edid_monitor_name(&iface_id),
+                friendly_name(&device)
+            );
+        }
+    }
+
+    #[test]
+    fn edid_model_name_is_read_from_the_name_descriptor() {
+        let mut edid = vec![0u8; 128];
+        edid[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        // 第一个 descriptor 是时序，第二个才是型号名。
+        edid[54 + 18..54 + 23].copy_from_slice(&[0x00, 0x00, 0x00, 0xFC, 0x00]);
+        edid[54 + 18 + 5..54 + 18 + 5 + 8].copy_from_slice(b"XG279Q\n ");
+        assert_eq!(monitor_name_descriptor(&edid).as_deref(), Some("XG279Q"));
+    }
+
+    #[test]
+    fn edid_without_a_name_descriptor_gives_nothing() {
+        let mut edid = vec![0u8; 128];
+        edid[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        assert!(monitor_name_descriptor(&edid).is_none());
+        assert!(monitor_name_descriptor(&[]).is_none());
+        assert!(monitor_name_descriptor(b"not an edid").is_none());
+    }
+
+    #[test]
+    fn generic_names_are_recognised() {
+        for name in ["", "Generic PnP Monitor", "Generic Monitor", "GENERIC MONITOR (AOC)"] {
+            assert!(is_generic_name(name), "{name:?} 应该算通用名");
+        }
+        for name in ["XG279Q", "ASUS ROG XG279Q(DisplayPort)", "DELL U2412M"] {
+            assert!(!is_generic_name(name), "{name:?} 是型号，不该被换掉");
+        }
+    }
+
+    #[test]
+    fn device_ids_map_to_registry_keys() {
+        assert_eq!(
+            enum_key(r"MONITOR\AUS27B1\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001").as_deref(),
+            Some(r"MONITOR\AUS27B1\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001")
+        );
+        assert_eq!(
+            enum_key(r"\\?\DISPLAY#AUS27B1#5&2f0d1a4&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}")
+                .as_deref(),
+            Some(r"DISPLAY\AUS27B1\5&2f0d1a4&0&UID4352")
+        );
+        assert_eq!(enum_key("   "), None);
     }
 }
