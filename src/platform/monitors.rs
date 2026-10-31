@@ -29,8 +29,13 @@ const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
 /// 一台显示器。
 #[derive(Clone, Debug, PartialEq)]
 pub struct MonitorInfo {
-    /// 友好名，例如 `XG279Q`；系统没给名字时退回 `\\.\DISPLAY1`。
+    /// 友好名，例如 `XG279Q`；系统只报通用名时退回它，再不行才用 `\\.\DISPLAY1`。
     pub name: String,
+    /// 真型号（驱动报的具体型号或 EDID 里的 `0xFC`）；只有通用名时为 `None`。
+    ///
+    /// 和 `name` 分开存：`name` 要保证「一定有东西显示」，而亮度面板只该拿
+    /// 真正的型号去替换驱动给的「Generic Monitor」。
+    pub model: Option<String>,
     /// 是不是主显示器。
     pub is_primary: bool,
     /// 工作区（逻辑像素）：x、y、宽、高。已经排除任务栏。
@@ -42,6 +47,8 @@ pub struct MonitorInfo {
     pub bounds: (f32, f32, f32, f32),
     /// 系统的 `HMONITOR`（拿来和 `MonitorFromPoint` 的结果比对）。
     pub handle: isize,
+    /// GDI 设备名，形如 `\\.\DISPLAY1`（认「哪台是内置屏」要用它）。
+    pub device: String,
 }
 
 /// 按 OSD 的显示器序号（0 = 主显示器，n = 第 n 台）取那块屏的句柄。
@@ -102,13 +109,15 @@ pub fn monitors() -> Vec<MonitorInfo> {
     list
 }
 
-/// 显示器友好名，按 `EnumDisplayMonitors` 的原始顺序（**不**排序）。
+/// 每台屏的完整信息（含 `HMONITOR` 和型号），按 `EnumDisplayMonitors` 的
+/// 原始顺序（**不**排序）。
 ///
-/// 亮度那边（`display::scan`）的 `Monitor::enumerate()` 就是照 `EnumDisplayMonitors`
-/// 的顺序走的，所以按序号取名字要这一份；`monitors()` 排过序，不能拿来对号。
-/// 驱动只报通用名（`Generic Monitor`）时里面是 EDID 里的型号。
-pub fn friendly_names() -> Vec<String> {
-    collect_all().into_iter().map(|info| info.name).collect()
+/// 亮度那边（`display::scan`）拿这份去要 DDC 通道：**只用句柄对号**，不靠下标。
+/// 笔记本合盖、显示器走转接器、虚拟屏这些情况下，`EnumDisplayMonitors` 里的
+/// 屏幕台数和 `GetPhysicalMonitorsFromHMONITOR` 给的物理显示器台数对不上，
+/// 按下标取名字会把隔壁屏的型号贴过来（合盖后外接屏显示成本机的名字就是这么来的）。
+pub fn screens() -> Vec<MonitorInfo> {
+    collect_all()
 }
 
 fn collect_all() -> Vec<MonitorInfo> {
@@ -157,8 +166,11 @@ unsafe extern "system" fn collect(
     let device = wide_to_string(&info.szDevice);
     let work = info.monitorInfo.rcWork;
     let screen = info.monitorInfo.rcMonitor;
+    let (model, reported) = device_names(&device);
     list.push(MonitorInfo {
-        name: friendly_name(&device).unwrap_or(device),
+        name: model.clone().or(reported).unwrap_or_else(|| device.clone()),
+        model,
+        device,
         is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
         work: (
             work.left as f32 / scale,
@@ -193,29 +205,28 @@ fn enumerate_monitor(device: &str, flags: u32) -> Option<DISPLAY_DEVICEW> {
     ok.as_bool().then_some(display)
 }
 
-/// 显示器的友好名（`EnumDisplayDevices` 的第二档：显示器本身那一层）。
+/// 一台屏的两档名字：`(真型号, 驱动报的名字)`。
 ///
 /// 驱动给的 `DeviceString` 经常只是通用名（`Generic PnP Monitor` /
 /// `Generic Monitor`），真正型号在 EDID 的 `0xFC` descriptor 里 ——
 /// 设备管理器那串「Generic Monitor (型号)」的括号内容就是从这儿拿的。
-/// 所以通用名才去读 EDID，驱动认得出型号就直接用它的。
-fn friendly_name(device: &str) -> Option<String> {
+/// 所以只有通用名才去读 EDID；驱动认得出型号就直接当型号用。
+fn device_names(device: &str) -> (Option<String>, Option<String>) {
     if device.is_empty() {
-        return None;
+        return (None, None);
     }
-    let plain = enumerate_monitor(device, 0)?;
+    let Some(plain) = enumerate_monitor(device, 0) else {
+        return (None, None);
+    };
     let reported = wide_to_string(&plain.DeviceString).trim().to_string();
-    if !is_generic_name(&reported) {
-        return Some(reported);
+    let reported = (!reported.is_empty()).then_some(reported);
+    if let Some(name) = reported.as_ref().filter(|name| !is_generic_name(name)) {
+        return (Some(name.clone()), reported);
     }
     let interface = enumerate_monitor(device, EDD_GET_DEVICE_INTERFACE_NAME)
         .map(|display| wide_to_string(&display.DeviceID))
         .unwrap_or_default();
-    if let Some(model) = edid_monitor_name(&interface) {
-        return Some(model);
-    }
-    // 没装显示器驱动时会回「Generic PnP Monitor」，比设备名还难认，宁可不要。
-    (!reported.is_empty()).then_some(reported)
+    (edid_monitor_name(&interface), reported)
 }
 
 /// 驱动没认出具体型号时给的名字。`Generic Monitor (XXX)` 这种也算 ——
@@ -379,10 +390,10 @@ mod tests {
                 String::new()
             };
             println!(
-                "{device}: reported={reported:?} id={id:?} iface_id={iface_id:?} enum_key={:?} edid_name={:?} final={:?}",
+                "{device}: reported={reported:?} id={id:?} iface_id={iface_id:?} enum_key={:?} edid_name={:?} names={:?}",
                 enum_key(&iface_id),
                 edid_monitor_name(&iface_id),
-                friendly_name(&device)
+                device_names(&device)
             );
         }
     }

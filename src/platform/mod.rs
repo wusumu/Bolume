@@ -1,6 +1,7 @@
 pub mod app_icon;
 pub mod app_pick;
 pub mod autostart;
+pub mod backlight;
 pub mod bootstart;
 pub mod detach;
 pub mod fonts;

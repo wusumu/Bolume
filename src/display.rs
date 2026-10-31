@@ -9,9 +9,15 @@
 //! 和音频线程（`audio::AudioEngine`）是同一套做法。
 
 use std::{
-    sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel},
+    rc::Rc,
+    sync::{
+        Mutex,
+        mpsc::{Receiver, RecvTimeoutError, Sender, channel},
+    },
     time::{Duration, Instant},
 };
+
+use crate::platform::backlight::Backlight;
 
 use ddc::Ddc;
 use ddc_winapi::Monitor;
@@ -25,6 +31,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::{BOOL, Interface as _};
+
+/// 上一次扫出来的每条亮度通道属于哪块屏（`HMONITOR`），下标就是 `displays` 的序号。
+///
+/// 光标在哪台、提示条拖的是哪条通道都靠它对号。不能用 `EnumDisplayMonitors` 的
+/// 下标：一块屏给不出物理显示器时（笔记本合盖后的内置屏）两边台数会错开。
+static ENTRY_SCREENS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// 上一次扫描时系统报的全部屏幕句柄。插拔、开合盖子后按它触发整轮重扫。
+static KNOWN_SCREENS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 unsafe extern "system" fn collect_handles(
     monitor: HMONITOR,
@@ -51,15 +66,11 @@ fn screen_handles() -> Vec<HMONITOR> {
     handles
 }
 
-/// 鼠标所在屏幕在 DDC 枚举里的序号（0 起）。
+/// 鼠标所在屏幕的亮度通道序号（0 起）。
 ///
-/// `ddc_winapi::Monitor::enumerate()` 的顺序 = `EnumDisplayMonitors` 的顺序
-/// （它内部就是先枚举 HMONITOR、再取每块屏的物理显示器），所以这里照同样的
-/// 顺序数一遍，就知道光标那块屏排第几 —— 不用去匹配设备名（DDC 那边只给
-/// 物理显示器描述，和 `\\.\DISPLAY1` 这种对不上）。
-///
-/// 一台显示器同时报出多个 physical monitor 的罕见情况下序号会往后偏，
-/// 那时「当前」会落到隔壁屏 —— 面板照样能调，不是死路。
+/// 序号以 `scan()` 那次扫出来的 `ENTRY_SCREENS` 为准（**不**是
+/// `EnumDisplayMonitors` 的下标）：一块屏给不出物理显示器时（笔记本合盖后的
+/// 内置屏就这样）两边台数会错开，按系统下标数就会落到隔壁屏的通道上。
 pub fn monitor_index_at_cursor() -> usize {
     let mut point = POINT::default();
     let target = unsafe {
@@ -68,24 +79,26 @@ pub fn monitor_index_at_cursor() -> usize {
         }
         MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
     };
-    let handles = screen_handles();
-    handles
-        .iter()
-        .position(|handle| *handle == target)
-        .unwrap_or(0)
+    index_for_handle(target.0 as isize)
 }
 
-/// 这块屏（`HMONITOR` 句柄）在 DDC 枚举里排第几（0 起）。
+/// 这块屏（`HMONITOR` 句柄）的亮度通道序号（0 起）。
 ///
-/// 顺序和 `Monitor::enumerate()` 一致（见 `monitor_index_at_cursor` 的说明），
-/// 所以只要手里有句柄就能对上 `displays` 里的那一项 —— 提示条拖亮度条时要靠它
-/// 找到「这条提示条所在那块屏」的亮度通道。认不出来就落到第一台：拖了总得
-/// 调点什么，整条没反应更糟。
+/// 句柄来自 `platform::monitors`，和 `scan()` 收的那套是同一批。认不出来就落到
+/// 第一台：拖了总得调点什么，整条没反应更糟。还没扫过（面板一次都没开）时退回
+/// 按枚举顺序数一遍，好歹给个号。
 pub fn index_for_handle(handle: isize) -> usize {
-    screen_handles()
-        .iter()
-        .position(|candidate| candidate.0 as isize == handle)
-        .unwrap_or(0)
+    let known = ENTRY_SCREENS
+        .lock()
+        .map(|list| list.clone())
+        .unwrap_or_default();
+    if known.is_empty() {
+        return screen_handles()
+            .iter()
+            .position(|candidate| candidate.0 as isize == handle)
+            .unwrap_or(0);
+    }
+    known.iter().position(|known| *known == handle).unwrap_or(0)
 }
 
 /// MCCS 的亮度 VCP 码（参考实现用的就是它）。
@@ -94,8 +107,7 @@ pub const VCP_BRIGHTNESS: u8 = 0x10;
 pub const VCP_CONTRAST: u8 = 0x12;
 
 /// 这块屏（`HMONITOR`）的 GDI 设备名，形如 `\\.\DISPLAY1`。
-fn gdi_device_name(handle: HMONITOR) -> Option<String> {
-    let mut info = MONITORINFOEXW::default();
+fn gdi_device_name(handle: HMONITOR) -> Option<String> {    let mut info = MONITORINFOEXW::default();
     info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     // `MONITORINFOEXW` 的头一段就是 `MONITORINFO`，所以这里能直接转过去。
     let ok = unsafe { GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) };
@@ -177,22 +189,21 @@ fn is_hdr_color_space(space: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_
     )
 }
 
-/// 按 `EnumDisplayMonitors` 的顺序标一遍：这块屏开没开 HDR。
-fn hdr_flags() -> Vec<bool> {
-    let screens = hdr_screens();
-    if screens.is_empty() {
-        return Vec::new();
-    }
-    screen_handles()
-        .iter()
-        .map(|handle| {
-            gdi_device_name(*handle)
-                .is_some_and(|name| screens.iter().any(|screen| screen.eq_ignore_ascii_case(&name)))
-        })
-        .collect()
+/// 这块屏开没开 HDR（`screens` 是 `hdr_screens()` 那批 GDI 设备名）。
+///
+/// 按**设备名**对号，不按下标：内置屏合盖后仍可能留在枚举里但拿不到物理显示器，
+/// 按下标对会张冠李戴。
+fn screen_is_hdr(handle: isize, screens: &[String]) -> bool {
+    gdi_device_name(hmonitor(handle))
+        .is_some_and(|name| screens.iter().any(|screen| screen.eq_ignore_ascii_case(&name)))
 }
 
-/// HDR 开关变了没有：按 `EnumDisplayMonitors` 的顺序对一遍。
+/// `isize` 形式的句柄转回 `HMONITOR`（两边存的是同一个值）。
+fn hmonitor(handle: isize) -> HMONITOR {
+    HMONITOR(handle as *mut std::ffi::c_void)
+}
+
+/// HDR 开关或者屏幕台数变了没有：变了就得整轮重扫。
 ///
 /// 空列表（还没扫过、或者亮度面板压根没开）直接算没变 —— 不能因为「没扫过」
 /// 就替人扫一轮，那会白白摸一遍 DDC/CI。
@@ -200,14 +211,23 @@ fn hdr_changed(entries: &[Entry]) -> bool {
     if entries.is_empty() {
         return false;
     }
-    let flags = hdr_flags();
-    // 台数对不上就不比：这种时候（显示器刚插拔）按「没变」处理，等面板打开
-    // 那次 `Refresh` 重扫 —— 每两秒白摸一轮 DDC/CI 更糟。
-    entries.len() == flags.len()
-        && entries
-            .iter()
-            .zip(&flags)
-            .any(|(entry, flag)| entry.hdr != *flag)
+    let current: Vec<isize> = screen_handles()
+        .iter()
+        .map(|handle| handle.0 as isize)
+        .collect();
+    let known = KNOWN_SCREENS
+        .lock()
+        .map(|list| list.clone())
+        .unwrap_or_default();
+    // 插了一台、拔了一台、合上盖子：都算变了。比的是**集合**，
+    // 合盖后拿不到物理显示器的那块屏一直在两边，不会每两秒白扫一轮。
+    if current.len() != known.len() || current.iter().any(|handle| !known.contains(handle)) {
+        return true;
+    }
+    let screens = hdr_screens();
+    entries
+        .iter()
+        .any(|entry| entry.hdr != screen_is_hdr(entry.handle, &screens))
 }
 
 /// 界面发往工作线程的命令。
@@ -290,9 +310,17 @@ impl Drop for DisplayEngine {
     }
 }
 
-/// 工作线程里的一台显示器：句柄 + 它的亮度上限。
+/// 亮度通道：外接屏走 DDC/CI，笔记本内置屏走 `\\.\LCD`。
+enum Channel {
+    /// 外接屏：DDC/CI（MCCS 的 VCP 0x10）。
+    Ddc(Monitor),
+    /// 笔记本内置屏：显卡的背光接口，和系统亮度滑块是同一条路。
+    Backlight(Rc<Backlight>),
+}
+
+/// 工作线程里的一台显示器：通道 + 它的亮度上限。
 struct Entry {
-    monitor: Monitor,
+    channel: Channel,
     key: String,
     name: String,
     /// 这台显示器自己报的上限（dxva2 的 `maximum`）。取不到时按 100。
@@ -308,6 +336,9 @@ struct Entry {
     misses: u32,
     /// 这块屏开着 HDR（枚举时问一次；窗口重新枚举会再问）。
     hdr: bool,
+    /// 这条通道属于哪块屏（`HMONITOR`）。名字、HDR、光标在哪台屏上都按它认，
+    /// 不按序号 —— 序号会因为某块屏给不出物理显示器而错位。
+    handle: isize,
 }
 
 impl Entry {
@@ -322,7 +353,13 @@ impl Entry {
 
     /// 读一次，把结果落回自己身上。
     fn reread(&mut self) -> bool {
-        match read_stable(&mut self.monitor) {
+        let read = match &mut self.channel {
+            Channel::Ddc(monitor) => read_stable(monitor),
+            Channel::Backlight(backlight) => backlight
+                .read()
+                .map(|index| (index, backlight.max_index())),
+        };
+        match read {
             Some((value, maximum)) => {
                 // `maximum` 没报（0）或者报成 1 时按 0..100 处理。
                 self.max = scale_max(u32::from(maximum));
@@ -499,64 +536,142 @@ fn run_worker(commands: Receiver<DisplayCommand>, events: async_channel::Sender<
     }
 }
 
-/// 界面上这台屏叫什么：驱动报的能用就用，只报通用名时换成 EDID 里的型号
-/// （`friendly` 是按枚举顺序取的 `platform::monitors::friendly_names()`）。
-fn display_name(index: usize, reported: &str, friendly: Option<&str>) -> String {
+/// 界面上这台屏叫什么：驱动报的能用就用，只报通用名时换成 EDID 里的型号。
+///
+/// `model` 是**这块屏自己**的真型号（`platform::monitors::screens()` 按句柄给的），
+/// 不是「按序号猜的隔壁屏」的。
+fn display_name(index: usize, reported: &str, model: Option<&str>) -> String {
     if reported.trim().is_empty() {
-        return format!("显示器 {}", index + 1);
+        return model
+            .filter(|model| !model.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("显示器 {}", index + 1));
     }
-    match friendly {
-        Some(friendly)
+    match model {
+        Some(model)
             if crate::platform::monitors::is_generic_name(reported.trim())
-                && !friendly.trim().is_empty() =>
+                && !model.trim().is_empty() =>
         {
-            friendly.to_string()
+            model.to_string()
         }
         _ => reported.to_string(),
     }
 }
 
 /// 枚举显示器并读出各自亮度。句柄留在 `Entry` 里，下次写就不用重新枚举。
+///
+/// 一条通道对应一块屏的一台物理显示器，**按 `HMONITOR` 对号**：
+/// `EnumDisplayMonitors` 里的屏和 `GetPhysicalMonitorsFromHMONITOR` 给的物理
+/// 显示器不保证一一对应（笔记本合盖后内置屏还在枚举里，却拿不到物理显示器），
+/// 按下标配对会把外接屏的名字和 HDR 标成内置屏的。
 fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
-    let monitors = match Monitor::enumerate() {
-        Ok(monitors) => monitors,
+    let screens = crate::platform::monitors::screens();
+    // DDC 那边的句柄类型是 `winapi` 的，和 `windows` 的不是一个东西 —— 拿它的
+    // 枚举结果按值（`isize`）和上面那份对号，不必在两种句柄之间转换。
+    let hmons: Vec<(isize, _)> = match ddc_winapi::enumerate_monitors() {
+        Ok(list) => list.into_iter().map(|hmon| (hmon as isize, hmon)).collect(),
         Err(error) => {
             let _ = events.send_blocking(DisplayEvent::Error(format!("无法枚举显示器：{error}")));
             return Vec::new();
         }
     };
-
-    let mut entries = Vec::with_capacity(monitors.len());
-    let hdr = hdr_flags();
-    // 驱动有时只报「Generic Monitor」这种通用名；真型号在 EDID 里，
-    // `platform::monitors` 那边已经做过这件事（顺序和这里一致）。
-    let friendly = crate::platform::monitors::friendly_names();
-    for (index, monitor) in monitors.into_iter().enumerate() {
-        let reported = monitor.description();
-        let name = display_name(index, &reported, friendly.get(index).map(String::as_str));
-        // key 一直用驱动报的原文：名字换成型号之后，以前存的别名还认得出来。
-        let key = if reported.trim().is_empty() {
-            format!("{index}:{name}")
-        } else {
-            format!("{index}:{reported}")
+    let hdr_screens = hdr_screens();
+    // 内置屏（笔记本面板）走背光接口，别的屏走 DDC/CI。
+    let internal = crate::platform::backlight::internal_device();
+    let mut backlight: Option<Rc<Backlight>> = None;
+    let mut entries = Vec::with_capacity(screens.len());
+    let mut handles = Vec::with_capacity(screens.len());
+    for (index, screen) in screens.iter().enumerate() {
+        let handle = screen.handle;
+        let hdr = screen_is_hdr(handle, &hdr_screens);
+        // 内置屏：DDC/CI 基本不通（笔记本面板没接 MCCS 那条线），走 `\\.\LCD` ——
+        // 系统那个亮度滑块走的就是它，两边调的是同一个东西。
+        let is_internal = internal
+            .as_deref()
+            .is_some_and(|device| device.eq_ignore_ascii_case(&screen.device));
+        if is_internal {
+            if backlight.is_none() {
+                backlight = Backlight::open().map(Rc::new);
+            }
+            if let Some(shared) = backlight.clone() {
+                let name = display_name(index, &screen.name, screen.model.as_deref());
+                let mut entry = Entry {
+                    channel: Channel::Backlight(shared),
+                    key: format!("{index}:{name}"),
+                    name,
+                    max: 100,
+                    raw: 0,
+                    readable: false,
+                    misses: 0,
+                    hdr,
+                    handle,
+                };
+                // 背光读得到就算数；读不到（驱动只给写不给读）再退回 DDC 试试。
+                if entry.reread() {
+                    entries.push(entry);
+                    handles.push(handle);
+                    continue;
+                }
+            }
+        }
+        let Some(hmon) = hmons
+            .iter()
+            .find(|(known, _)| *known == handle)
+            .map(|(_, hmon)| *hmon)
+        else {
+            continue;
         };
-        let mut entry = Entry {
-            monitor,
-            key,
-            name,
-            max: 100,
-            raw: 0,
-            readable: false,
-            misses: 0,
-            // 序号和 `EnumDisplayMonitors` 一致（见 `monitor_index_at_cursor`）。
-            hdr: hdr.get(index).copied().unwrap_or(false),
+        let physical = match ddc_winapi::get_physical_monitors_from_hmonitor(hmon) {
+            Ok(list) => list,
+            Err(error) => {
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "拿不到这块屏的物理显示器（{}）：{error}",
+                        gdi_device_name(hmonitor(handle)).unwrap_or_default()
+                    );
+                }
+                continue;
+            }
         };
-        entry.reread();
-        entries.push(entry);
+        for physical in physical {
+            let monitor = unsafe { Monitor::new(physical) };
+            let reported = monitor.description();
+            let name = display_name(index, &reported, screen.model.as_deref());
+            // key 一直用驱动报的原文：名字换成型号之后，以前存的别名还认得出来。
+            let key = if reported.trim().is_empty() {
+                format!("{index}:{name}")
+            } else {
+                format!("{index}:{reported}")
+            };
+            let mut entry = Entry {
+                channel: Channel::Ddc(monitor),
+                key,
+                name,
+                max: 100,
+                raw: 0,
+                readable: false,
+                misses: 0,
+                hdr,
+                handle,
+            };
+            entry.reread();
+            entries.push(entry);
+            handles.push(handle);
+        }
     }
-
+    remember_screens(&handles, &screens);
     emit(events, &entries);
     entries
+}
+
+/// 记下这次扫出来的通道次序和系统报的屏，供「光标在哪台」和插拔检测用。
+fn remember_screens(handles: &[isize], screens: &[crate::platform::monitors::MonitorInfo]) {
+    if let Ok(mut entry_screens) = ENTRY_SCREENS.lock() {
+        *entry_screens = handles.to_vec();
+    }
+    if let Ok(mut known) = KNOWN_SCREENS.lock() {
+        *known = screens.iter().map(|screen| screen.handle).collect();
+    }
 }
 
 /// 读一次亮度，读到「两次一致」才算数。
@@ -608,11 +723,13 @@ fn apply(entries: &mut [Entry], key: &str, percent: u32) {
         return;
     }
     let raw = raw_of(percent, entry.max);
-    if entry
-        .monitor
-        .set_vcp_feature(VCP_BRIGHTNESS, raw as u16)
-        .is_ok()
-    {
+    let written = match &mut entry.channel {
+        Channel::Ddc(monitor) => monitor
+            .set_vcp_feature(VCP_BRIGHTNESS, raw as u16)
+            .is_ok(),
+        Channel::Backlight(backlight) => backlight.write(raw as u16),
+    };
+    if written {
         entry.raw = raw;
     }
 }
@@ -647,7 +764,8 @@ mod tests {
             display_name(0, "ASUS ROG XG279Q(DisplayPort)", Some("ROG XG279Q")),
             "ASUS ROG XG279Q(DisplayPort)"
         );
-        assert_eq!(display_name(0, "  ", Some("XG279Q")), "显示器 1");
+        // 驱动连名字都没报：有真型号就用真型号，比「显示器 1」有用。
+        assert_eq!(display_name(0, "  ", Some("XG279Q")), "XG279Q");
         assert_eq!(display_name(2, "", None), "显示器 3");
     }
 
