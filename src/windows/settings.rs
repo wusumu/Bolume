@@ -155,8 +155,9 @@ impl Page {
             Self::Shortcuts => "keyboard",
             Self::Osd => "monitor",
             Self::Blocklist => "ban",
-            // 层叠的几条：几个配置档摞在一起。
-            Self::Profiles => "levels",
+            // 配置 = 可以拿去改的东西，一把扳手。别再拿「层叠的几条」：
+            // 那眼睛看着像音量条，和「音量」页混。
+            Self::Profiles => "wrench",
             Self::About => "info",
         }
     }

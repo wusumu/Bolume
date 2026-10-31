@@ -64,6 +64,7 @@ icon_assets!(
     "search",
     "adjustments",
     "levels",
+    "wrench",
     "wifi",
     "bluetooth",
     "pencil",
