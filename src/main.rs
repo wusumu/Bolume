@@ -84,8 +84,44 @@ fn install_panic_log() {
         // 不再写调用栈：release 是 `strip = "symbols"`，栈里全是 `<unknown>`，
         // 一行位置（`文件:行:列`）反而更直接。
         platform::logfile::append("crash.log", &text);
+        // 图形设备起不来时，用户看到的是「双击没反应」——什么提示都没有。
+        // 这一种给个框，理由直接写在脸上（虚拟机没装显卡增强驱动最常见）。
+        if text.contains("failed to initialize Windows platform") {
+            startup_failure_box(&text);
+        }
         previous(info);
     }));
+}
+
+/// 启动阶段（图形设备初始化）失败时的提示框。
+///
+/// 这是进程启动的第一个动作，界面上没有任何东西可以显示，日志又要用户自己去
+/// exe 目录翻，所以只能弹框。只在 `failed to initialize Windows platform` 这一种
+/// 上触发 —— 运行中途的 panic 不弹，免得用户回来发现程序卡在一个框上。
+fn startup_failure_box(detail: &str) {
+    // 注意：本项目自己也有一层叫 `windows` 的模块（设置页那一堆），
+    // 这里必须写 `::windows` 才是 crate。
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+    };
+    use ::windows::core::PCWSTR;
+
+    let text = format!(
+        "Bolume 需要一个能用的 DirectX 11 图形设备才能画出界面，这台机器上初始化失败了。\n\n\
+         常见原因：虚拟机没装显卡增强驱动（VMware Tools / VirtualBox 增强功能），\
+         或者显卡驱动异常。装好驱动再启动一次通常就能解决。\n\n\
+         详细信息已写进 exe 旁边的 crash.log。\n\n{detail}"
+    );
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = "Bolume 启动失败".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
 }
 
 fn main() {

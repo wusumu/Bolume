@@ -6,8 +6,8 @@ use windows::Win32::{
     Foundation::HMODULE,
     Graphics::{
         Direct3D::{
-            D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+            D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL,
+            D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
         },
         Direct3D11::{
             D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
@@ -15,8 +15,9 @@ use windows::Win32::{
             D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
         },
         Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIDevice3, IDXGIFactory6,
+            CreateDXGIFactory1, CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG,
+            DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIDevice3,
+            IDXGIFactory2,
         },
     },
 };
@@ -69,7 +70,7 @@ pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T
 #[derive(Clone)]
 pub(crate) struct DirectXDevices {
     pub(crate) adapter: IDXGIAdapter1,
-    pub(crate) dxgi_factory: IDXGIFactory6,
+    pub(crate) dxgi_factory: IDXGIFactory2,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
 }
@@ -121,7 +122,7 @@ fn check_debug_layer_available() -> bool {
 }
 
 #[inline]
-fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
+fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory2> {
     let factory_flag = if debug_layer_available {
         DXGI_CREATE_FACTORY_DEBUG
     } else {
@@ -131,12 +132,20 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
         );
         DXGI_CREATE_FACTORY_FLAGS::default()
     };
-    unsafe { Ok(CreateDXGIFactory2(factory_flag)?) }
+    // Bolume patch：这里只要 `IDXGIFactory2` —— 下面用到的枚举适配器、建交换链、
+    // 关 Alt+Enter 全在 DXGI 1.2 里。上游写的是 `IDXGIFactory6`，那是 Win10 1803
+    // （DXGI 1.6）才有的接口：虚拟机和更老的 Win10 上 `CreateDXGIFactory2` 创建
+    // 完再 QI 到 1.6 会拿到 `E_NOINTERFACE`(0x80004002)，进程启动即崩。
+    // 先按原样建（降到 1.2），再退到 `CreateDXGIFactory1`（Win7 SP1 + 平台更新就有）。
+    if let Ok(factory) = unsafe { CreateDXGIFactory2::<IDXGIFactory2>(factory_flag) } {
+        return Ok(factory);
+    }
+    unsafe { CreateDXGIFactory1::<IDXGIFactory2>() }.context("Creating DXGI factory")
 }
 
 #[inline]
 fn get_adapter(
-    dxgi_factory: &IDXGIFactory6,
+    dxgi_factory: &IDXGIFactory2,
     debug_layer_available: bool,
 ) -> Result<(
     IDXGIAdapter1,
@@ -145,7 +154,10 @@ fn get_adapter(
     D3D_FEATURE_LEVEL,
 )> {
     for adapter_index in 0.. {
-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
+        let Ok(adapter) = (unsafe { dxgi_factory.EnumAdapters(adapter_index) }) else {
+            break;
+        };
+        let adapter: IDXGIAdapter1 = adapter.cast()?;
         if let Ok(desc) = unsafe { adapter.GetDesc1() } {
             let gpu_name = String::from_utf16_lossy(&desc.Description)
                 .trim_matches(char::from(0))
@@ -157,7 +169,7 @@ fn get_adapter(
         let mut context: Option<ID3D11DeviceContext> = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
         if let Some(device) = get_device(
-            &adapter,
+            Some(&adapter),
             Some(&mut context),
             Some(&mut feature_level),
             debug_layer_available,
@@ -168,12 +180,30 @@ fn get_adapter(
         }
     }
 
-    unreachable!()
+    // Bolume patch：一块能建出 D3D11 设备的卡都没有时退回 WARP（软件光栅）。
+    // 虚拟机里只装了「Microsoft 基本显示适配器」、或者精简过的驱动包里
+    // 连 WARP 都没列进适配器列表时，硬走上面那圈就只有一句
+    // 「Getting DXGI adapter」然后启动失败。
+    log::warn!("No adapter could create a Direct3D 11 device; falling back to WARP.");
+    let mut context: Option<ID3D11DeviceContext> = None;
+    let mut feature_level = D3D_FEATURE_LEVEL::default();
+    let device = get_device(
+        None,
+        Some(&mut context),
+        Some(&mut feature_level),
+        debug_layer_available,
+    )
+    .context("Creating a WARP device")?;
+    let dxgi_device: IDXGIDevice = device.cast().context("Getting the WARP DXGI device")?;
+    let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetAdapter() }
+        .and_then(|adapter| adapter.cast())
+        .context("Getting the WARP adapter")?;
+    Ok((adapter, device, context.unwrap(), feature_level))
 }
 
 #[inline]
 fn get_device(
-    adapter: &IDXGIAdapter1,
+    adapter: Option<&IDXGIAdapter1>,
     context: Option<*mut Option<ID3D11DeviceContext>>,
     feature_level: Option<*mut D3D_FEATURE_LEVEL>,
     debug_layer_available: bool,
@@ -184,10 +214,21 @@ fn get_device(
     } else {
         D3D11_CREATE_DEVICE_BGRA_SUPPORT
     };
+    // 给了适配器就走 `UNKNOWN`（由适配器决定软硬）；没给就是 WARP。
+    let driver_type = if adapter.is_some() {
+        D3D_DRIVER_TYPE_UNKNOWN
+    } else {
+        D3D_DRIVER_TYPE_WARP
+    };
+    // `D3D11CreateDevice` 收的是 `IDXGIAdapter`，`IDXGIAdapter1` 得转一手。
+    let target: Option<IDXGIAdapter> = match adapter {
+        Some(adapter) => Some(adapter.cast()?),
+        None => None,
+    };
     unsafe {
         D3D11CreateDevice(
-            adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
+            target.as_ref(),
+            driver_type,
             HMODULE::default(),
             device_flags,
             // 4x MSAA is required for Direct3D Feature Level 10.1 or better
