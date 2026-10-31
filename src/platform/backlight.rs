@@ -9,16 +9,13 @@
 
 use std::mem::size_of;
 
+use crate::platform::displaycfg;
+
 use windows::{
     Win32::{
         Devices::Display::{
-            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-            DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL,
-            DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-            DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
-            GetDisplayConfigBufferSizes, IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS,
-            IOCTL_VIDEO_QUERY_SUPPORTED_BRIGHTNESS, IOCTL_VIDEO_SET_DISPLAY_BRIGHTNESS,
-            QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+            IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS, IOCTL_VIDEO_QUERY_SUPPORTED_BRIGHTNESS,
+            IOCTL_VIDEO_SET_DISPLAY_BRIGHTNESS,
         },
         Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE},
         Storage::FileSystem::{
@@ -164,55 +161,20 @@ impl Drop for Backlight {
     }
 }
 
-/// 内置屏（笔记本面板）的 GDI 设备名，形如 `\\.\DISPLAY1`；没有内置屏时 `None`。
+/// 活动路径里「像内嵌接口」的那几条的 GDI 设备名（`\\.\DISPLAY1` 这种）。
 ///
-/// 用 `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` 看**正在用**的那几条路径：
-/// 合盖之后内置屏不是活动路径，这里就返回 `None` —— 省得给一块关着的屏
-/// 也放一条亮度滑条。`outputTechnology == INTERNAL` 是「这台是内置屏」的
-/// 唯一可靠信号（EDID、设备名、序号都认不出来）。
-pub fn internal_device() -> Option<String> {
-    let mut paths = 0u32;
-    let mut modes = 0u32;
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) }.0 != 0 {
-        return None;
-    }
-    if paths == 0 {
-        return None;
-    }
-    let mut path_buffer = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
-    let mut mode_buffer = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
-    let status = unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut paths,
-            path_buffer.as_mut_ptr(),
-            &mut modes,
-            mode_buffer.as_mut_ptr(),
-            None,
-        )
-    };
-    if status.0 != 0 {
-        return None;
-    }
-    path_buffer.truncate(paths as usize);
-    for path in &path_buffer {
-        if path.targetInfo.outputTechnology != DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL {
-            continue;
-        }
-        // `DISPLAYCONFIG_PATH_SOURCE_INFO` 里只有 id，GDI 设备名要再问一次。
-        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        source.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-        source.header.adapterId = path.sourceInfo.adapterId;
-        source.header.id = path.sourceInfo.id;
-        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
-            continue;
-        }
-        if let Some(device) = wide_text(&source.viewGdiDeviceName) {
-            return Some(device);
-        }
-    }
-    None
+/// 只给**候选**，不是结论：厂商驱动会把外接 DisplayPort 也报成
+/// `DISPLAYPORT_EMBEDDED`（实测一台 RTX 5090 笔记本就这样），单看输出技术
+/// 会把外接屏当成内置屏、去拧笔记本的背光。所以 `display::scan` 还要看这块屏
+/// 的 DDC/CI 读不读得出亮度 —— 读得出就是普通外接屏，读不出才轮到背光。
+///
+/// 合盖之后内置屏不是活动路径，这里就没有它 —— 不会给一块关着的屏留滑条。
+pub fn embedded_sources() -> Vec<String> {
+    displaycfg::active_paths()
+        .into_iter()
+        .filter(|path| displaycfg::is_embedded(path.technology))
+        .filter_map(|path| path.source)
+        .collect()
 }
 
 /// 诊断用：把「这条屏是哪台 / 背光能不能开」的原始信息写出来。
@@ -225,77 +187,31 @@ pub fn diag_report() -> String {
     let mut out = String::new();
 
     let _ = writeln!(out, "── QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)");
-    let mut paths = 0u32;
-    let mut modes = 0u32;
-    let status = unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) };
-    if status.0 != 0 {
-        let _ = writeln!(out, "   取缓冲区失败：{}", status.0);
-    } else {
-        let mut path_buffer = vec![DISPLAYCONFIG_PATH_INFO::default(); paths.max(1) as usize];
-        let mut mode_buffer = vec![DISPLAYCONFIG_MODE_INFO::default(); modes.max(1) as usize];
-        let status = unsafe {
-            QueryDisplayConfig(
-                QDC_ONLY_ACTIVE_PATHS,
-                &mut paths,
-                path_buffer.as_mut_ptr(),
-                &mut modes,
-                mode_buffer.as_mut_ptr(),
-                None,
-            )
-        };
-        if status.0 != 0 {
-            let _ = writeln!(out, "   QueryDisplayConfig 失败：{}", status.0);
-        } else {
-            path_buffer.truncate(paths as usize);
-            let _ = writeln!(out, "   活动路径 {} 条", path_buffer.len());
-            for (index, path) in path_buffer.iter().enumerate() {
-                // 源：`\\.\DISPLAY1` 这种，和 EnumDisplayMonitors 的 `szDevice` 同一套。
-                let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-                source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-                source.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-                source.header.adapterId = path.sourceInfo.adapterId;
-                source.header.id = path.sourceInfo.id;
-                let source_name = if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } == 0 {
-                    wide_text(&source.viewGdiDeviceName)
-                } else {
-                    None
-                };
-                // 目标：显示器自己报的友好名 + EDID 厂商/产品号。
-                let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-                target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-                target.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-                target.header.adapterId = path.targetInfo.adapterId;
-                target.header.id = path.targetInfo.id;
-                let has_target = unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } == 0;
-                let friendly = if has_target {
-                    wide_text(&target.monitorFriendlyDeviceName)
-                } else {
-                    None
-                };
-                let edid_path = if has_target {
-                    wide_text(&target.monitorDevicePath)
-                } else {
-                    None
-                };
-                let technology = path.targetInfo.outputTechnology.0;
-                let _ = writeln!(
-                    out,
-                    "   [{index}] 源={source_name:?} 输出技术={technology} ({}) 目标友好名={friendly:?}",
-                    technology_name(technology)
-                );
-                if has_target {
-                    let _ = writeln!(
-                        out,
-                        "       EDID 厂商=0x{:04X} 产品=0x{:04X} 设备路径={edid_path:?}",
-                        target.edidManufactureId, target.edidProductCodeId
-                    );
-                }
-            }
-        }
+    let paths = displaycfg::active_paths();
+    let _ = writeln!(out, "   活动路径 {} 条", paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "   [{index}] 源={:?} 输出技术={} ({}{}) 目标友好名={:?}",
+            path.source,
+            path.technology,
+            displaycfg::technology_name(path.technology),
+            if displaycfg::is_embedded(path.technology) {
+                " ← 内嵌候选"
+            } else {
+                ""
+            },
+            path.friendly
+        );
+        let _ = writeln!(
+            out,
+            "       EDID 厂商=0x{:04X} 产品=0x{:04X} 设备路径={:?}",
+            path.manufacture, path.product, path.device_path
+        );
     }
 
-    let _ = writeln!(out, "\n── 内置屏判定（outputTechnology == INTERNAL）");
-    let _ = writeln!(out, "   internal_device() = {:?}", internal_device());
+    let _ = writeln!(out, "\n── 内置屏候选（内嵌接口 ∩ 亮度走背光）");
+    let _ = writeln!(out, "   embedded_sources() = {:?}", embedded_sources());
 
     let _ = writeln!(out, "\n── 背光设备 \\\\.\\LCD");
     match unsafe {
@@ -356,34 +272,8 @@ pub fn diag_report() -> String {
     out
 }
 
-/// 输出技术的可读名（`DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY` 的取值）。
-fn technology_name(value: i32) -> &'static str {
-    match value {
-        -2 => "UNINITIALIZED",
-        -1 => "OTHER",
-        0 => "VGA",
-        1 => "SVIDEO",
-        2 => "COMPOSITE_VIDEO",
-        3 => "COMPONENT_VIDEO",
-        4 => "DVI",
-        5 => "HDMI",
-        6 => "LVDS",
-        7 => "D_JPN",
-        8 => "SDI",
-        9 => "DISPLAYPORT_EXTERNAL",
-        10 => "DISPLAYPORT_EMBEDDED",
-        11 => "UDI_EXTERNAL",
-        12 => "UDI_EMBEDDED",
-        13 => "SDTVDONGLE",
-        14 => "MIRACAST",
-        15 => "INDIRECT_WIRED",
-        16 => "INDIRECT_VIRTUAL",
-        -0x8000_0000 => "INTERNAL",
-        _ => "?",
-    }
-}
-
-fn wide_text(buffer: &[u16]) -> Option<String> {    let len = buffer
+fn wide_text(buffer: &[u16]) -> Option<String> {
+    let len = buffer
         .iter()
         .position(|unit| *unit == 0)
         .unwrap_or(buffer.len());
@@ -424,7 +314,7 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_internal_panel() {
-        println!("内置屏：{:?}", super::internal_device());
+        println!("内嵌候选：{:?}", super::embedded_sources());
         match super::Backlight::open() {
             Some(backlight) => println!(
                 "背光：档位数 {}、当前档位 {:?}",

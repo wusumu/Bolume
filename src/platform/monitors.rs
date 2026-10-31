@@ -10,6 +10,8 @@
 
 use std::mem::size_of;
 
+use crate::platform::displaycfg;
+
 use windows::{
     Win32::{
         Foundation::{LPARAM, RECT},
@@ -49,6 +51,15 @@ pub struct MonitorInfo {
     pub handle: isize,
     /// GDI 设备名，形如 `\\.\DISPLAY1`（认「哪台是内置屏」要用它）。
     pub device: String,
+    /// 活动路径推到的那台显示器的设备接口路径（`\\?\DISPLAY#…#{…}`）。
+    pub target_device: Option<String>,
+    /// 这个源下面挂的显示器节点，就是它此刻真正推的那台。
+    ///
+    /// 笔记本的内置屏被关掉之后，源会继续挂着内置屏的节点（名字、EDID 全是
+    /// 笔记本屏的），画面却在往别处送 —— 这时是 `false`。判「这块屏能不能
+    /// 当内置屏走背光」必须看它：否则一块 DDC/CI 恰好读不出的外接屏会被认成
+    /// 笔记本面板，拖它的滑条反而去拧笔记本的背光。
+    pub own_target: bool,
 }
 
 /// 按 OSD 的显示器序号（0 = 主显示器，n = 第 n 台）取那块屏的句柄。
@@ -165,9 +176,35 @@ pub fn diag_report() -> String {
         );
         let _ = writeln!(
             out,
-            "       最终名字={:?} 型号={:?}",
-            info.name, info.model
+            "       最终名字={:?} 型号={:?} 目标是不是自己的={}",
+            info.name, info.model, info.own_target
         );
+        let _ = writeln!(
+            out,
+            "       GDI 设备={:?} 活动目标设备={:?}",
+            info.device, info.target_device
+        );
+        // 名字取自哪一层：活动路径的目标是「画面真正落的那台」，和
+        // `EnumDisplayDevices` 报的可能不是同一台（合盖后常见）。
+        match displaycfg::path_of(&info.device) {
+            Some(path) => {
+                let _ = writeln!(
+                    out,
+                    "       活动路径: 技术={} ({}) 目标名={:?}",
+                    path.technology,
+                    displaycfg::technology_name(path.technology),
+                    path.friendly
+                );
+                let _ = writeln!(
+                    out,
+                    "       目标设备路径: {:?}",
+                    path.device_path
+                );
+            }
+            None => {
+                let _ = writeln!(out, "       活动路径: 没有（这块屏没在输出）");
+            }
+        }
         match enumerate_monitor(&info.device, 0) {
             Some(display) => {
                 let _ = writeln!(
@@ -216,17 +253,26 @@ pub fn diag_report() -> String {
     out
 }
 
+/// 枚举回调的上下文：一遍枚举里，活动路径只取一次（每块屏各取一次太浪费）。
+struct CollectCtx {
+    list: Vec<MonitorInfo>,
+    paths: Vec<displaycfg::Path>,
+}
+
 fn collect_all() -> Vec<MonitorInfo> {
-    let mut list: Vec<MonitorInfo> = Vec::new();
+    let mut ctx = CollectCtx {
+        list: Vec::new(),
+        paths: displaycfg::active_paths(),
+    };
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
             None,
             Some(collect),
-            LPARAM(&mut list as *mut Vec<MonitorInfo> as isize),
+            LPARAM(&mut ctx as *mut CollectCtx as isize),
         );
     }
-    list
+    ctx.list
 }
 
 unsafe extern "system" fn collect(
@@ -235,7 +281,7 @@ unsafe extern "system" fn collect(
     _clip: *mut RECT,
     data: LPARAM,
 ) -> BOOL {
-    let list = unsafe { &mut *(data.0 as *mut Vec<MonitorInfo>) };
+    let ctx = unsafe { &mut *(data.0 as *mut CollectCtx) };
     let mut info = MONITORINFOEXW {
         monitorInfo: MONITORINFO {
             cbSize: size_of::<MONITORINFOEXW>() as u32,
@@ -262,11 +308,31 @@ unsafe extern "system" fn collect(
     let device = wide_to_string(&info.szDevice);
     let work = info.monitorInfo.rcWork;
     let screen = info.monitorInfo.rcMonitor;
-    let (model, reported) = device_names(&device);
-    list.push(MonitorInfo {
+    // 这个源下面挂的显示器节点（`\\?\DISPLAY#…`），以及活动路径实际推的那台。
+    let interface = enumerate_monitor(&device, EDD_GET_DEVICE_INTERFACE_NAME)
+        .map(|display| wide_to_string(&display.DeviceID))
+        .unwrap_or_default();
+    let target_device = ctx
+        .paths
+        .iter()
+        .find(|path| {
+            path.source
+                .as_deref()
+                .is_some_and(|source| source.eq_ignore_ascii_case(&device))
+        })
+        .and_then(|path| path.device_path.clone());
+    // 两边都拿得到才比；拿不全就按「是它自己的」处理，退回只看接口技术的旧行为。
+    let own_target = match target_device.as_deref() {
+        Some(target) if !interface.is_empty() => interface.eq_ignore_ascii_case(target),
+        _ => true,
+    };
+    let (model, reported) = device_names(&device, &ctx.paths, &interface);
+    ctx.list.push(MonitorInfo {
         name: model.clone().or(reported).unwrap_or_else(|| device.clone()),
         model,
         device,
+        target_device,
+        own_target,
         is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
         work: (
             work.left as f32 / scale,
@@ -303,26 +369,47 @@ fn enumerate_monitor(device: &str, flags: u32) -> Option<DISPLAY_DEVICEW> {
 
 /// 一台屏的两档名字：`(真型号, 驱动报的名字)`。
 ///
-/// 驱动给的 `DeviceString` 经常只是通用名（`Generic PnP Monitor` /
-/// `Generic Monitor`），真正型号在 EDID 的 `0xFC` descriptor 里 ——
-/// 设备管理器那串「Generic Monitor (型号)」的括号内容就是从这儿拿的。
-/// 所以只有通用名才去读 EDID；驱动认得出型号就直接当型号用。
-fn device_names(device: &str) -> (Option<String>, Option<String>) {
+/// 型号按这个顺序找，前一层认得出就不往下问：
+///
+/// 1. **活动显示路径的目标**（`platform::displaycfg`）。`EnumDisplayDevices`
+///    报的是「挂在这个源下面的显示器设备」—— 笔记本合盖、内置屏被关掉之后，
+///    那个源会继续挂着内置屏的节点（名字、EDID 全是笔记本屏的），画面却送到
+///    外接屏上去了。路径目标是当下真实的落点，`32X1UE META` 这种名字只有它有。
+/// 2. 驱动给的 `DeviceString`，前提是它不叫「Generic …」。
+/// 3. EDID 的 `0xFC` descriptor（设备管理器「Generic Monitor (型号)」的括号来源）。
+fn device_names(
+    device: &str,
+    paths: &[displaycfg::Path],
+    interface: &str,
+) -> (Option<String>, Option<String>) {
     if device.is_empty() {
         return (None, None);
     }
-    let Some(plain) = enumerate_monitor(device, 0) else {
-        return (None, None);
-    };
-    let reported = wide_to_string(&plain.DeviceString).trim().to_string();
-    let reported = (!reported.is_empty()).then_some(reported);
-    if let Some(name) = reported.as_ref().filter(|name| !is_generic_name(name)) {
-        return (Some(name.clone()), reported);
-    }
-    let interface = enumerate_monitor(device, EDD_GET_DEVICE_INTERFACE_NAME)
-        .map(|display| wide_to_string(&display.DeviceID))
-        .unwrap_or_default();
-    (edid_monitor_name(&interface), reported)
+    let declared = paths
+        .iter()
+        .find(|path| {
+            path.source
+                .as_deref()
+                .is_some_and(|source| source.eq_ignore_ascii_case(device))
+        })
+        .and_then(|path| {
+            path.friendly
+                .clone()
+                .filter(|name| !is_generic_name(name))
+                .or_else(|| path.device_path.as_deref().and_then(edid_monitor_name))
+        });
+    let reported = enumerate_monitor(device, 0)
+        .map(|display| wide_to_string(&display.DeviceString).trim().to_string())
+        .filter(|name| !name.is_empty());
+    let model = declared
+        .or_else(|| {
+            reported
+                .as_deref()
+                .filter(|name| !is_generic_name(name))
+                .map(str::to_string)
+        })
+        .or_else(|| edid_monitor_name(interface));
+    (model, reported)
 }
 
 /// 驱动没认出具体型号时给的名字。`Generic Monitor (XXX)` 这种也算 ——
@@ -494,7 +581,7 @@ mod tests {
                 "{device}: reported={reported:?} id={id:?} iface_id={iface_id:?} enum_key={:?} edid_name={:?} names={:?}",
                 enum_key(&iface_id),
                 edid_monitor_name(&iface_id),
-                device_names(&device)
+                device_names(&device, &displaycfg::active_paths(), &iface_id)
             );
         }
     }

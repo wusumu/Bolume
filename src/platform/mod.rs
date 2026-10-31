@@ -5,6 +5,7 @@ pub mod backlight;
 pub mod bootstart;
 pub mod clipboard;
 pub mod detach;
+pub mod displaycfg;
 pub mod fonts;
 pub mod fullscreen;
 pub mod hotkey;

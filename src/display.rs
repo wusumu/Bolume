@@ -565,6 +565,33 @@ fn display_name(index: usize, reported: &str, model: Option<&str>) -> String {
 /// `EnumDisplayMonitors` 里的屏和 `GetPhysicalMonitorsFromHMONITOR` 给的物理
 /// 显示器不保证一一对应（笔记本合盖后内置屏还在枚举里，却拿不到物理显示器），
 /// 按下标配对会把外接屏的名字和 HDR 标成内置屏的。
+/// 这块屏能不能当内置屏、走 `\\.\LCD` 的背光通道。
+///
+/// 认它是内置屏有两条路，都得先过「这块屏一条亮度都读不出来」这道坎：
+///
+/// 1. 活动路径报成内嵌接口（eDP / LVDS / INTERNAL），并且这个源推的就是它
+///    自己挂的那块面板（`own_target`）；
+/// 2. 连一台物理显示器都拿不到（面板根本没接 I2C 那条线）。**技术无关**：
+///    有的驱动把 eDP 也报成 `DISPLAYPORT_EXTERNAL`，只看接口技术会漏掉。
+///
+/// 反过来最常见的误判是：内置屏被关掉之后，那个源还挂着笔记本面板的节点
+/// （名字、EDID 都是笔记本屏的），画面却送到了外接屏上。这时 `own_target`
+/// 是 `false`，DDC/CI 读写的是外接屏 —— 绝不能因为「节点看着像笔记本屏」
+/// 就去拧笔记本的背光。
+fn is_internal_panel(
+    own_target: bool,
+    ddc_seen: usize,
+    ddc_readable: bool,
+    embedded: &[String],
+    device: &str,
+    taken: bool,
+) -> bool {
+    if taken || ddc_readable || !own_target {
+        return false;
+    }
+    embedded.iter().any(|known| known.eq_ignore_ascii_case(device)) || ddc_seen == 0
+}
+
 fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
     let screens = crate::platform::monitors::screens();
     // DDC 那边的句柄类型是 `winapi` 的，和 `windows` 的不是一个东西 —— 拿它的
@@ -577,88 +604,105 @@ fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
         }
     };
     let hdr_screens = hdr_screens();
-    // 内置屏（笔记本面板）走背光接口，别的屏走 DDC/CI。
-    let internal = crate::platform::backlight::internal_device();
+    // 内嵌接口的源：内置屏的**候选**，不是结论。厂商驱动会把外接 DisplayPort
+    // 也报成 `DISPLAYPORT_EMBEDDED`（实测一台 RTX 5090 笔记本就这样），所以
+    // 还要过两道才认：这块屏的 DDC/CI 读不出亮度，并且它推的就是自己挂的那台
+    // 显示器（不是内置屏关掉之后留下的空壳节点）。
+    let embedded = crate::platform::backlight::embedded_sources();
     let mut backlight: Option<Rc<Backlight>> = None;
+    // `\\.\LCD` 全系统只有一条，只给一台屏用。
+    let mut backlight_taken = false;
     let mut entries = Vec::with_capacity(screens.len());
     let mut handles = Vec::with_capacity(screens.len());
     for (index, screen) in screens.iter().enumerate() {
         let handle = screen.handle;
         let hdr = screen_is_hdr(handle, &hdr_screens);
-        // 内置屏：DDC/CI 基本不通（笔记本面板没接 MCCS 那条线），走 `\\.\LCD` ——
-        // 系统那个亮度滑块走的就是它，两边调的是同一个东西。
-        let is_internal = internal
-            .as_deref()
-            .is_some_and(|device| device.eq_ignore_ascii_case(&screen.device));
-        if is_internal {
-            if backlight.is_none() {
-                backlight = Backlight::open().map(Rc::new);
-            }
-            if let Some(shared) = backlight.clone() {
-                let name = display_name(index, &screen.name, screen.model.as_deref());
-                let mut entry = Entry {
-                    channel: Channel::Backlight(shared),
-                    key: format!("{index}:{name}"),
-                    name,
-                    max: 100,
-                    raw: 0,
-                    readable: false,
-                    misses: 0,
-                    hdr,
-                    handle,
-                };
-                // 背光读得到就算数；读不到（驱动只给写不给读）再退回 DDC 试试。
-                if entry.reread() {
-                    entries.push(entry);
-                    handles.push(handle);
-                    continue;
-                }
-            }
-        }
-        let Some(hmon) = hmons
+        let start = entries.len();
+        let mut ddc_seen = 0usize;
+        // 先走 DDC/CI：外接屏都在这条路上。
+        if let Some(hmon) = hmons
             .iter()
             .find(|(known, _)| *known == handle)
             .map(|(_, hmon)| *hmon)
-        else {
+        {
+            match ddc_winapi::get_physical_monitors_from_hmonitor(hmon) {
+                Ok(physical) => {
+                    ddc_seen = physical.len();
+                    for physical in physical {
+                        let monitor = unsafe { Monitor::new(physical) };
+                        let reported = monitor.description();
+                        let name = display_name(index, &reported, screen.model.as_deref());
+                        // key 一直用驱动报的原文：名字换成型号之后，以前存的别名还认得出来。
+                        let key = if reported.trim().is_empty() {
+                            format!("{index}:{name}")
+                        } else {
+                            format!("{index}:{reported}")
+                        };
+                        let mut entry = Entry {
+                            channel: Channel::Ddc(monitor),
+                            key,
+                            name,
+                            max: 100,
+                            raw: 0,
+                            readable: false,
+                            misses: 0,
+                            hdr,
+                            handle,
+                        };
+                        entry.reread();
+                        entries.push(entry);
+                        handles.push(handle);
+                    }
+                }
+                Err(error) => {
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!("拿不到这块屏的物理显示器（{}）：{error}", screen.device);
+                    }
+                }
+            }
+        }
+        // 内置屏（笔记本面板）不接 MCCS，DDC/CI 一条都读不出来 —— 这是它和
+        // 「一块 DDC 恰好闪断的外接屏」的区别所在。
+        let readable = entries[start..].iter().any(|entry| entry.readable);
+        if !is_internal_panel(
+            screen.own_target,
+            ddc_seen,
+            readable,
+            &embedded,
+            &screen.device,
+            backlight_taken,
+        ) {
+            continue;
+        }
+        if backlight.is_none() {
+            backlight = Backlight::open().map(Rc::new);
+        }
+        let Some(shared) = backlight.clone() else {
             continue;
         };
-        let physical = match ddc_winapi::get_physical_monitors_from_hmonitor(hmon) {
-            Ok(list) => list,
-            Err(error) => {
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "拿不到这块屏的物理显示器（{}）：{error}",
-                        gdi_device_name(hmonitor(handle)).unwrap_or_default()
-                    );
-                }
-                continue;
-            }
+        let name = display_name(index, &screen.name, screen.model.as_deref());
+        let mut entry = Entry {
+            channel: Channel::Backlight(shared),
+            key: format!("{index}:{name}"),
+            name,
+            max: 100,
+            raw: 0,
+            readable: false,
+            misses: 0,
+            // 背光调的是真背光，开着 HDR 也照样有效 —— 「HDR 不给调」那条限制
+            // 是给 DDC 的色调映射留的，别把笔记本屏一起锁死。
+            hdr: false,
+            handle,
         };
-        for physical in physical {
-            let monitor = unsafe { Monitor::new(physical) };
-            let reported = monitor.description();
-            let name = display_name(index, &reported, screen.model.as_deref());
-            // key 一直用驱动报的原文：名字换成型号之后，以前存的别名还认得出来。
-            let key = if reported.trim().is_empty() {
-                format!("{index}:{name}")
-            } else {
-                format!("{index}:{reported}")
-            };
-            let mut entry = Entry {
-                channel: Channel::Ddc(monitor),
-                key,
-                name,
-                max: 100,
-                raw: 0,
-                readable: false,
-                misses: 0,
-                hdr,
-                handle,
-            };
-            entry.reread();
-            entries.push(entry);
-            handles.push(handle);
+        if !entry.reread() {
+            continue;
         }
+        // 这块屏那几条读不出的 DDC 通道换成背光这一条，别同屏挂两条。
+        entries.truncate(start);
+        handles.truncate(start);
+        entries.push(entry);
+        handles.push(handle);
+        backlight_taken = true;
     }
     remember_screens(&handles, &screens);
     emit(events, &entries);
@@ -916,7 +960,72 @@ fn emit(events: &async_channel::Sender<DisplayEvent>, entries: &[Entry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RETRY_CAP, RETRY_FIRST, display_name, percent_of, raw_of, retry_delay};
+    use super::{
+        RETRY_CAP, RETRY_FIRST, display_name, is_internal_panel, percent_of, raw_of, retry_delay,
+    };
+
+    /// 笔记本合盖后的实况（用户诊断报告）：唯一一块屏是外接 4K，DDC/CI 读得出，
+    /// 但那个源下面挂的还是笔记本面板的节点 —— 这条以前会被认成内置屏。
+    #[test]
+    fn external_screen_carrying_the_laptop_node_is_not_the_internal_panel() {
+        let embedded = vec![r"\\.\DISPLAY1".to_string()];
+        assert!(!is_internal_panel(
+            false, // 活动路径推的不是它挂的那个节点
+            1,     // 一台物理显示器
+            true,  // 亮度读得出
+            &embedded,
+            r"\\.\DISPLAY1",
+            false
+        ));
+    }
+
+    /// eDP 报 `DISPLAYPORT_EMBEDDED`：DDC/CI 一台物理显示器都给不出。
+    #[test]
+    fn edp_panel_takes_the_backlight_channel() {
+        let embedded = vec![r"\\.\DISPLAY5".to_string()];
+        assert!(is_internal_panel(
+            true,
+            0,
+            false,
+            &embedded,
+            r"\\.\DISPLAY5",
+            false
+        ));
+    }
+
+    /// 有的驱动把 eDP 也报成 `DISPLAYPORT_EXTERNAL`（不在候选里）：
+    /// 只要连物理显示器都拿不到，仍然认作内置屏。
+    #[test]
+    fn panel_without_any_physical_monitor_counts_as_internal() {
+        assert!(is_internal_panel(true, 0, false, &[], r"\\.\DISPLAY1", false));
+    }
+
+    /// 外接屏关了 DDC/CI（有物理显示器、但读不出亮度）：不能抢背光通道，
+    /// 否则拖它的滑条会去改笔记本的背光。
+    #[test]
+    fn external_screen_without_ddc_is_not_given_the_backlight() {
+        assert!(!is_internal_panel(
+            true,
+            1,
+            false,
+            &[],
+            r"\\.\DISPLAY1",
+            false
+        ));
+    }
+
+    /// 背光接口全局只有一条，已经给出去就不再给第二块屏。
+    #[test]
+    fn backlight_is_handed_out_once() {
+        assert!(!is_internal_panel(
+            true,
+            0,
+            false,
+            &[r"\\.\DISPLAY1".to_string()],
+            r"\\.\DISPLAY1",
+            true
+        ));
+    }
 
     #[test]
     fn generic_driver_names_take_the_edid_model() {
