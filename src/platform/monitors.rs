@@ -120,6 +120,102 @@ pub fn screens() -> Vec<MonitorInfo> {
     collect_all()
 }
 
+/// 诊断用：把「显示器名」这一链路上的每一层原始值都摊开写出来。
+///
+/// 用户报「名字不对 / 认不出哪台是笔记本屏」时，我们拿不到他的机器，只能靠这份
+/// 报告对号：系统枚举到几块屏、驱动报的 `DeviceString` 是什么、EDID 里的型号是
+/// 什么、注册表键对不对得上。只在 `--diag-displays` 里用。
+pub fn diag_report() -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    // 适配器层：`\\.\DISPLAY1` 这种设备名是这一层给的。
+    let _ = writeln!(out, "── 适配器层（EnumDisplayDevices(NULL, n)）");
+    for index in 0..16u32 {
+        let mut display = DISPLAY_DEVICEW {
+            cb: size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut display, 0) };
+        if !ok.as_bool() {
+            break;
+        }
+        let _ = writeln!(
+            out,
+            "  [{index}] device={:?} string={:?} id={:?} flags=0x{:X}",
+            wide_to_string(&display.DeviceName),
+            wide_to_string(&display.DeviceString),
+            wide_to_string(&display.DeviceID),
+            display.StateFlags.0
+        );
+    }
+
+    let list = screens();
+    let _ = writeln!(out, "\n── EnumDisplayMonitors：{} 块屏", list.len());
+    for (index, info) in list.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "  [{index}] handle=0x{:X} device={:?} primary={}",
+            info.handle, info.device, info.is_primary
+        );
+        let _ = writeln!(
+            out,
+            "       bounds={:?} work={:?}",
+            info.bounds, info.work
+        );
+        let _ = writeln!(
+            out,
+            "       最终名字={:?} 型号={:?}",
+            info.name, info.model
+        );
+        match enumerate_monitor(&info.device, 0) {
+            Some(display) => {
+                let _ = writeln!(
+                    out,
+                    "       EnumDisplayDevices(0): string={:?} id={:?}",
+                    wide_to_string(&display.DeviceString),
+                    wide_to_string(&display.DeviceID)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "       EnumDisplayDevices(0): 失败");
+            }
+        }
+        let Some(iface) = enumerate_monitor(&info.device, EDD_GET_DEVICE_INTERFACE_NAME) else {
+            let _ = writeln!(out, "       设备接口名: 取不到");
+            continue;
+        };
+        let iface_id = wide_to_string(&iface.DeviceID);
+        let _ = writeln!(out, "       接口名: {iface_id:?}");
+        let _ = writeln!(
+            out,
+            "       注册表键: {:?}",
+            enum_key(&iface_id).unwrap_or_default()
+        );
+        match edid_bytes(&iface_id) {
+            Some(edid) => {
+                let head: Vec<String> = edid
+                    .iter()
+                    .take(16)
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "       EDID: {} 字节，头 {:?}，型号={:?}",
+                    edid.len(),
+                    head.join(" "),
+                    monitor_name_descriptor(&edid)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "       EDID: 读不到（注册表里没有）");
+            }
+        }
+    }
+
+    out
+}
+
 fn collect_all() -> Vec<MonitorInfo> {
     let mut list: Vec<MonitorInfo> = Vec::new();
     unsafe {
@@ -242,6 +338,11 @@ pub fn is_generic_name(name: &str) -> bool {
 /// 设备接口写法 `\\?\DISPLAY#AUS27B1#5&…#{接口 GUID}` 要把 `#` 换成 `\`、
 /// 去掉末尾的接口 GUID。读不到就 `None` —— 这不是关键路径，不值得为它报错。
 fn edid_monitor_name(device_id: &str) -> Option<String> {
+    monitor_name_descriptor(&edid_bytes(device_id)?)
+}
+
+/// 注册表里那串 EDID 原始字节（`Enum\<设备>\Device Parameters\EDID`）。
+fn edid_bytes(device_id: &str) -> Option<Vec<u8>> {
     let key = format!(
         "SYSTEM\\CurrentControlSet\\Enum\\{}\\Device Parameters",
         enum_key(device_id)?
@@ -279,7 +380,7 @@ fn edid_monitor_name(device_id: &str) -> Option<String> {
         return None;
     }
     buffer.truncate(size as usize);
-    monitor_name_descriptor(&buffer)
+    Some(buffer)
 }
 
 /// 把设备 ID 变成 `Enum\` 底下的子键路径。

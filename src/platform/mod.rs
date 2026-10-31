@@ -3,6 +3,7 @@ pub mod app_pick;
 pub mod autostart;
 pub mod backlight;
 pub mod bootstart;
+pub mod clipboard;
 pub mod detach;
 pub mod fonts;
 pub mod fullscreen;

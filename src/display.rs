@@ -107,7 +107,8 @@ pub const VCP_BRIGHTNESS: u8 = 0x10;
 pub const VCP_CONTRAST: u8 = 0x12;
 
 /// 这块屏（`HMONITOR`）的 GDI 设备名，形如 `\\.\DISPLAY1`。
-fn gdi_device_name(handle: HMONITOR) -> Option<String> {    let mut info = MONITORINFOEXW::default();
+fn gdi_device_name(handle: HMONITOR) -> Option<String> {
+    let mut info = MONITORINFOEXW::default();
     info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     // `MONITORINFOEXW` 的头一段就是 `MONITORINFO`，所以这里能直接转过去。
     let ok = unsafe { GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) };
@@ -664,9 +665,183 @@ fn scan(events: &async_channel::Sender<DisplayEvent>) -> Vec<Entry> {
     entries
 }
 
+/// 诊断用：把亮度这条链路上的三层信息摊开写出来。
+///
+/// 用户报「笔记本外接屏顶着内置屏的名字」「内置屏调不了亮度」时，我们看不到他的
+/// 机器，只能靠这份报告判断是哪一层对不上：系统枚举到几块屏、DDC 给了几台物理
+/// 显示器、最后界面上拿到的是哪条。只在 `--diag-displays` 里用。
+pub fn diag_report() -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Bolume {} / {} build {} / {}",
+        crate::version(),
+        if crate::platform::winver::is_windows_11() {
+            "Windows 11"
+        } else {
+            "Windows 10"
+        },
+        crate::platform::winver::build_number(),
+        std::env::consts::ARCH
+    );
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = writeln!(out, "exe: {}", exe.display());
+        // 用户手里是哪一版：版本号一样时靠修改时间和大小分辨（诊断包里最常问的一句）。
+        if let Ok(meta) = std::fs::metadata(&exe) {
+            let when = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| {
+                    // 不加时间库：按 UTC 秒数报，能对上文件时间就够。
+                    format!("{} 秒（Unix 时间，UTC）", since.as_secs())
+                })
+                .unwrap_or_else(|| "?".into());
+            let _ = writeln!(out, "exe 大小={} 字节，修改时间={when}", meta.len());
+        }
+    }
+    let (width, height) = unsafe {
+        (
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN,
+            ),
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN,
+            ),
+        )
+    };
+    let _ = writeln!(out, "虚拟桌面: {width}×{height}");
+
+    let _ = writeln!(out, "\n{}", crate::platform::monitors::diag_report());
+
+    let _ = writeln!(out, "── DXGI 输出（HDR 判定用）");
+    match unsafe { CreateDXGIFactory1::<IDXGIFactory1>() } {
+        Ok(factory) => {
+            let mut adapter_index = 0;
+            loop {
+                let Ok(adapter) = (unsafe { factory.EnumAdapters1(adapter_index) }) else {
+                    break;
+                };
+                adapter_index += 1;
+                let description = unsafe { adapter.GetDesc1() }
+                    .map(|desc| {
+                        let len = desc
+                            .Description
+                            .iter()
+                            .position(|unit| *unit == 0)
+                            .unwrap_or(desc.Description.len());
+                        String::from_utf16_lossy(&desc.Description[..len])
+                    })
+                    .unwrap_or_default();
+                let _ = writeln!(out, "  适配器[{adapter_index}] {description:?}");
+                let mut output_index = 0;
+                loop {
+                    let Ok(output) = (unsafe { adapter.EnumOutputs(output_index) }) else {
+                        break;
+                    };
+                    output_index += 1;
+                    let Ok(six) = output.cast::<IDXGIOutput6>() else {
+                        let _ = writeln!(out, "    输出[{output_index}] 拿不到 IDXGIOutput6");
+                        continue;
+                    };
+                    let Ok(desc) = (unsafe { six.GetDesc1() }) else {
+                        let _ = writeln!(out, "    输出[{output_index}] GetDesc1 失败");
+                        continue;
+                    };
+                    let len = desc
+                        .DeviceName
+                        .iter()
+                        .position(|unit| *unit == 0)
+                        .unwrap_or(desc.DeviceName.len());
+                    let name = String::from_utf16_lossy(&desc.DeviceName[..len]);
+                    let _ = writeln!(
+                        out,
+                        "    输出[{output_index}] {name:?} 桌面={} 色彩空间={} HDR={}",
+                        desc.AttachedToDesktop.as_bool(),
+                        desc.ColorSpace.0,
+                        is_hdr_color_space(desc.ColorSpace)
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(out, "  建工厂失败：{error}");
+        }
+    }
+
+    let _ = writeln!(out, "\n── DDC/CI 物理显示器（按 HMONITOR 对号）");
+    match ddc_winapi::enumerate_monitors() {
+        Ok(list) => {
+            let _ = writeln!(out, "   ddc 枚举到 {} 个 HMONITOR", list.len());
+            for hmon in list {
+                let handle = hmon as isize;
+                let device = gdi_device_name(hmonitor(handle)).unwrap_or_default();
+                let _ = writeln!(out, "   [0x{handle:X}] {device}");
+                match ddc_winapi::get_physical_monitors_from_hmonitor(hmon) {
+                    Ok(physical) => {
+                        let _ = writeln!(out, "      物理显示器 {} 台", physical.len());
+                        for physical in physical {
+                            let mut monitor = unsafe { Monitor::new(physical) };
+                            let description = monitor.description();
+                            let read = monitor.get_vcp_feature(VCP_BRIGHTNESS);
+                            let _ = writeln!(
+                                out,
+                                "      描述={description:?} 亮度={:?}",
+                                read.map(|value| (value.value(), value.maximum()))
+                                    .map_err(|error| error.to_string())
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = writeln!(out, "      GetPhysicalMonitors 失败：{error}");
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(out, "   ddc 枚举失败：{error}");
+        }
+    }
+
+    let _ = writeln!(out, "\n── 背光与显示路径\n{}", crate::platform::backlight::diag_report());
+
+    // 真的跑一遍生产用的 `scan`：界面拿到的就是这一份。
+    let (events, receiver) = async_channel::bounded(8);
+    let entries = scan(&events);
+    drop(events);
+    while let Ok(event) = receiver.try_recv() {
+        if let DisplayEvent::Error(message) = event {
+            let _ = writeln!(out, "\n[scan 报错] {message}");
+        }
+    }
+    let _ = writeln!(out, "── 最终条目（亮度面板与设置页看到的就是这些）");
+    for entry in &entries {
+        let _ = writeln!(
+            out,
+            "  name={:?} key={:?} 通道={} 可读={} 值={}/{} HDR={} handle=0x{:X}",
+            entry.name,
+            entry.key,
+            match entry.channel {
+                Channel::Ddc(_) => "DDC/CI",
+                Channel::Backlight(_) => "背光(\\\\.\\LCD)",
+            },
+            entry.readable,
+            entry.raw,
+            entry.max,
+            entry.hdr,
+            entry.handle
+        );
+    }
+    if entries.is_empty() {
+        let _ = writeln!(out, "  （一条都没有）");
+    }
+    out
+}
+
 /// 记下这次扫出来的通道次序和系统报的屏，供「光标在哪台」和插拔检测用。
-fn remember_screens(handles: &[isize], screens: &[crate::platform::monitors::MonitorInfo]) {
-    if let Ok(mut entry_screens) = ENTRY_SCREENS.lock() {
+fn remember_screens(handles: &[isize], screens: &[crate::platform::monitors::MonitorInfo]) {    if let Ok(mut entry_screens) = ENTRY_SCREENS.lock() {
         *entry_screens = handles.to_vec();
     }
     if let Ok(mut known) = KNOWN_SCREENS.lock() {

@@ -12,9 +12,10 @@ use std::mem::size_of;
 use windows::{
     Win32::{
         Devices::Display::{
-            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
-            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_PATH_INFO,
-            DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+            DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL,
+            DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+            DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
             GetDisplayConfigBufferSizes, IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS,
             IOCTL_VIDEO_QUERY_SUPPORTED_BRIGHTNESS, IOCTL_VIDEO_SET_DISPLAY_BRIGHTNESS,
             QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
@@ -214,8 +215,175 @@ pub fn internal_device() -> Option<String> {
     None
 }
 
-fn wide_text(buffer: &[u16]) -> Option<String> {
-    let len = buffer
+/// 诊断用：把「这条屏是哪台 / 背光能不能开」的原始信息写出来。
+///
+/// 笔记本用户报「内置屏调不了亮度」时，这份能分辨三种情况：系统没认出内置屏、
+/// 认出来了但 `\\.\LCD` 打不开（少数驱动只给 WMI）、打得开但档位不够。
+pub fn diag_report() -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+
+    let _ = writeln!(out, "── QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)");
+    let mut paths = 0u32;
+    let mut modes = 0u32;
+    let status = unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) };
+    if status.0 != 0 {
+        let _ = writeln!(out, "   取缓冲区失败：{}", status.0);
+    } else {
+        let mut path_buffer = vec![DISPLAYCONFIG_PATH_INFO::default(); paths.max(1) as usize];
+        let mut mode_buffer = vec![DISPLAYCONFIG_MODE_INFO::default(); modes.max(1) as usize];
+        let status = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut paths,
+                path_buffer.as_mut_ptr(),
+                &mut modes,
+                mode_buffer.as_mut_ptr(),
+                None,
+            )
+        };
+        if status.0 != 0 {
+            let _ = writeln!(out, "   QueryDisplayConfig 失败：{}", status.0);
+        } else {
+            path_buffer.truncate(paths as usize);
+            let _ = writeln!(out, "   活动路径 {} 条", path_buffer.len());
+            for (index, path) in path_buffer.iter().enumerate() {
+                // 源：`\\.\DISPLAY1` 这种，和 EnumDisplayMonitors 的 `szDevice` 同一套。
+                let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+                source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                source.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+                source.header.adapterId = path.sourceInfo.adapterId;
+                source.header.id = path.sourceInfo.id;
+                let source_name = if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } == 0 {
+                    wide_text(&source.viewGdiDeviceName)
+                } else {
+                    None
+                };
+                // 目标：显示器自己报的友好名 + EDID 厂商/产品号。
+                let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+                target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+                target.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+                target.header.adapterId = path.targetInfo.adapterId;
+                target.header.id = path.targetInfo.id;
+                let has_target = unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } == 0;
+                let friendly = if has_target {
+                    wide_text(&target.monitorFriendlyDeviceName)
+                } else {
+                    None
+                };
+                let edid_path = if has_target {
+                    wide_text(&target.monitorDevicePath)
+                } else {
+                    None
+                };
+                let technology = path.targetInfo.outputTechnology.0;
+                let _ = writeln!(
+                    out,
+                    "   [{index}] 源={source_name:?} 输出技术={technology} ({}) 目标友好名={friendly:?}",
+                    technology_name(technology)
+                );
+                if has_target {
+                    let _ = writeln!(
+                        out,
+                        "       EDID 厂商=0x{:04X} 产品=0x{:04X} 设备路径={edid_path:?}",
+                        target.edidManufactureId, target.edidProductCodeId
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = writeln!(out, "\n── 内置屏判定（outputTechnology == INTERNAL）");
+    let _ = writeln!(out, "   internal_device() = {:?}", internal_device());
+
+    let _ = writeln!(out, "\n── 背光设备 \\\\.\\LCD");
+    match unsafe {
+        CreateFileW(
+            w!("\\\\.\\LCD"),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    } {
+        Ok(device) => {
+            let _ = writeln!(out, "   打开成功");
+            let mut backlight = Backlight {
+                device,
+                levels: Vec::new(),
+            };
+            match backlight.query_levels() {
+                Some(levels) => {
+                    let _ = writeln!(
+                        out,
+                        "   档位 {} 个：{:?}",
+                        levels.len(),
+                        &levels[..levels.len().min(24)]
+                    );
+                    backlight.levels = levels;
+                    match backlight.read() {
+                        Some(index) => {
+                            let _ = writeln!(
+                                out,
+                                "   当前档位下标={index}（值 {:?}），量程上限={}",
+                                backlight.levels.get(index as usize),
+                                backlight.levels.len().saturating_sub(1)
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(out, "   读当前档位失败（驱动只给写不给读？）");
+                        }
+                    }
+                }
+                None => {
+                    let _ = writeln!(out, "   打得开，但读不到档位表");
+                }
+            }
+            // 句柄交给 `Drop` 关。
+        }
+        Err(error) => {
+            let _ = writeln!(
+                out,
+                "   打开失败：{}（0x{:08X}）",
+                error.message(),
+                error.code().0
+            );
+        }
+    }
+    out
+}
+
+/// 输出技术的可读名（`DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY` 的取值）。
+fn technology_name(value: i32) -> &'static str {
+    match value {
+        -2 => "UNINITIALIZED",
+        -1 => "OTHER",
+        0 => "VGA",
+        1 => "SVIDEO",
+        2 => "COMPOSITE_VIDEO",
+        3 => "COMPONENT_VIDEO",
+        4 => "DVI",
+        5 => "HDMI",
+        6 => "LVDS",
+        7 => "D_JPN",
+        8 => "SDI",
+        9 => "DISPLAYPORT_EXTERNAL",
+        10 => "DISPLAYPORT_EMBEDDED",
+        11 => "UDI_EXTERNAL",
+        12 => "UDI_EMBEDDED",
+        13 => "SDTVDONGLE",
+        14 => "MIRACAST",
+        15 => "INDIRECT_WIRED",
+        16 => "INDIRECT_VIRTUAL",
+        -0x8000_0000 => "INTERNAL",
+        _ => "?",
+    }
+}
+
+fn wide_text(buffer: &[u16]) -> Option<String> {    let len = buffer
         .iter()
         .position(|unit| *unit == 0)
         .unwrap_or(buffer.len());

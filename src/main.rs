@@ -103,6 +103,20 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // 显示器诊断：给用户一个「双击就出报告」的包 —— 把 exe 改名成 `BolumeDiag.exe`
+    // 就是诊断工具，不用教他敲命令行参数（`--diag-displays` 也一样）。
+    let diag_by_name = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase())
+        })
+        .is_some_and(|stem| stem.starts_with("bolumediag"));
+    if diag_by_name || args.iter().any(|arg| arg == "--diag-displays") {
+        probe::run_diag();
+        return;
+    }
+
     // 系统启动那一档：任务是开机触发、SYSTEM 身份跑的。那个进程不画界面，
     // 只等用户会话出现、再把自己送进去（详见 `platform::bootstart`）。
     if args

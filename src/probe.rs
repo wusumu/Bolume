@@ -639,3 +639,98 @@ fn truncate(value: &str, limit: usize) -> String {
     text.push('…');
     text
 }
+
+/// 诊断：把显示器 / 亮度这条链路上的原始信息写成一个 txt，并复制到剪贴板。
+///
+/// 用法：`Bolume.exe --diag-displays`（或者直接把本程序改名成 `BolumeDiag.exe`
+/// 双击 —— 见 `main` 里的那条判断，交给不懂命令行的用户时用后者）。
+/// 落点：exe 旁边 `Bolume-diag.txt`；那里不可写就落到临时目录。
+pub fn run_diag() {
+    use std::fmt::Write as _;
+
+    let mut report = crate::display::diag_report();
+
+    // 顺带记一段配置：有些问题是「亮度功能根本没开」，光看硬件层看不出来。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Ok(text) = std::fs::read_to_string(dir.join("config.json")) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let _ = writeln!(report, "\n── config.json");
+                    for key in [
+                        "config_rev",
+                        "brightness",
+                        "panel_layout",
+                        "language",
+                    ] {
+                        if let Some(item) = value.get(key) {
+                            let _ = writeln!(
+                                report,
+                                "   {key} = {}",
+                                serde_json::to_string(item).unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("{report}");
+
+    let path = diag_path();
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend(report.as_bytes());
+    let saved = std::fs::write(&path, &bytes).is_ok();
+    let copied = crate::platform::clipboard::set_text(&report);
+
+    let message = if saved {
+        format!(
+            "诊断信息已保存到：\n{}\n\n{}",
+            path.display(),
+            if copied {
+                "同时也复制到剪贴板了，可以直接粘贴发送。"
+            } else {
+                "请把这个文件发给我。"
+            }
+        )
+    } else {
+        "诊断信息生成失败（写文件出错），请把弹出的控制台内容拍照发我。".to_string()
+    };
+    message_box("Bolume 诊断", &message);
+}
+
+/// 诊断文件落在 exe 旁边；不可写（装在 Program Files 之类）就落临时目录。
+fn diag_path() -> std::path::PathBuf {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+        .unwrap_or_else(std::env::temp_dir);
+    let candidate = dir.join("Bolume-diag.txt");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&candidate)
+    {
+        Ok(_) => candidate,
+        Err(_) => std::env::temp_dir().join("Bolume-diag.txt"),
+    }
+}
+
+/// 一个只有「确定」的系统消息框（诊断跑完总得告诉用户去哪儿拿文件）。
+fn message_box(caption: &str, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+    };
+    use windows::core::PCWSTR;
+
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = caption.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        );
+    }
+}
