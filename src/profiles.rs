@@ -50,21 +50,36 @@ pub fn dir(root: &Path) -> PathBuf {
     root.join(DIR_NAME)
 }
 
-/// 「上一次的主配置」那份快照的文件名（在 `Configs/` 里）。
+/// 「上一次的主配置」那份快照的文件名。
 ///
 /// 启用副配置是整份盖掉 `config.json`，盖之前先把当前这套写到这里，
-/// 所以主配置行永远有东西可以点「启用」切回去。它不参与副配置列表 ——
-/// 名字固定（不跟界面语言走），过滤也好写。
-pub const MAIN_BACKUP: &str = "主配置";
+/// 所以主配置行永远有东西可以点「启用」切回去。
+///
+/// 它**不在 `Configs/` 里**：那个文件夹放的是用户自己建的档，混一份系统状态
+/// 进去只会让人以为多了一份配置。这份快照就放在 `config.json` 边上，
+/// 名字固定（不跟界面语言走）。
+pub const MAIN_BACKUP: &str = "config.backup.json";
 
-/// `根目录/Configs/主配置.json`。
+/// `根目录/config.backup.json`。
 pub fn main_backup(root: &Path) -> PathBuf {
-    main_backup_of(&dir(root))
+    root.join(MAIN_BACKUP)
 }
 
-/// `Configs/` 目录里的那份快照路径（`unique` 里判保留名用）。
-fn main_backup_of(dir: &Path) -> PathBuf {
-    dir.join(format!("{MAIN_BACKUP}.{EXTENSION}"))
+/// 老版本把快照放在 `Configs/主配置.json`：挪出来，别让它冒充一份副配置。
+///
+/// 现在 `Configs/` 里叫什么名字都可以，那份老快照没人认得，会在列表里多出一行。
+/// 根目录还没有快照就搬过去（主配置行照样能切回），有就把老的删掉。
+pub fn migrate_legacy_backup(root: &Path) {
+    let legacy = dir(root).join(format!("主配置.{EXTENSION}"));
+    if !legacy.exists() {
+        return;
+    }
+    let target = main_backup(root);
+    if target.exists() || fs::copy(&legacy, &target).is_err() {
+        let _ = fs::remove_file(&legacy);
+        return;
+    }
+    let _ = fs::remove_file(&legacy);
 }
 
 fn ensure_dir(root: &Path) -> std::io::Result<PathBuf> {
@@ -89,10 +104,6 @@ pub fn list(root: &Path) -> Vec<Profile> {
         let Some(name) = file_stem(&path) else {
             continue;
         };
-        // 主配置快照归主配置那行管，不算一份副配置。
-        if name == MAIN_BACKUP {
-            continue;
-        }
         let meta = entry.metadata().ok();
         out.push(Profile {
             name,
@@ -147,12 +158,9 @@ pub fn clean_name(raw: &str) -> String {
 /// 在 `dir` 里找一个不撞名的路径：`名字.json`、`名字 (2).json`…
 fn unique(dir: &Path, stem: &str) -> PathBuf {
     let stem = if stem.is_empty() { "config" } else { stem };
-    // 「主配置」这个名字留给 `main_backup` 那份快照：新档要是占了它，
-    // 下次启用副配置就会把用户这份当快照直接覆盖掉。
-    let reserved = main_backup_of(dir);
     let mut candidate = dir.join(format!("{stem}.{EXTENSION}"));
     let mut n = 2;
-    while (candidate.exists() || candidate == reserved) && n < 1000 {
+    while candidate.exists() && n < 1000 {
         candidate = dir.join(format!("{stem} ({n}).{EXTENSION}"));
         n += 1;
     }
@@ -204,9 +212,6 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     let stem = clean_name(new_name);
     if stem.is_empty() {
         return Err("empty name".into());
-    }
-    if stem == MAIN_BACKUP {
-        return Err("reserved".into());
     }
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let target = dir.join(format!("{stem}.{EXTENSION}"));
@@ -263,21 +268,40 @@ mod tests {
         dir
     }
 
+    /// 主配置快照放在根目录，不进 `Configs/`；老版本留在里面的那份要被挪出来。
     #[test]
-    fn snapshot_name_is_reserved() {
-        let root = temp_root("reserved");
+    fn snapshot_lives_outside_the_configs_dir() {
+        let root = temp_root("snapshot");
         let config = Config::default();
-        // 新档占不了快照的名字，否则下次启用会把它当快照直接覆盖。
-        let path = create(&root, MAIN_BACKUP, &config).unwrap();
-        assert_eq!(path.file_name().unwrap(), "主配置 (2).json");
-        // 改名到快照名也要拦住。
-        let other = create(&root, "x", &config).unwrap();
-        assert_eq!(rename(&other, MAIN_BACKUP).unwrap_err(), "reserved");
-        // 快照自己照常写，且不参与副配置列表。
-        write(&main_backup(&root), &config).unwrap();
-        assert!(main_backup(&root).exists());
-        assert!(list(&root).iter().all(|profile| profile.name != MAIN_BACKUP));
+        let backup = main_backup(&root);
+        assert_eq!(backup.parent().unwrap(), root.as_path());
+        assert_ne!(backup.parent().unwrap(), dir(&root));
+
+        write(&backup, &config).unwrap();
+        assert!(backup.exists());
+        // 快照不是副配置，`Configs/` 里也根本没有它。
+        assert!(list(&root).is_empty());
+
+        // 叫「主配置」的副配置现在是个正常名字。
+        let named = create(&root, "主配置", &config).unwrap();
+        assert_eq!(named.file_name().unwrap(), "主配置.json");
+        assert_eq!(list(&root).len(), 1);
+
+        // 老版本那份 `Configs/主配置.json` 会被搬成根目录的快照，而不是当成一份档。
+        let root2 = temp_root("snapshot-legacy");
+        let legacy = dir(&root2).join("主配置.json");
+        let mut old = Config::default();
+        old.ui_opacity = 33;
+        write(&legacy, &old).unwrap();
+        assert_eq!(list(&root2).len(), 1);
+        migrate_legacy_backup(&root2);
+        assert!(!legacy.exists(), "老的快照要挪走，不能留在列表里");
+        assert!(main_backup(&root2).exists());
+        assert_eq!(read(&main_backup(&root2)).unwrap().ui_opacity, 33);
+        assert!(list(&root2).is_empty());
+
         fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&root2).ok();
     }
 
     #[test]

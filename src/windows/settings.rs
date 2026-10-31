@@ -535,7 +535,7 @@ pub struct Settings {
     /// 启用 / 设为主配置之后要能一眼看出「现在用的是这份」，所以不留记号，
     /// 直接在列表里比内容 —— 重启、手动改文件都不会让标注变假。
     profile_active: RefCell<Option<PathBuf>>,
-    /// 「上一次的主配置」快照（`Configs/主配置.json`），存在且跟当前不同才有值。
+    /// 「上一次的主配置」快照（根目录的 `config.backup.json`），存在且跟当前不同才有值。
     ///
     /// 主配置那行的「启用」就靠它切回去 —— 启用副配置会把 `config.json` 整份盖掉，
     /// 不留这一份就再也回不来了。
@@ -548,7 +548,7 @@ pub struct Settings {
     profile_rename: Option<(PathBuf, String)>,
     /// 新建配置时的名字输入。
     profile_new: Option<String>,
-    /// 点过一次「删除」的那一档：再点一次才真删（文件删了可找不回来）。
+    /// 等确认「删除」的那一档（文件删了可找不回来，所以先弹框问一句）。
     profile_pending_delete: Option<PathBuf>,
     /// 等确认「和主配置互换」的那一档。
     ///
@@ -5003,9 +5003,10 @@ impl Settings {
                     this.profile_pending_delete = None;
                     this.profile_swap = None;
                 }
-                // 别的页也有「设为主配置」的确认框开着走过场的情况：换页就收掉。
+                // 别的页也有「设为主配置」「删除」的确认框开着走过场的情况：换页就收掉。
                 if page != Page::Profiles {
                     this.profile_swap = None;
+                    this.profile_pending_delete = None;
                 }
                 refresh_ui(window, cx);
             }))
@@ -6913,6 +6914,12 @@ impl Settings {
             let active = window.is_window_active();
             if was_active && !active {
                 this.blur_rename(window, cx);
+                // 配置页的改名同样收下（切到别的程序也算把名字敲完了）。
+                this.rename_profile_file(window, cx);
+                if this.profile_new.is_some() {
+                    this.profile_new = None;
+                    refresh_ui(window, cx);
+                }
             }
             was_active = active;
         })
@@ -14532,6 +14539,8 @@ impl Settings {
     /// 进这一页、以及每次增删改导入之后调一次。不在渲染里读目录：那是 IO，
     /// 一帧一次纯属浪费；外面手动改文件的话，切走再切回来就能看到。
     fn reload_profiles(&self) {
+        // 老版本把快照塞在 `Configs/主配置.json`，那里现在只该有用户自己的档。
+        crate::profiles::migrate_legacy_backup(&self.profiles_root());
         let list = crate::profiles::list(&self.profiles_root());
         let live = self.config.borrow().get().clone();
         let backup = crate::profiles::main_backup(&self.profiles_root());
@@ -14759,7 +14768,6 @@ impl Settings {
     ) -> AnyElement {
         let path = profile.path.clone();
         let renaming = matches!(&self.profile_rename, Some((target, _)) if *target == path);
-        let pending_delete = self.profile_pending_delete.as_deref() == Some(path.as_path());
         // 有未保存的改动时不许切：切档是整份替换，那些改动会静默消失。
         let dirty = self.config.borrow().is_dirty();
         let key = path.display().to_string();
@@ -14771,8 +14779,6 @@ impl Settings {
         let rename_path = path.clone();
         let name = div()
             .id(SharedString::from(format!("profile-name-{key}")))
-            .flex_1()
-            .min_w(px(0.))
             .truncate()
             .text_size(theme::fs(12.))
             .text_color(theme::text_primary())
@@ -14788,16 +14794,31 @@ impl Settings {
             }))
             .child(title);
 
+        // 「正在使用」和主配置那行长得一模一样、位置也一样：紧挨着名字后头。
         let active = self.profile_active.borrow().as_deref() == Some(path.as_path());
-        let active_badge = div()
-            .flex_none()
-            .px(px(5.))
-            .py(px(1.))
-            .rounded(px(theme::RADIUS_SMALL))
-            .bg(theme::accent_soft())
-            .text_size(theme::fs(9.5))
-            .text_color(theme::accent())
-            .child(lang.pick("使用中", "Active"));
+        let title_block = {
+            let mut block = div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(name);
+            if active {
+                block = block.child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .py(px(1.))
+                        .rounded(px(theme::RADIUS_SMALL))
+                        .bg(theme::accent_soft())
+                        .text_size(theme::fs(9.5))
+                        .text_color(theme::accent())
+                        .child(lang.pick("正在使用", "In use")),
+                );
+            }
+            block
+        };
 
         let age = div()
             .flex_none()
@@ -14869,26 +14890,6 @@ impl Settings {
             cx,
             move |this, window, cx| this.delete_profile(delete_path.clone(), window, cx),
         );
-        // 待确认的那颗要自己画：红字 + 还能点（改完样式换了元素，别把点击丢掉）。
-        let confirm_delete = {
-            let again = path.clone();
-            div()
-                .id(SharedString::from(format!("profile-delete-confirm-{key}")))
-                .flex_none()
-                .px(px(8.))
-                .py(px(2.))
-                .rounded(px(theme::RADIUS_SMALL))
-                .bg(theme::track())
-                .text_size(theme::fs(11.))
-                .text_color(theme::danger())
-                .cursor_pointer()
-                .hover(|style| style.opacity(0.88))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.delete_profile(again.clone(), window, cx)
-                }))
-                .child(lang.pick("再点一次确认", "Click again to delete"))
-                .into_any_element()
-        };
 
         div()
             .flex()
@@ -14897,20 +14898,15 @@ impl Settings {
             .px(px(9.))
             .py(px(4.))
             .rounded(px(theme::RADIUS_ROW))
-            .when(pending_delete, |style| style.bg(theme::track()))
-            .child(name)
-            .when(active, |style| style.child(active_badge))
+            .when(active, |style| style.bg(theme::track()))
+            .child(title_block)
             .child(age)
             .child(activate)
             .child(swap)
             .child(copy)
             .child(rename)
             .child(export)
-            .child(if pending_delete {
-                confirm_delete
-            } else {
-                delete
-            })
+            .child(delete)
             .into_any_element()
     }
 
@@ -15138,45 +15134,36 @@ impl Settings {
         refresh_ui(window, cx);
     }
 
-    fn commit_profile_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, buffer)) = self.profile_rename.take() else {
-            return;
-        };
+    /// 真去改名（文件 + 列表），把要提示的那句话交回给调用方。
+    ///
+    /// 单独拆出来是因为「窗口失焦」那条回调只有 `App`、拿不到 `Context`，
+    /// 发不出提示 —— 但名字照样得存下来。
+    fn rename_profile_file(&mut self, window: &mut Window, cx: &mut App) -> Option<String> {
+        let (path, buffer) = self.profile_rename.take()?;
         let lang = self.config.borrow().get().language;
-        match crate::profiles::rename(&path, &buffer) {
+        let text = match crate::profiles::rename(&path, &buffer) {
             Ok(_) => {
                 self.reload_profiles();
-                self.set_profile_notice(lang.pick("已改名", "Renamed").to_string(), cx);
+                lang.pick("已改名", "Renamed").to_string()
             }
             Err(error) if error == "empty name" => {
+                // 空名字不收：留着他接着打。
                 self.profile_rename = Some((path, buffer));
-                self.set_profile_notice(
-                    lang.pick("名字不能为空", "Name cannot be empty").to_string(),
-                    cx,
-                );
-                refresh_ui(window, cx);
-                return;
-            }
-            Err(error) if error == "reserved" => {
-                self.set_profile_notice(
-                    lang.pick(
-                        "「主配置」这个名字留给上一次的主配置快照",
-                        "That name is kept for the previous main config",
-                    )
-                    .to_string(),
-                    cx,
-                );
+                lang.pick("名字不能为空", "Name cannot be empty").to_string()
             }
             Err(error) if error == "exists" => {
-                self.set_profile_notice(
-                    lang.pick("已经有同名的配置了", "A profile with that name exists")
-                        .to_string(),
-                    cx,
-                );
+                lang.pick("已经有同名的配置了", "A profile with that name exists").to_string()
             }
-            Err(error) => self.set_profile_notice(error.to_string(), cx),
-        }
+            Err(error) => error,
+        };
         refresh_ui(window, cx);
+        Some(text)
+    }
+
+    fn commit_profile_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.rename_profile_file(window, cx) {
+            self.set_profile_notice(text, cx);
+        }
     }
 
     /// 「启用」：把这一档整份装进主配置，立刻生效。
@@ -15442,16 +15429,27 @@ impl Settings {
         refresh_ui(window, cx);
     }
 
-    /// 删除：点第一次只是变成「确认删除」，再点一次才真删。
+    /// 删除：先弹框问一句（文件删了找不回来），确认了再动。
+    ///
+    /// 以前是「原地变成『再点一次确认』」，那颗按钮把整行撑开、还把别处的按钮
+    /// 挤走，而且没有退路 —— 现在跟「设为主配置」用同一个确认框。
     fn delete_profile(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.profile_pending_delete.as_deref() != Some(path.as_path()) {
-            self.profile_rename = None;
-            self.profile_pending_delete = Some(path);
-            refresh_ui(window, cx);
-            return;
-        }
-        let lang = self.config.borrow().get().language;
+        self.profile_rename = None;
+        self.profile_new = None;
+        self.profile_swap = None;
+        self.profile_pending_delete = Some(path);
+        refresh_ui(window, cx);
+    }
+
+    /// 确认删除：真把文件删掉。
+    fn confirm_delete_profile(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.profile_pending_delete = None;
+        let lang = self.config.borrow().get().language;
         match crate::profiles::remove(&path) {
             Ok(()) => {
                 self.reload_profiles();
@@ -16453,6 +16451,119 @@ impl Settings {
         )
     }
 
+    /// 「删除」的确认框：删掉的文件找不回来，问一句再动。
+    ///
+    /// 以前是行内「再点一次确认」，那颗按钮会把整行撑开、把别的按钮挤走，
+    /// 而且点错了没有退路（再点一下「删除」又换回来，看不出哪一下算数）。
+    fn profile_delete_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let path = self.profile_pending_delete.clone()?;
+        let stem = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let file = format!("{stem}.json");
+        let target = path.clone();
+        let confirm = div()
+            .id("profile-delete-confirm")
+            .px(px(12.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::track())
+            .text_color(theme::danger())
+            .text_size(theme::fs(11.5))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.88))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.confirm_delete_profile(target.clone(), window, cx);
+            }))
+            .child(lang.pick("删除", "Delete"));
+        let cancel = div()
+            .id("profile-delete-cancel")
+            .px(px(12.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::track())
+            .text_color(theme::text_secondary())
+            .text_size(theme::fs(11.5))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.88))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.profile_pending_delete = None;
+                window.refresh();
+                cx.notify();
+            }))
+            .child(lang.pick("取消", "Cancel"));
+
+        Some(
+            div()
+                .id("profile-delete-backdrop")
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgb_to_hsla(rgba(0x00000059)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        // 点背板 = 取消，跟「取消」那颗一样。
+                        cx.stop_propagation();
+                        this.profile_pending_delete = None;
+                        window.refresh();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(360.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .p(px(16.))
+                        .rounded(px(theme::RADIUS_WINDOW))
+                        .border_1()
+                        .border_color(theme::border_strong())
+                        .bg(theme::opaque(theme::surface_elevated()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation()
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(13.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::text_primary())
+                                .child(lang.pick("删除配置", "Delete profile")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(11.))
+                                .text_color(theme::text_secondary())
+                                .child(if lang.is_en() {
+                                    format!("{file} will be deleted. This cannot be undone.")
+                                } else {
+                                    format!("{file} 会被删掉，删了找不回来。")
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(confirm)
+                                .child(cancel),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// 「有未保存的更改」确认框：保存 / 不保存 / 取消。
     fn confirm_close_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.confirm_close {
@@ -16746,6 +16857,7 @@ impl Render for Settings {
         let restore_menu = self.restore_menu_overlay(&config, lang, cx);
         let confirm_close = self.confirm_close_overlay(lang, cx);
         let profile_swap = self.profile_swap_overlay(lang, cx);
+        let profile_delete = self.profile_delete_overlay(lang, cx);
         let apply_bar = self.apply_bar(lang, cx);
         let donate = self.donate_overlay(lang, cx);
 
@@ -16830,6 +16942,17 @@ impl Render for Settings {
             // 捕获相位从根往下走，谁都拦不住。点在输入框自己身上不算失焦。
             .capture_any_mouse_down(cx.listener(
                 |this, event: &gpui::MouseDownEvent, window, cx| {
+                    // 配置页的改名：敲完名字随手点别处就该算数（回车只是另一条路）。
+                    // 改名没有「占位」概念，缓冲里永远是当前名字，点别处提交不会误清。
+                    if this.profile_rename.is_some() {
+                        this.commit_profile_rename(window, cx);
+                    }
+                    // 新建那一行反过来：点到别处就收起来，不能凭一下误点就往
+                    // `Configs/` 里多塞一份档；要建还是回车。
+                    if this.profile_new.is_some() {
+                        this.profile_new = None;
+                        refresh_ui(window, cx);
+                    }
                     if this.device_rename.is_none() && this.display_rename.is_none() {
                         return;
                     }
@@ -16999,6 +17122,8 @@ impl Render for Settings {
             .children(donate)
             // 互换配置的确认框也是模态，压在捐赠浮层之上。
             .children(profile_swap)
+            // 删除配置的确认框和它同一层（两个不会同时开）。
+            .children(profile_delete)
             // 「有未保存的更改」是关窗前的最后一问，压在最上面。
             .children(confirm_close)
     }
