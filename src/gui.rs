@@ -1427,7 +1427,7 @@ pub fn apply_theme_extras(config: &Config) {
     theme::set_mode(base_is_dark(config));
     let (surface, accent) = theme_custom(config);
     theme::apply_custom(&surface, &accent, config.ui_contrast);
-    theme::set_font_scale(config.ui_font_scale as f32 / 100.0);
+    theme::set_font_scale(config.ui_font_size / crate::config::UI_BASE_FONT_SIZE);
     theme::set_ui_opacity(config.ui_opacity as f32 / 100.0);
     theme::set_ui_font(&config.ui_font);
     theme::set_ui_font_weight(config.ui_font_weight);

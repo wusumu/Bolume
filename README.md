@@ -73,7 +73,7 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 
 - 深色 / 浅色两套打底，默认跟随系统切换；固定模式用深色底
 - 背景色与强调色分开自选，亮色档、深色档各存一套；强调色默认跟随 Windows（读 `DWM\AccentColor`）
-- 界面字体、字号缩放、字重、对比度、不透明度都能调
+- 界面字体、字号、字重、对比度、不透明度都能调（字号直接填 px，默认比基准大一档）
 - 面板里音量条（含亮度条）的粗细、圆角可调，圆角按条高百分比算，100% 是全圆头
 - 弹出动画二选一：`跟随系统`（照系统的指数曲线，从屏幕最底边、任务栏背后滑进来，速度按同一比例缩放）/ `淡入淡出`（原地淡入）；都按屏幕刷新率逐帧推进，**怎么出就怎么回**，收起也能选带不带动画
 - 动画可以**打断**：没出完再按一次就从当前位置掉头收回，收回一半再按也能接着弹回来
@@ -228,7 +228,7 @@ vendor/
 - On multi-monitor setups the panel pops up on the display where the cursor is, not always on the primary
 - Its own on-screen display for volume, mute, track changes and brightness, with a layout editor; the volume card and the media-key card can each have their own background (size, corners, opacity, color)
 - Global hotkeys for everything, including media keys taken over through a low-level keyboard hook, hold-to-repeat, and an app blocklist that gets out of the way in fullscreen games
-- Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
+- Light/dark themes, follow Windows accent color, adjustable UI font & size (in px, default one step above the baseline), weight, contrast and opacity, bilingual UI (中文 / English)
 - Edits stay in the window until you press **Apply** (save, keep editing) or **Save** (save and close); closing with pending edits asks save / don't save / cancel. The ≡ menu in the title bar reverts this page or everything, or restores factory defaults, per page or wholesale
 - The same ≡ menu can `Replace this page only…`: pick a backed-up `config.json` and only the fields that page owns are copied into the current draft, nothing else moves
 - Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. A new profile starts from the factory defaults; create / copy / rename / export / import there, or just drop a `.json` onto the page. **Use** switches to a profile temporarily and the main config row's **Use** switches back (the list marks the active one); anything you save while it is in use goes back into that profile as well, so it keeps your edits; **Make main** promotes that profile — its content becomes `config.json`, its `.json` leaves the `Configs` list, and the old main config is gone (a red warning comes first)

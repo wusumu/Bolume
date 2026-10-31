@@ -208,7 +208,7 @@ fn page_fields(page: Page) -> &'static [&'static str] {
             "theme_dark_accent",
             "theme_surface",
             "theme_accent",
-            "ui_font_scale",
+            "ui_font_size",
             "ui_opacity",
             "ui_font",
             "ui_font_weight",
@@ -1194,8 +1194,8 @@ enum NumberField {
     PanelLineHeight,
     /// 面板弹出动画时长（毫秒）。
     PopupAnimation,
-    /// 设置窗口的字号缩放（百分比）。
-    UiFontScale,
+    /// 设置窗的字号（逻辑像素，内部按十分之一像素存：`value = px × 10`）。
+    UiFontSize,
     /// 界面不透明度（百分比）。
     UiOpacity,
     /// 界面对比度（百分比，100 = 主题原样）。
@@ -1247,6 +1247,7 @@ impl NumberField {
     fn value(self, config: &Config) -> i32 {
         match self {
             Self::PanelFontSize => (config.panel_font_size * 10.0).round() as i32,
+            Self::UiFontSize => (config.ui_font_size * 10.0).round() as i32,
             Self::PanelLetterSpacing => (config.panel_letter_spacing * 10.0).round() as i32,
             Self::PanelLineHeight => config.panel_line_height.round() as i32,
             Self::TrayDigit(digits, metric) => {
@@ -1269,6 +1270,8 @@ impl NumberField {
             Self::PanelFontSize | Self::PanelLetterSpacing | Self::PanelLineHeight => {
                 unreachable!("面板字体字段走有符号的那一层")
             }
+            // 界面字号也按十分之一存（0.5px 一档），同样走上面的那一层。
+            Self::UiFontSize => unreachable!("界面字号走有符号的那一层"),
             // 托盘数字四件套也走有符号的那一层（字距能填负数）。
             Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
             Self::HotkeyStep => config.hotkey_volume_step,
@@ -1299,7 +1302,6 @@ impl NumberField {
             Self::OsdSize(part) => config.osd.part(part).size,
             Self::DeviceNameSize => config.device_name_size,
             Self::PopupAnimation => config.popup_animation_ms,
-            Self::UiFontScale => config.ui_font_scale,
             Self::UiOpacity => config.ui_opacity,
             Self::UiContrast => config.ui_contrast,
             Self::TrayMenuWidth => config.tray_menu_max_width,
@@ -1318,6 +1320,11 @@ impl NumberField {
     /// 可填范围。负数只给面板字间距一个字段。
     fn range(self) -> (i32, i32) {
         match self {
+            // 设置窗字号：10.0–20.0px，按十分之一存。
+            Self::UiFontSize => (
+                (crate::config::UI_FONT_SIZE_RANGE.0 * 10.0).round() as i32,
+                (crate::config::UI_FONT_SIZE_RANGE.1 * 10.0).round() as i32,
+            ),
             // 6.0–72.0px，按十分之一存。
             Self::PanelFontSize => (
                 (crate::config::PANEL_FONT_SIZE_RANGE.0 * 10.0).round() as i32,
@@ -1354,6 +1361,7 @@ impl NumberField {
             Self::PanelFontSize | Self::PanelLetterSpacing | Self::PanelLineHeight => {
                 unreachable!("面板字体字段走有符号的那一层")
             }
+            Self::UiFontSize => unreachable!("界面字号走有符号的那一层"),
             Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
             Self::HotkeyStep => (1, 100),
             Self::WheelStep => (1, 100),
@@ -1389,8 +1397,6 @@ impl NumberField {
             Self::DeviceNameSize => (9, 20),
             // 0 = 不动画（面板直接出现）；再长就慢得难受了。
             Self::PopupAnimation => (0, 2000),
-            // 再小字就看不清了，再大整个布局会开始挤。
-            Self::UiFontScale => (80, 150),
             // 低于 30% 连字都读不出来，不如不给。
             Self::UiOpacity => (30, 100),
             Self::UiContrast => crate::config::UI_CONTRAST_RANGE,
@@ -1419,6 +1425,7 @@ impl NumberField {
     fn apply(self, config: &mut Config, value: i32) {
         match self {
             Self::PanelFontSize => config.panel_font_size = value as f32 / 10.0,
+            Self::UiFontSize => config.ui_font_size = value as f32 / 10.0,
             Self::PanelLetterSpacing => config.panel_letter_spacing = value as f32 / 10.0,
             Self::PanelLineHeight => config.panel_line_height = value as f32,
             // 字距能填负数，所以托盘数字这几项走有符号这一层。
@@ -1442,6 +1449,7 @@ impl NumberField {
             Self::PanelFontSize | Self::PanelLetterSpacing | Self::PanelLineHeight => {
                 unreachable!("面板字体字段走有符号的那一层")
             }
+            Self::UiFontSize => unreachable!("界面字号走有符号的那一层"),
             Self::HotkeyStep => config.hotkey_volume_step = value,
             Self::WheelStep => config.scroll_wheel_step = value,
             Self::LogWheelStep => config.log_scroll_wheel_step = value as f32 / 10.0,
@@ -1473,7 +1481,6 @@ impl NumberField {
             Self::OsdSize(part) => with_volume_osd(config, |osd| osd.set_part_size(part, value)),
             Self::DeviceNameSize => config.device_name_size = value,
             Self::PopupAnimation => config.popup_animation_ms = value,
-            Self::UiFontScale => config.ui_font_scale = value,
             Self::UiOpacity => config.ui_opacity = value,
             Self::UiContrast => config.ui_contrast = value,
             Self::TrayMenuWidth => config.tray_menu_max_width = value,
@@ -1493,6 +1500,8 @@ impl NumberField {
         match self {
             // 「字体字号」那套：11.5 这种一位小数，整数就不带尾巴。
             Self::PanelFontSize => format!("{} px", tenths_text(value)),
+            // 设置窗字号同样是 px，13.5 这种。
+            Self::UiFontSize => format!("{} px", tenths_text(value)),
             // 字间距带正负号：+2 一眼看出是放松，−1.5 是收紧。
             Self::PanelLetterSpacing => {
                 let text = tenths_text(value);
@@ -1516,6 +1525,7 @@ impl NumberField {
             Self::PanelFontSize | Self::PanelLetterSpacing | Self::PanelLineHeight => {
                 unreachable!("面板字体字段走有符号的那一层")
             }
+            Self::UiFontSize => unreachable!("界面字号走有符号的那一层"),
             Self::HotkeyStep
             | Self::WheelStep
             | Self::StartupVolume
@@ -1576,7 +1586,7 @@ impl NumberField {
             Self::OsdSize(_) => format!("{value} px"),
             Self::DeviceNameSize => format!("{value} px"),
             Self::PopupAnimation => format!("{value} ms"),
-            Self::UiFontScale | Self::UiOpacity | Self::UiContrast => format!("{value}%"),
+            Self::UiOpacity | Self::UiContrast => format!("{value}%"),
             Self::TrayMenuWidth => format!("{value} px"),
             Self::TrayMotionGain => format!("{value}%"),
             Self::HotkeyRepeatInterval | Self::HotkeyRepeatDelay => format!("{value} ms"),
@@ -1597,7 +1607,7 @@ impl NumberField {
     fn allows_decimal(self) -> bool {
         matches!(
             self,
-            Self::LogWheelStep | Self::PanelFontSize | Self::PanelLetterSpacing
+            Self::LogWheelStep | Self::PanelFontSize | Self::PanelLetterSpacing | Self::UiFontSize
         )
     }
 
@@ -1608,7 +1618,10 @@ impl NumberField {
 
     /// 手动输入框最多几个字符。
     fn edit_len(self) -> usize {
-        if matches!(self, Self::PanelFontSize | Self::PanelLetterSpacing) {
+        if matches!(
+            self,
+            Self::PanelFontSize | Self::PanelLetterSpacing | Self::UiFontSize
+        ) {
             // 字号最长 "72.0"，字间距还要给负号留一位。
             4 + usize::from(self.allows_negative())
         } else if self.allows_decimal() {
@@ -1692,8 +1705,9 @@ impl NumberField {
             Self::OsdOpacity => 5,
             Self::OsdFadeIn | Self::OsdFadeOut => 20,
             Self::OsdHold => 100,
-            // 字号和不透明度按 5% 走：1% 一按看不出来，精确值直接点数字输入。
-            Self::UiFontScale | Self::UiOpacity => 5,
+            // 字号按 0.5px 走（内部十分之一），不透明度按 5%：
+            // 一像素 / 1% 一按看不出来，精确值直接点数字输入。
+            Self::UiFontSize | Self::UiOpacity => 5,
             // 对比度也是 1% 看不出来，按 5% 走。
             Self::UiContrast => 5,
             // 动画时长按 25ms 走（原来只有 200/300/400/500 四档）。
@@ -2490,20 +2504,15 @@ impl Settings {
             .into_any_element()
     }
 
-    /// 字重的四档选项（托盘数字 / 界面共用）。
+    /// 字重的三档选项（界面 / 面板共用）。
     ///
-    /// 只给四档、且跨度拉开：400 和 500 在 16px 的托盘上几乎没差别，
-    /// 留着两档只会让人以为没生效。要更细的笔画就往下取 300。
+    /// 只给三档、且跨度拉开：300 和 400、600 和 700 在界面字号上几乎没差别，
+    /// 留着中间的档只会让人以为没生效。「半粗」（600）实测和「粗」一模一样，已经收掉。
     fn weight_options(lang: Lang) -> &'static [(u32, &'static str)] {
         if lang.is_en() {
-            &[
-                (300, "Light"),
-                (400, "Regular"),
-                (600, "Semibold"),
-                (700, "Bold"),
-            ]
+            &[(300, "Light"), (400, "Regular"), (700, "Bold")]
         } else {
-            &[(300, "细"), (400, "常规"), (600, "半粗"), (700, "粗")]
+            &[(300, "细"), (400, "常规"), (700, "粗")]
         }
     }
 
@@ -3133,15 +3142,15 @@ impl Settings {
         }
         if matches!(
             field,
-            NumberField::UiFontScale | NumberField::UiOpacity | NumberField::UiContrast
+            NumberField::UiFontSize | NumberField::UiOpacity | NumberField::UiContrast
         ) {
             // 字号 / 不透明度 / 对比度是「界面级」的：先推进主题层，再让这扇窗自己立刻变。
             //
             // 字号变了整窗都要重排（行高跟着字号走）。面板有自己的一套字号
-            // （`panel_font_scale`），这里顺手刷一次只是让面板按最新配置重排，不影响它的字号。
+            // （`panel_font_size` / `ui_font_size`），这里顺手刷一次只是让面板按最新配置重排，不影响它的字号。
             crate::gui::apply_theme_extras(&self.config.borrow().get().clone());
             crate::windows::platform::set_opacity(window, theme::ui_opacity());
-            if field == NumberField::UiFontScale {
+            if field == NumberField::UiFontSize {
                 crate::gui::refresh_flyout_size(cx);
             }
             if field == NumberField::UiContrast {
@@ -11530,14 +11539,14 @@ impl Settings {
             ));
         }
 
-        let font_scale = self.number_row(
-            "ui-font-scale",
+        let font_size = self.number_row(
+            "ui-font-size",
             lang.pick("设置窗字号", "Settings font size"),
             lang.pick(
-                "整个设置窗口的文字缩放，100% 是原始大小",
-                "Scales every text in this window; 100% is the original size",
+                "整个设置窗口的正文大小，其他文字按同一比例跟着变",
+                "Body text size in this window; every other text follows the same scale",
             ),
-            NumberField::UiFontScale,
+            NumberField::UiFontSize,
             config,
             lang,
             cx,
@@ -11561,7 +11570,7 @@ impl Settings {
         // 整个设置窗的字体：和「设置窗字号」摆在一起。
         let ui_font = self.font_picker_row(config, lang, FontTarget::Ui, cx);
 
-        // 界面字重：四档（细 / 常规 / 半粗 / 粗），只影响整窗文字。
+        // 界面字重：三档（细 / 常规 / 粗），只影响整窗文字。
         let ui_weight = {
             let store = self.config.clone();
             let weight_options = Self::weight_options(lang);
@@ -12295,7 +12304,7 @@ impl Settings {
                 lang.pick("界面", "Interface"),
                 "settings",
                 vec![
-                    font_scale,
+                    font_size,
                     ui_font,
                     ui_weight,
                     ui_contrast,

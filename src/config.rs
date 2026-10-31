@@ -1460,7 +1460,11 @@ impl StartupProfile {
 /// 的那两格一并填上 —— 空着的话亮色档会落到深色模板上。
 /// rev 73：调音量的音效（`volume_sound`）是新字段，默认关 —— serde 默认就是
 /// 「关 + 轻点 + 三种手势全勾」，老配置读进来什么都不用搬，这里只留个记号。
-const CONFIG_REV: u32 = 73;
+/// rev 74：设置窗字号从「百分比缩放」（`ui_font_scale`）改成「字号」
+/// （`ui_font_size`，逻辑像素，基准 12.5px），默认比基准大一档（13.5px）；
+/// 界面的字重去掉「半粗」—— 它和「粗」在 UI 字体上几乎看不出差别，
+/// 老配置里存着 600 的按 700 算。
+const CONFIG_REV: u32 = 74;
 
 /// 面板弹出动画的风格。
 ///
@@ -4174,6 +4178,17 @@ pub const TRAY_MOTION_GAIN_RANGE: (u32, u32) = (50, 300);
 pub const UI_FONT_DEFAULT: &str = "";
 /// 界面字重的默认值（常规）。
 pub const DEFAULT_UI_FONT_WEIGHT: u32 = 400;
+/// 界面字重只有细 / 常规 / 粗三档（半粗和粗在 UI 字体上看不出差别，收掉了）。
+///
+/// 别的值（老配置的 600、手改出来的 500）落到最近的一档：600 归「粗」——
+/// 选半粗的人本来就是想更粗一点。
+pub fn normalize_ui_weight(weight: u32) -> u32 {
+    match weight {
+        0..=350 => 300,
+        351..=550 => 400,
+        _ => 700,
+    }
+}
 /// 界面对比度的默认值（100% = 主题原样）。
 pub const DEFAULT_UI_CONTRAST: u32 = 100;
 /// 「跟随系统」时亮色档的默认底色：色块行里最后一个浅色。
@@ -4182,6 +4197,16 @@ pub const DEFAULT_LIGHT_SURFACE: &str = "#f4efe6";
 pub const DEFAULT_DARK_SURFACE: &str = "#262b33";
 /// 界面对比度的可调范围（百分比）。低于 60 次级文字基本糊没了，高于 160 就刺眼。
 pub const UI_CONTRAST_RANGE: (u32, u32) = (60, 160);
+
+/// 设置窗口**基准字号**（逻辑像素）。
+///
+/// 设置页里正文（每行下面那句说明）是 12.5px，字号设置就是「相对这一档多大」。
+/// 标题、副标题这些按自己的字号乘同一个系数，所以改一处整窗一起变。
+pub const UI_BASE_FONT_SIZE: f32 = 12.5;
+/// 设置窗口字号可调范围（逻辑像素）。
+///
+/// 10 号以下正文就开始糊了，20 号往上左栏和右侧的列会挤得放不下。
+pub const UI_FONT_SIZE_RANGE: (f32, f32) = (10.0, 20.0);
 
 /// 音量面板**基准字号**（逻辑像素）。
 ///
@@ -4810,8 +4835,11 @@ pub struct Config {
     pub theme_surface: String,
     /// 自选强调色（空 = 跟随 Windows 的强调色）。选中态、滑条、角标都用它。
     pub theme_accent: String,
-    /// 设置窗口的字号缩放（百分比，100 = 原始字号）。
-    pub ui_font_scale: u32,
+    /// 设置窗口的字号（逻辑像素）。
+    ///
+    /// 整窗文字按 `ui_font_size / UI_BASE_FONT_SIZE` 缩放；行高由内容撑开，
+    /// 边距不跟着乘（否则大字号下会空得离谱）。默认比基准大一档。
+    pub ui_font_size: f32,
     /// 界面不透明度（百分比，100 = 完全不透明）。
     pub ui_opacity: u32,
     /// 界面字体族（空 = 跟随系统默认字体）。
@@ -4989,7 +5017,7 @@ impl Default for Config {
             theme_dark_accent: String::new(),
             theme_surface: String::new(),
             theme_accent: String::new(),
-            ui_font_scale: 100,
+            ui_font_size: UI_BASE_FONT_SIZE + 1.0,
             ui_opacity: 100,
             ui_font: UI_FONT_DEFAULT.to_string(),
             ui_font_weight: DEFAULT_UI_FONT_WEIGHT,
@@ -5857,7 +5885,42 @@ impl ConfigStore {
                     _ => {}
                 }
             }
+            // rev 74：设置窗字号从「百分比」改成「字号（逻辑像素）」。
+            //
+            // 老配置存的是 80..150 的百分比，按 100% = 12.5px 换算（数字框按十分之一存）。
+            // 100% 是老默认值，跟着新默认一起升到 13.5px —— 新版默认大一档，原样搬过去
+            // 的话升级完看不出任何变化。判断依据是「新字段在不在」而不是 rev：
+            // 手改过配置的人可能 rev 已经是 74 但还留着老的百分比。
+            if config.config_rev < 74 {
+                let legacy_scale = raw.as_deref().and_then(|content| {
+                    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+                    if value.get("ui_font_size").is_some() {
+                        return None;
+                    }
+                    value.get("ui_font_scale")?.as_u64()
+                });
+                if let Some(scale) = legacy_scale {
+                    config.ui_font_size = if scale == 100 {
+                        UI_BASE_FONT_SIZE + 1.0
+                    } else {
+                        (UI_BASE_FONT_SIZE * scale as f32 / 100.0 * 10.0).round() / 10.0
+                    };
+                }
+            }
             config.config_rev = CONFIG_REV;
+            migrated = true;
+        }
+        // 字重收成三档（细 / 常规 / 粗）：半粗和粗在界面字体上看不出差别，
+        // 留着只会让人以为没生效。老配置里的 600 折到「粗」，别的越界值落到最近的档。
+        // 放在 rev 判断外面、每次都跑：手改配置文件写进 500 也能自动归位，幂等。
+        let ui_weight = normalize_ui_weight(config.ui_font_weight);
+        if ui_weight != config.ui_font_weight {
+            config.ui_font_weight = ui_weight;
+            migrated = true;
+        }
+        let panel_weight = normalize_ui_weight(config.panel_font_weight);
+        if panel_weight != config.panel_font_weight {
+            config.panel_font_weight = panel_weight;
             migrated = true;
         }
         // 页脚按钮表：注册表里有、配置里没有的补进去（默认显示）。
@@ -7558,10 +7621,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// rev 74：设置窗字号从「百分比」搬成「字号（像素）」，基准 12.5px。
+    ///
+    /// 100% 是老默认值 —— 跟着新默认一起升到 13.5px（这一版默认大一号）；
+    /// 130% 换算成 16.3px（一位小数）。已经写了新字段的配置不搬。
+    #[test]
+    fn rev74_turns_settings_scale_into_font_size() {
+        let dir = std::env::temp_dir().join(format!("bolume-rev74-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"config_rev": 73, "ui_font_scale": 130}"#).unwrap();
+        let store = ConfigStore::load(path.clone());
+        assert_eq!(store.get().ui_font_size, 16.3, "130% 就是 12.5 × 1.3");
+        assert_eq!(store.get().config_rev, CONFIG_REV);
+
+        // 老默认 100% 跟着新默认走：升级完应该能看到「大一号」。
+        std::fs::write(&path, r#"{"config_rev": 73, "ui_font_scale": 100}"#).unwrap();
+        let store = ConfigStore::load(path.clone());
+        assert_eq!(store.get().ui_font_size, UI_BASE_FONT_SIZE + 1.0);
+
+        // 新字段在就以它为准（老字段只是历史残留）。
+        std::fs::write(
+            &path,
+            r#"{"config_rev": 73, "ui_font_scale": 80, "ui_font_size": 11.0}"#,
+        )
+        .unwrap();
+        let store = ConfigStore::load(path.clone());
+        assert_eq!(store.get().ui_font_size, 11.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 字重只剩细 / 常规 / 粗三档：老配置的 600（半粗）折到 700，500 落到 400。
+    #[test]
+    fn legacy_semibold_weight_folds_into_bold() {
+        assert_eq!(normalize_ui_weight(600), 700);
+        assert_eq!(normalize_ui_weight(700), 700);
+        assert_eq!(normalize_ui_weight(500), 400);
+        assert_eq!(normalize_ui_weight(400), 400);
+        assert_eq!(normalize_ui_weight(300), 300);
+        assert_eq!(normalize_ui_weight(350), 300);
+        assert_eq!(normalize_ui_weight(900), 700);
+
+        let dir = std::env::temp_dir().join(format!("bolume-weight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"config_rev": 74, "ui_font_weight": 600, "panel_font_weight": 600}"#,
+        )
+        .unwrap();
+        let store = ConfigStore::load(path.clone());
+        assert_eq!(store.get().ui_font_weight, 700);
+        assert_eq!(store.get().panel_font_weight, 700);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 子菜单：收进去 / 挪回来 / 删掉子菜单都不丢条目。
     #[test]
-    fn tray_menu_folder_moves_keep_entries() {
-        let mut menu = TrayMenuConfig::default();
+    fn tray_menu_folder_moves_keep_entries() {        let mut menu = TrayMenuConfig::default();
         menu.root
             .push(TrayMenuNode::folder("folder:1", "子菜单 1", Vec::new()));
         let folder_index = menu.root.len() - 1;
