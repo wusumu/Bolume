@@ -88,10 +88,10 @@ Bolume 把这些收进屏幕右下角弹出的面板里：一台默认设备 + �
 
 **配置档**
 
-- `配置` 页可以存好几套设置：根目录 `Configs/` 里每个 `.json` 就是一份，主配置仍然是根目录的 `config.json`
+- `配置` 页里主配置和副配置是平级的一份份设置，只是主配置那份在根目录叫 `config.json`，其余放在 `Configs/` 里（每个 `.json` 一份）
 - 新建的一份从出厂设置开始；新建 / 副本 / 改名 / 导出 / 导入都在这一页，`.json` 文件直接拖到这一页上也会导入
-- 「启用」切换过去、立刻生效，原来那套会留一份，主配置那行的「启用」随时能切回来；列表里用「使用中」标出当前生效的是哪一份
-- 「设为主配置」是直接覆盖主配置，会先弹一句警告 —— 原来那套不再保留（想留着就先「副本」）
+- 「启用」临时切过去、立刻生效，主配置那行的「启用」随时切回来；列表里用「使用中」标出当前生效的是哪一份
+- 「设为主配置」把那份**提升**成主配置：内容写进 `config.json`、它的 `.json` 从 `Configs/` 里消失，原来的主配置不再保留（会先弹一句红字警告；想留着就先「副本」）
 
 ## 截图
 
@@ -178,7 +178,8 @@ cargo test --release
 - `config_rev` 是配置格式版本，程序升级时会自动迁移旧配置
 - 设备名、应用音量上限、黑名单等都记在里面，换机器直接拷这个文件
 - `Configs/` 里放的是副配置（设置页 `配置` 那一页）：每份一个 `.json`，格式和 `config.json` 一模一样，里面缺的字段按默认补齐；点「启用」就是把它整份装进 `config.json`，所以切换完直接生效
-- `Configs/主配置.json` 是「上一次的主配置」快照：每次启用别的配置之前自动存一份，主配置那行的「启用」读的就是它，所以切走之后还能切回来；它不出现在副配置列表里
+- `Configs/主配置.json` 是「上一次的主配置」快照：启用副配置之前自动存一份（当前用的本来就是某份副配置时不覆盖），主配置那行的「启用」读的就是它，所以切走之后还能切回来；它不出现在副配置列表里，也不许被新建 / 改名占用这个名字
+- 「设为主配置」之后这份副配置的 `.json` 会被删掉（内容已经在 `config.json` 里），快照也一起清掉
 
 ## 目录结构
 
@@ -229,7 +230,7 @@ vendor/
 - Light/dark themes, follow Windows accent color, adjustable UI font & scale, bilingual UI (中文 / English)
 - Edits stay in the window until you press **Apply** (save, keep editing) or **Save** (save and close); closing with pending edits asks save / don't save / cancel. The ≡ menu in the title bar reverts this page or everything, or restores factory defaults, per page or wholesale
 - The same ≡ menu can `Replace this page only…`: pick a backed-up `config.json` and only the fields that page owns are copied into the current draft, nothing else moves
-- Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. A new profile starts from the factory defaults; create / copy / rename / export / import there, or just drop a `.json` onto the page. **Use** switches to a profile and keeps what you had (the main config row's **Use** switches back, and the list marks the active one); **Make main** overwrites the main config after a warning and keeps nothing
+- Profiles: the **Profiles** page keeps several full setups — every `.json` in `Configs/` next to the exe is one of them, while the main config stays `config.json`. A new profile starts from the factory defaults; create / copy / rename / export / import there, or just drop a `.json` onto the page. **Use** switches to a profile temporarily and the main config row's **Use** switches back (the list marks the active one); **Make main** promotes that profile — its content becomes `config.json`, its `.json` leaves the `Configs` list, and the old main config is gone (a red warning comes first)
 - Popup animations can follow the system: the panel and the OSD both rise from the bottom edge of the screen from *behind* the taskbar, animated frame-by-frame in sync with the display refresh rate, matching how Windows 11 (and 10) animate their own volume surfaces
 
 Download the latest `Bolume_vX.XX.zip` from [Releases](../../releases), extract anywhere and run `Bolume.exe`. Windows 10/11 x64, no installer, no .NET.

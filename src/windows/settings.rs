@@ -14926,8 +14926,8 @@ impl Settings {
                 .text_size(theme::fs(10.5))
                 .text_color(theme::text_tertiary())
                 .child(lang.pick(
-                    "主配置永远是程序目录下的 config.json；下面每一份都放在 Configs 文件夹里。点「启用」切换过去，原来那套会留着，主配置那行能切回来；点「设为主配置」是直接覆盖，不再保留。",
-                    "The main config is always config.json next to the program; every profile below lives in the Configs folder. “Use” switches to it and keeps what you had, so the main config row can switch back; “Make main” overwrites the main config and keeps nothing.",
+                    "主配置和下面这些是平级的一份份配置，只是一份在根目录叫 config.json、其余放在 Configs 里。点「启用」临时切过去，主配置那行能切回来；点「设为主配置」把那份换成主配置（它从 Configs 里消失），原来那份不再保留。",
+                    "The main config is one of your setups — it just lives in the program folder as config.json, the rest sit in Configs. “Use” switches to one temporarily and the main config row switches back; “Make main” promotes that profile (it leaves the Configs list) and the old main config is gone.",
                 ))
                 .into_any_element(),
         );
@@ -15345,6 +15345,15 @@ impl Settings {
             self.set_profile_notice(error.to_string(), cx);
             return;
         }
+        // 这一份「变成」了主配置，就不再是副配置：文件从 Configs/ 里移走，
+        // 列表里那行随之消失（内容已经整份在 config.json 里，没有另存的必要）。
+        // 原来的主配置不保留，连上一次留下的那份快照也一起清掉 —— 别留一份
+        // 用户以为已经没了的配置，让主配置行的「启用」还能切回去。
+        let backup_path = crate::profiles::main_backup(&self.profiles_root());
+        let removed = crate::profiles::remove(&path);
+        if backup_path != path {
+            let _ = crate::profiles::remove(&backup_path);
+        }
         let after = self.config.borrow().get().clone();
         // 换过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
         let autostart_changed = Self::fields_differ(
@@ -15361,10 +15370,15 @@ impl Settings {
             .and_then(|name| name.to_str())
             .unwrap_or("")
             .to_string();
-        let text = if lang.is_en() {
-            format!("{stem} replaced the main config")
-        } else {
-            format!("{stem} 已覆盖主配置")
+        let text = match (removed, lang.is_en()) {
+            (Ok(()), true) => format!("{stem} is now the main config"),
+            (Ok(()), false) => format!("{stem} 已设为主配置"),
+            (Err(error), true) => format!(
+                "{stem} is now the main config, but {stem}.json was not removed: {error}"
+            ),
+            (Err(error), false) => format!(
+                "{stem} 已设为主配置，但 {stem}.json 没删掉：{error}"
+            ),
         };
         self.set_profile_notice(text, cx);
         refresh_ui(window, cx);
@@ -16418,11 +16432,11 @@ impl Settings {
                                 .text_color(theme::danger())
                                 .child(if lang.is_en() {
                                     format!(
-                                        "This overwrites config.json with everything in {file}. The current main config is not kept."
+                                        "{file} becomes the main config and its file is removed from Configs. The current main config is not kept."
                                     )
                                 } else {
                                     format!(
-                                        "会用 {file} 整份覆盖 config.json，当前主配置不再保留。"
+                                        "{file} 会成为主配置，文件从 Configs 里移走；原来的主配置不再保留。"
                                     )
                                 }),
                         )
