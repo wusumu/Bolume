@@ -798,15 +798,18 @@ fn takeover_media() -> bool {
 /// 只在 Bolume 运行期间有效（钩子在主程序进程里）。
 static BLOCK_SYSTEM_OSD: AtomicBool = AtomicBool::new(false);
 
-/// 开关「禁用 Windows 音量条」（配置变更时由 `apply_config` 同步）。
+/// 开关「禁用 Windows 音量条 / 隐藏播放信息卡片」（配置变更时由 `apply_config` 同步）。
 ///
 /// 这里只是钩子那一半（吞掉音量键，让资源管理器收不到）；另一半在
-/// `platform::system_osd` —— 直接把系统那扇 OSD 窗口最小化。
+/// `platform::system_osd` —— 给系统那扇 OSD 窗口设裁剪区域。
 /// 两半都得有：Win10 上媒体键多半走 HID consumer，钩子根本看不见，
 /// 而「正在播放」那张卡片也不是按键触发的。
-pub fn set_block_system_osd(on: bool) {
-    BLOCK_SYSTEM_OSD.store(on, Ordering::SeqCst);
-    crate::platform::system_osd::set_blocked(on);
+///
+/// 两个参数对应设置里那两个开关：`volume` 整条不显示，`media` 只藏播放信息卡片。
+/// 只有 `volume` 影响钩子 —— 只藏卡片时音量键照常交给系统。
+pub fn set_block_system_osd(volume: bool, media: bool) {
+    BLOCK_SYSTEM_OSD.store(volume, Ordering::SeqCst);
+    crate::platform::system_osd::set_blocked(volume, media);
 }
 
 fn block_system_osd() -> bool {
@@ -1023,7 +1026,7 @@ pub fn apply(bindings: &[(Action, usize, Hotkey)]) {
 /// 按当前配置注册全部快捷键（每个动作最多三组）。
 pub fn apply_config(config: &Config) {
     set_takeover_media(config.osd.takeover_media_keys);
-    set_block_system_osd(config.osd.block_system_osd);
+    set_block_system_osd(config.osd.block_system_osd, config.osd.block_media_osd);
     set_numpad_raw(config.hotkey_numpad_raw);
     // 只有「按住连续触发」开着的时候才谈得上「忽略系统的长按重复」：关掉连发时
     // 我们自己是不会补的，再把系统那一路也关掉，按住音量键就彻底不动了。

@@ -223,6 +223,12 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--probe-osd") {
+        // 诊断：系统那扇 OSD 窗口找不找得到、区域设没设上（会静音再取消静音一次）。
+        println!("{}", crate::platform::system_osd::diag_report());
+        return;
+    }
+
     if let Some(index) = args.iter().position(|arg| arg == "--probe-display") {
         // 用法：--probe-display [轮数] [名字:百分比]
         // 例：--probe-display 3           只读三遍

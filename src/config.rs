@@ -3163,6 +3163,12 @@ pub struct OsdConfig {
     /// 弹自己的卡片。退出 Bolume 之后系统行为恢复原样。
     pub block_system_osd: bool,
 
+    /// 只藏音量条旁边那张「正在播放」卡片（封面 / 曲名），音量条本身留着。
+    ///
+    /// 和 `block_system_osd` 是同一扇窗口上的两种裁法：那条裁成空的（整条不见），
+    /// 这条只裁掉右边那一块。两个都开时按音量条算 —— 整条都没了，卡片自然也看不见。
+    pub block_media_osd: bool,
+
     /// 标题文字。空 = 用自动标题（「音量」「已静音」「下一曲」这种）。
     pub title_text: String,
     /// 自定义文字（一条都没有 = 不显示任何自定义文字）。
@@ -3411,6 +3417,7 @@ impl Default for OsdConfig {
             snap: true,
             takeover_media_keys: false,
             block_system_osd: false,
+            block_media_osd: false,
             title_text: String::new(),
             texts: Vec::new(),
             z_order: Vec::new(),
@@ -6278,9 +6285,11 @@ mod tests {
     fn block_system_osd_defaults_off() {
         let config = Config::default();
         assert!(!config.osd.block_system_osd);
-        // 老配置（没有这个字段）读进来也应该是关的。
+        assert!(!config.osd.block_media_osd);
+        // 老配置（没有这两个字段）读进来也应该是关的。
         let old: Config = serde_json::from_str("{\"config_rev\": 42}").unwrap();
         assert!(!old.osd.block_system_osd);
+        assert!(!old.osd.block_media_osd);
     }
 
     /// 「滚轮悬浮调节」默认开着：滚轮本来就能调（以前只认音量条那一条），

@@ -10185,13 +10185,35 @@ impl Settings {
             "osd-block-system",
             lang.pick("禁用 Windows 音量条", "Hide the Windows volume bar"),
             lang.pick(
-                "Bolume 运行时不再出现 Windows 自己的音量条，带 Ctrl / Alt / Shift 也一样；上一曲 / 下一曲 / 播放暂停弹出的那张带封面的卡片也一起隐藏。退出 Bolume 后系统恢复原样。",
-                "While Bolume is running, the Windows volume bar stays hidden, even with Ctrl / Alt / Shift held — and so does the album-art card that media keys bring up. Closing Bolume restores the default behaviour.",
+                "Bolume 运行时不再出现 Windows 自己的音量条，带 Ctrl / Alt / Shift 也一样；音量条旁边那张带封面的「正在播放」卡片也一起隐藏。退出 Bolume 后系统恢复原样。",
+                "While Bolume is running, the Windows volume bar stays hidden, even with Ctrl / Alt / Shift held — along with the album-art card that sits next to it. Closing Bolume restores the default behaviour.",
             ),
             config.osd.block_system_osd,
             self.bind(|config| {
                 config.osd.block_system_osd = !config.osd.block_system_osd;
-                crate::platform::hotkey::set_block_system_osd(config.osd.block_system_osd);
+                crate::platform::hotkey::set_block_system_osd(
+                    config.osd.block_system_osd,
+                    config.osd.block_media_osd,
+                );
+            }),
+        );
+
+        // 单独一颗：只藏播放信息，音量条留着。裁的是同一扇窗口的另一块
+        // （Win10 上这张卡片和音量条并排画在一起）。
+        let kill_media = self.toggle_row(
+            "osd-block-media",
+            lang.pick("隐藏播放信息卡片", "Hide the playback card"),
+            lang.pick(
+                "只裁掉音量条旁边那张带封面和曲名的卡片，音量条本身照旧出现。Windows 11 的音量条里没有这张独立卡片，那条开关在那代系统上不生效。",
+                "Crops out only the album-art / track-name card beside the volume bar; the volume bar itself still shows. Windows 11 has no separate card, so this does nothing there.",
+            ),
+            config.osd.block_media_osd,
+            self.bind(|config| {
+                config.osd.block_media_osd = !config.osd.block_media_osd;
+                crate::platform::hotkey::set_block_system_osd(
+                    config.osd.block_system_osd,
+                    config.osd.block_media_osd,
+                );
             }),
         );
 
@@ -10507,7 +10529,12 @@ impl Settings {
             self.section(
                 lang.pick("显示内容", "Content"),
                 "info",
-                vec![takeover, kill_osd, self.sub_group(function_toggles)],
+                vec![
+                    takeover,
+                    kill_osd,
+                    kill_media,
+                    self.sub_group(function_toggles),
+                ],
             ),
             self.section(
                 lang.pick("应用过滤", "App filter"),
