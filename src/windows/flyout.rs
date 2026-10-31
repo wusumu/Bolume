@@ -3544,32 +3544,23 @@ impl Flyout {
     /// 整块卡片完全在屏幕外，往上滑的这一路上被任务栏挡住 —— 系统自己就是这么出来的。
     /// 不是「面板高度 + 固定值」：面板高矮差很多时，那种算法会让开口忽高忽低。
     fn slide_distance(&self, cx: &mut Context<Self>) -> f32 {
-        let (x, y, width, height) = self.base_frame;
-        if width <= 0.0 || height <= 0.0 {
-            return 0.0;
-        }
         // 用摆位时记下的那台屏（不是现问光标）：面板弹在哪台，就从那台的边滑进来。
-        let (ax, ay, aw, ah) = if self.screen.2 > 0.0 && self.screen.3 > 0.0 {
+        let screen = if self.screen.2 > 0.0 && self.screen.3 > 0.0 {
             self.screen
         } else {
-            let screen = crate::gui::display_at_cursor(cx)
+            let bounds = crate::gui::display_at_cursor(cx)
                 .map(|display| display.bounds())
                 .unwrap_or_else(|| {
                     gpui::Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.)))
                 });
             (
-                screen.origin.x.as_f32(),
-                screen.origin.y.as_f32(),
-                screen.size.width.as_f32(),
-                screen.size.height.as_f32(),
+                bounds.origin.x.as_f32(),
+                bounds.origin.y.as_f32(),
+                bounds.size.width.as_f32(),
+                bounds.size.height.as_f32(),
             )
         };
-        match self.edge {
-            TaskbarEdge::Bottom => (ay + ah - y).max(0.0),
-            TaskbarEdge::Top => (y + height - ay).max(0.0),
-            TaskbarEdge::Left => (x + width - ax).max(0.0),
-            TaskbarEdge::Right => (ax + aw - x).max(0.0),
-        }
+        slide_distance_of(self.base_frame, screen, self.edge)
     }
 
     /// 把「目标位置 + 当前位移」写进窗口（系统风格专用）。
@@ -3875,9 +3866,8 @@ impl Flyout {
             None => self.rest_offset,
         };
         if !animate {
-            // 关掉收起动画：先照旧把窗口挪到屏幕外（`park_window` 读 anim.slide()），
-            // 再清掉这一轮的参数。
-            self.park_window(window);
+            // 关掉收起动画：直接把窗口挪到屏幕外，再清掉这一轮的参数。
+            self.park_window(window, cx);
             self.anim.finish();
             return;
         }
@@ -3915,27 +3905,22 @@ impl Flyout {
     /// 把窗口停到「屏幕外」（或全透明）—— 收起的终点。
     ///
     /// 不 `ShowWindow(SW_HIDE)`：一隐藏，下次显示 DWM 又会补一段出现淡入。
-    fn park_window(&mut self, window: &Window) {
+    ///
+    /// 距离**按面板此刻的摆位现算**，不读 `anim.slide()`：关掉弹出动画时
+    /// `begin_with` 会把起点归零，读它就成了「挪 0px」—— 面板逻辑上收起了、
+    /// 画面上还杵在那儿，失焦和点别处都收不掉。
+    fn park_window(&mut self, window: &Window, cx: &mut Context<Self>) {
         match self.anim.motion() {
             EntranceMotion::Fade => {
                 crate::windows::platform::set_opacity(window, 0.0);
                 self.rest_offset = 0.0;
             }
             _ => {
-                let slide = self.slide_distance_plain();
+                let slide = self.slide_distance(cx);
                 self.apply_slide(window, slide);
                 self.rest_offset = slide;
             }
         }
-    }
-
-    /// 收起后要停到多远（就是这一轮 `begin_with` 记下的位移，不再查显示器）。
-    fn slide_distance_plain(&self) -> f32 {
-        let (_, _, width, height) = self.base_frame;
-        if width <= 0.0 || height <= 0.0 {
-            return 0.0;
-        }
-        self.anim.slide()
     }
 
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4124,6 +4109,28 @@ impl Flyout {
         // 原生窗口尺寸变了 gpui 的 viewport 缓存不一定跟着变：不显式通知，
         // 面板下半截会留在上一次的尺寸里不重绘（QcClip 在同一位置也是这么做的）。
         window.bounds_changed(cx);
+    }
+}
+
+/// 面板摆好后要滑出多远（正数）：贴着哪条边，就从那条边滑出去。
+///
+/// 起点是「窗口顶边正好贴住屏幕那条边」，整块卡片完全在屏幕外。
+/// 和动画状态无关 —— 收起时现算一次，关掉弹出动画也照样能把窗口停到屏幕外。
+fn slide_distance_of(
+    frame: (f32, f32, f32, f32),
+    screen: (f32, f32, f32, f32),
+    edge: TaskbarEdge,
+) -> f32 {
+    let (x, y, width, height) = frame;
+    let (ax, ay, aw, ah) = screen;
+    if width <= 0.0 || height <= 0.0 || aw <= 0.0 || ah <= 0.0 {
+        return 0.0;
+    }
+    match edge {
+        TaskbarEdge::Bottom => (ay + ah - y).max(0.0),
+        TaskbarEdge::Top => (y + height - ay).max(0.0),
+        TaskbarEdge::Left => (x + width - ax).max(0.0),
+        TaskbarEdge::Right => (ax + aw - x).max(0.0),
     }
 }
 
@@ -4725,8 +4732,8 @@ mod tests {
     use super::{
         HOLD_SETTLE, MUTE_OVERRIDE_FOR, MuteNote, ReleaseNote, V_FADER_HEIGHT, V_FADER_MIN,
         VOLUME_HOLD_FOR, note_muted, resolve_held_volume, resolve_muted, shown_muted,
-        slider_unmute, split_device_name, vertical_columns, vertical_fader_height,
-        vertical_panel_height, volume_readout,
+        slider_unmute, slide_distance_of, split_device_name, vertical_columns,
+        vertical_fader_height, vertical_panel_height, volume_readout,
     };
     use crate::config::{Config, VolumeGesture};
 
@@ -4975,5 +4982,34 @@ mod tests {
         note.at =
             crate::platform::ago(MUTE_OVERRIDE_FOR + std::time::Duration::from_millis(1));
         assert_eq!(resolve_muted(&mut note, true), None);
+    }
+
+    /// 收起距离按几何算：关掉弹出动画时也得挪出足够远，不能是 0。
+    ///
+    /// 以前这里读的是 `anim.slide()`，而关掉动画时 `begin_with` 会把它归零 ——
+    /// 于是收起变成「挪 0px」：面板逻辑上关了、画面上还留着，失焦和点别处都收不掉。
+    #[test]
+    fn park_distance_comes_from_geometry_not_from_animation() {
+        // 1920×1080，任务栏在下面，面板 380×290 贴右下角留 12px。
+        let screen = (0.0, 0.0, 1920.0, 1080.0);
+        let frame = (1920.0 - 380.0 - 12.0, 1080.0 - 12.0 - 290.0, 380.0, 290.0);
+        let bottom = slide_distance_of(frame, screen, crate::windows::platform::TaskbarEdge::Bottom);
+        assert!(
+            (bottom - (290.0 + 12.0)).abs() < 0.01,
+            "顶边贴住屏幕底要挪「高度 + 底边距」，实际 {bottom}"
+        );
+        // 任务栏在上：顶边对齐屏幕顶，整块往下滑出去。
+        let top_frame = (1920.0 - 380.0 - 12.0, 12.0, 380.0, 290.0);
+        let top = slide_distance_of(top_frame, screen, crate::windows::platform::TaskbarEdge::Top);
+        assert!((top - (290.0 + 12.0)).abs() < 0.01, "实际 {top}");
+        // 左右任务栏按宽度走。
+        let left_frame = (12.0, 1080.0 - 290.0 - 12.0, 380.0, 290.0);
+        let left = slide_distance_of(left_frame, screen, crate::windows::platform::TaskbarEdge::Left);
+        assert!((left - (380.0 + 12.0)).abs() < 0.01, "实际 {left}");
+        // 位置还没量出来（全 0）时不硬编一个距离。
+        assert_eq!(
+            slide_distance_of((0.0, 0.0, 0.0, 0.0), screen, crate::windows::platform::TaskbarEdge::Bottom),
+            0.0
+        );
     }
 }

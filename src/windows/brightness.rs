@@ -1056,7 +1056,7 @@ impl Brightness {
             None => self.rest_offset,
         };
         if !animate {
-            self.park_window(window);
+            self.park_window(window, cx);
             self.anim.finish();
             return;
         }
@@ -1070,13 +1070,17 @@ impl Brightness {
     }
 
     /// 把窗口停到屏幕外并压成全透明（不隐藏）。
-    fn park_window(&mut self, window: &Window) {
+    ///
+    /// 距离现算，不读 `anim.slide()`：关掉弹出动画时它是 0，读它等于「挪 0px」，
+    /// 窗口会留在屏幕上（音量面板那边同一个坑）。
+    fn park_window(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.anim.motion() == EntranceMotion::Fade {
             crate::windows::platform::set_opacity(window, 0.0);
             self.rest_offset = 0.0;
         } else {
-            self.apply_slide(window, self.anim.slide());
-            self.rest_offset = self.anim.slide();
+            let slide = self.slide_distance(cx);
+            self.apply_slide(window, slide);
+            self.rest_offset = slide;
         }
     }
 
