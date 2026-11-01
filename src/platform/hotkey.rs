@@ -104,6 +104,9 @@ static HOOK: AtomicIsize = AtomicIsize::new(0);
 /// 「按住连续触发」开着，而且用户没勾「理会系统的长按重复」：系统补出来的重复
 /// 一律不理会，重复节奏完全由我们自己掌握。
 static IGNORE_SYSTEM_REPEAT: AtomicBool = AtomicBool::new(false);
+/// 「按下快捷键时不发送原始按键」：配过的组合一律交给低级钩子吞掉，
+/// 连 `RegisterHotKey` 那一路都不注册（它拦不住用 Raw Input 读键盘的程序）。
+static SWALLOW_RAW: AtomicBool = AtomicBool::new(false);
 /// 按住会连发的动作（`Action` 的 repr 值）。`apply_config` 里按配置重算。
 ///
 /// 钩子拿它判断「系统补出来的重复 keydown」该不该吞：没勾连发的动作按住只该动
@@ -626,14 +629,31 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     let already_down = mark_key_down(key);
     let system_repeat = already_down && ignore_system_repeat();
 
+    let mods = current_modifiers();
+
+    // 普通键（字母 / F 键那一类）平时根本不归钩子管。只有开着「按下时不发送
+    // 原始按键」、并且这一发正好是配过的组合时才接管 —— 其余一律原样放行。
+    // 录制期间也放行：录制靠设置页窗口自己的 keydown，钩子插一手会把
+    // Esc / Backspace 这类也吞掉，反而录不下去。
     if !is_hook_key(key) {
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        if !swallow_raw()
+            || CAPTURING.load(Ordering::SeqCst)
+            || list_blocked()
+            || !bindings_match(mods, key)
+        {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+        trace(&format!("hook swallow raw vk=0x{key:02X} mods={mods}"));
+        if swallow_system_repeat(already_down, media_action(key)) {
+            return LRESULT(1);
+        }
+        send_hotkey(Hotkey::new(mods, key));
+        return LRESULT(1);
     }
     // 到这里都是「我们认识的键」：重复的那几发一律吞掉不派发（也不放给系统，
     // 否则系统那条音量条 / 播放器照样按自己的节奏动，等于没忽略）。
     // 重复由 `start_hold_repeat` 按设置里的间隔自己走。
 
-    let mods = current_modifiers();
     let hotkey = Hotkey::new(mods, key);
 
     if CAPTURING.load(Ordering::SeqCst) {
@@ -654,11 +674,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    let bound = hook_bindings()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .any(|binding| *binding == (mods, key));
+    let bound = bindings_match(mods, key);
     trace(&format!(
         "hook vk=0x{key:02X} mods={mods} bound={bound} injected={injected} capturing={}",
         CAPTURING.load(Ordering::SeqCst)
@@ -682,6 +698,15 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
+/// 这一发（修饰键 + 键码）是不是配过的组合。
+fn bindings_match(mods: u32, key: u32) -> bool {
+    hook_bindings()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|binding| *binding == (mods, key))
+}
+
 /// 这个键现在还按着没有。
 ///
 /// **只对没被我们吞掉的键可靠**：keydown 被钩子吞掉之后，那一发根本没进系统的
@@ -698,7 +723,9 @@ pub fn is_key_down(key: u32) -> bool {
 /// （表现就是「按住音量键一点反应都没有」）。这几颗只能看钩子自己维护的按下表：
 /// 表在 keydown 里置位、keyup 清位，而 keyup **永远**会送到钩子（吞掉的是 keydown）。
 pub fn is_key_held(key: u32) -> bool {
-    if is_hook_key(key) {
+    // 「按下时不发送原始按键」开着时，普通键的 keydown 也被钩子吞了：
+    // 系统那边同样当它没按过，只能问钩子自己的按下表（钩子对所有键都在记）。
+    if hook_covers(key) {
         return tracked_down(key);
     }
     is_key_down(key)
@@ -715,6 +742,27 @@ fn tracked_down(key: u32) -> bool {
         return false;
     }
     DOWN_KEYS[(key / 64) as usize].load(Ordering::SeqCst) & (1u64 << (key % 64)) != 0
+}
+
+/// 开 / 关「按下快捷键时不发送原始按键」（配置变更时由 `apply_config` 同步）。
+///
+/// 只置个原子量：真正「把这颗键从输入队列里拿掉」的是钩子，而哪张表进钩子
+/// 是 `apply_desired` 算的 —— 那边会读这个值，所以这里之后还得走一次 `apply`。
+pub fn set_swallow_raw(on: bool) {
+    SWALLOW_RAW.store(on, Ordering::SeqCst);
+}
+
+fn swallow_raw() -> bool {
+    SWALLOW_RAW.load(Ordering::SeqCst)
+}
+
+/// 这颗键归不归钩子管：媒体 / 小键盘 / 方向那一组本来就走钩子；
+/// 打开「按下时不发送原始按键」之后，普通键也算进来。
+///
+/// 普通键在钩子里只做一件事 —— 命中了绑定就吞掉，没命中照常放行
+/// （见 `keyboard_proc`），所以「算进来」不影响别的按键。
+fn hook_covers(key: u32) -> bool {
+    is_hook_key(key) || swallow_raw()
 }
 
 /// 开 / 关「忽略系统的长按重复」（配置变更时由 `apply_config` 同步）。
@@ -940,7 +988,12 @@ unsafe fn apply_desired(hwnd: HWND) {
             moused.push((mods, key));
             continue;
         }
-        if is_hook_key(key) {
+        // 钩子活着的时候，「按下时不发送原始按键」把所有配过的组合都收进钩子：
+        // `RegisterHotKey` 只能让窗口收不到，拦不住用 Raw Input 读键盘的程序，
+        // 而低级钩子返回 1 是真的从输入队列里抹掉。
+        // 钩子没装上（HOOK = 0）时仍然走注册 —— 宁可按键漏出去，也别让快捷键整个失效。
+        let hook_alive = HOOK.load(Ordering::SeqCst) != 0;
+        if is_hook_key(key) || (hook_alive && swallow_raw()) {
             // 媒体键交给低级钩子，不走 RegisterHotKey（那类键注册不上，
             // 万一注册上了还会和钩子重复触发）。方向 / Ins / Del 那一组也走钩子：
             // `RegisterHotKey` 只认键码，小键盘在 NumLock 关着时冒充的就是同一个
@@ -1007,6 +1060,8 @@ pub fn apply_config(config: &Config) {
     // 只有「按住连续触发」开着的时候才谈得上「忽略系统的长按重复」：关掉连发时
     // 我们自己是不会补的，再把系统那一路也关掉，按住音量键就彻底不动了。
     set_ignore_system_repeat(config.hotkey_hold_repeat && config.hotkey_ignore_system_repeat);
+    // 这一项决定「配过的组合交给钩子还是 RegisterHotKey」，得赶在下面的 `apply` 前面。
+    set_swallow_raw(config.hotkey_swallow_raw);
     // 钩子按这张表判断「系统补出来的重复要不要吞」，所以它得先于下面的注册更新。
     *repeat_actions()
         .lock()
@@ -1666,6 +1721,23 @@ mod tests {
 
         // 越界的伪键码（鼠标键）不该写进表里，也不该报「已经按着」。
         assert!(!mark_key_down(0x100));
+    }
+
+    /// 「按下快捷键时不发送原始按键」：打开后普通键也归钩子管。
+    ///
+    /// 平时字母键根本进不了钩子（`CallNextHookEx` 放行），只有这一项开着、
+    /// 而且正好是配过的组合时才被吞掉 —— 范围由 `hook_covers` 决定。
+    #[test]
+    fn swallow_raw_extends_the_hook_to_plain_keys() {
+        set_swallow_raw(false);
+        assert!(!hook_covers(0x41), "默认不管字母键");
+        assert!(hook_covers(VK_LEFT), "方向键本来就走钩子");
+        assert!(hook_covers(VK_VOLUME_UP));
+        set_swallow_raw(true);
+        assert!(hook_covers(0x41), "开着时字母键也要进钩子");
+        assert!(hook_covers(0x70), "F1 同理");
+        set_swallow_raw(false);
+        assert!(!hook_covers(0x41), "关掉之后恢复原状");
     }
 
     /// 接管的只有四个播放键；音量键留给系统自己的提示条。

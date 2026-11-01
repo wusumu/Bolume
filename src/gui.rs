@@ -4,7 +4,10 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -2256,11 +2259,51 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
     }
 }
 
-/// 「按住连发」的令牌：每按一次 +1，跑着的重复任务发现令牌变了就自己退场。
-///
-/// 只用一个原子量：连发任务跑在 gpui 的执行器上，按键处理在事件回调里，
-/// 两边要同步的就这一个数字。
+/// 「按住连发」的令牌：每按一次 +1。
 static HOLD_REPEAT_TOKEN: AtomicU64 = AtomicU64::new(0);
+/// 一组快捷键一格：`(修饰键, 键码) → 当前令牌`。
+///
+/// 早先只有一个全局令牌，按住音量键再按亮度键，后按的那颗会把前面那颗顶掉 ——
+/// 两根手指各按一个键，只有后按的在连发。分格之后各走各的：同一颗键再按一次
+/// 只顶掉自己那一格，别的键一概不受影响。
+static HOLD_REPEAT_SLOTS: OnceLock<Mutex<Vec<((u32, u32), u64)>>> = OnceLock::new();
+
+fn hold_slots() -> &'static Mutex<Vec<((u32, u32), u64)>> {
+    HOLD_REPEAT_SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 给这个组合领一个新令牌（同组合的旧任务据此退场），返回新令牌。
+fn claim_hold_slot(hotkey: crate::config::Hotkey) -> u64 {
+    let token = HOLD_REPEAT_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut slots = hold_slots()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match slots
+        .iter_mut()
+        .find(|(key, _)| *key == (hotkey.mods, hotkey.key))
+    {
+        Some(slot) => slot.1 = token,
+        None => slots.push(((hotkey.mods, hotkey.key), token)),
+    }
+    token
+}
+
+/// 这一格现在还归不归这个令牌管。
+fn hold_slot_is(token: u64, hotkey: crate::config::Hotkey) -> bool {
+    hold_slots()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|(key, slot)| *key == (hotkey.mods, hotkey.key) && *slot == token)
+}
+
+/// 退场时把自己那一格擦掉。被同键的新任务顶掉时令牌已经变了，`retain` 动不到它。
+fn release_hold_slot(token: u64, hotkey: crate::config::Hotkey) {
+    hold_slots()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|(key, slot)| !(*key == (hotkey.mods, hotkey.key) && *slot == token));
+}
 
 /// 按住音量 / 亮度 / 切歌键时，按设置的间隔一档档往下走；键一松就停。
 ///
@@ -2286,7 +2329,7 @@ fn start_hold_repeat(cx: &mut App, hotkey: crate::config::Hotkey) {
     // 延迟可以设成 0：这时第一档照旧等一个间隔，和加这一项之前一模一样。
     let (dlow, dhigh) = crate::config::HOTKEY_REPEAT_DELAY_RANGE;
     let delay = delay.clamp(dlow, dhigh) as u64;
-    let token = HOLD_REPEAT_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let token = claim_hold_slot(hotkey);
     cx.spawn(async move |cx| {
         // 第一档之前先等这么久 —— 系统那套「键盘字符重复延迟」的等价物。
         // 0 就不额外等（下面循环第一次等的还是间隔）。
@@ -2296,20 +2339,22 @@ fn start_hold_repeat(cx: &mut App, hotkey: crate::config::Hotkey) {
                 .timer(std::time::Duration::from_millis(wait))
                 .await;
             wait = interval;
-            if HOLD_REPEAT_TOKEN.load(Ordering::SeqCst) != token {
-                return;
-            }
-            if !crate::platform::hotkey::is_key_held(hotkey.key) {
+            // 只看自己这一格：按着音量键的时候再按亮度键，两个任务各跑各的。
+            if !hold_slot_is(token, hotkey)
+                || !crate::platform::hotkey::is_key_held(hotkey.key)
+            {
+                release_hold_slot(token, hotkey);
                 return;
             }
             let alive = cx.update(|cx| {
-                if HOLD_REPEAT_TOKEN.load(Ordering::SeqCst) != token {
+                if !hold_slot_is(token, hotkey) {
                     return false;
                 }
                 dispatch_hotkey_inner(cx, hotkey, true);
                 true
             });
             if !alive {
+                release_hold_slot(token, hotkey);
                 return;
             }
         }
@@ -3148,7 +3193,10 @@ fn open_settings(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BRIGHTNESS_OVERRIDE_FOR, BrightnessNote, resolve_brightness};
+    use super::{
+        BRIGHTNESS_OVERRIDE_FOR, BrightnessNote, claim_hold_slot, hold_slot_is,
+        release_hold_slot, resolve_brightness,
+    };
     use std::{collections::HashMap, time::{Duration, Instant}};
 
     fn note(want: u32, age: Duration) -> BrightnessNote {
@@ -3159,6 +3207,28 @@ mod tests {
                 .expect("测试里的时间差不会超过开机时长"),
             hold: BRIGHTNESS_OVERRIDE_FOR,
         }
+    }
+
+    /// 「按住连发」的令牌按组合分格：按着音量键再按亮度键，两个互不顶掉。
+    #[test]
+    fn hold_repeat_slots_stay_apart() {
+        let volume = crate::config::Hotkey::new(0, 0xAF);
+        let brightness = crate::config::Hotkey::new(0, 0x26);
+        let first = claim_hold_slot(volume);
+        let other = claim_hold_slot(brightness);
+        assert!(hold_slot_is(first, volume));
+        assert!(hold_slot_is(other, brightness), "另一个键不该被顶掉");
+
+        // 同一颗键再按一次：只顶掉自己那一格。
+        let second = claim_hold_slot(volume);
+        assert!(!hold_slot_is(first, volume), "旧任务该退场");
+        assert!(hold_slot_is(second, volume));
+        assert!(hold_slot_is(other, brightness), "旁边的键照常连发");
+
+        release_hold_slot(second, volume);
+        release_hold_slot(other, brightness);
+        assert!(!hold_slot_is(second, volume));
+        assert!(!hold_slot_is(other, brightness));
     }
 
     /// 一次套给好几台时，后头的台是排在前头的 DDC 写后面才轮到：那一笔的时限

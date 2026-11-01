@@ -1465,7 +1465,10 @@ impl StartupProfile {
 /// （`ui_font_size`，逻辑像素，基准 12.5px），默认比基准大一档（13.5px）；
 /// 界面的字重去掉「半粗」—— 它和「粗」在 UI 字体上几乎看不出差别，
 /// 老配置里存着 600 的按 700 算。
-const CONFIG_REV: u32 = 74;
+/// rev 75：快捷键多一个「按下时不发送原始按键」（`hotkey_swallow_raw`，默认关）——
+/// 打开后配过的组合整个从输入队列里拿掉，前台连 Raw Input 也读不到。
+/// 默认关 = 老配置的行为一个字不变，这里只留个记号。
+const CONFIG_REV: u32 = 75;
 
 /// 面板弹出动画的风格。
 ///
@@ -4798,6 +4801,20 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub hotkey_ignore_system_repeat: bool,
 
+    /// 「按下快捷键时不发送原始按键」（默认关）。
+    ///
+    /// 配了 `Ctrl+Alt+方向键` 这样的组合之后，默认行为是只把这一份拿走、方向键本身
+    /// 照旧落到前台程序（多半是用户按着 Ctrl/Alt 顺手拨了一下，不该翻页）；
+    /// 打开这一项，被认下的组合整个从输入队列里拿掉 —— 前台收不到那颗键，
+    /// 也收不到由它触发的翻页 / 移动光标。
+    ///
+    /// 做法上这一项把**所有**配过的组合都从 `RegisterHotKey` 挪到低级键盘钩子：
+    /// `RegisterHotKey` 只是让系统别把按键交给窗口，用 Raw Input 读键盘的程序
+    /// （多数游戏）照样看得见；低级钩子返回 1 才算真的没发生过。
+    /// 代价是钩子装不上时这些组合会一起失效（媒体键一直如此）。
+    #[serde(default)]
+    pub hotkey_swallow_raw: bool,
+
     /// 配色跟着 Windows 的亮暗走（默认开）。
     ///
     /// 打开后：系统亮色用浅色模板、深色用深色模板，系统一改界面立刻跟着换；
@@ -4994,6 +5011,7 @@ impl Default for Config {
             hotkey_repeat_delay: 0,
             hotkey_repeat_actions: default_repeat_actions(),
             hotkey_ignore_system_repeat: true,
+            hotkey_swallow_raw: false,
             theme_follow_system: true,
             theme_light_surface: DEFAULT_LIGHT_SURFACE.to_string(),
             theme_light_accent: String::new(),

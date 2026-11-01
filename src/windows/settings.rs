@@ -309,6 +309,7 @@ fn page_fields(page: Page) -> &'static [&'static str] {
             "hotkey_repeat_delay",
             "hotkey_repeat_actions",
             "hotkey_ignore_system_repeat",
+            "hotkey_swallow_raw",
         ],
         Page::Osd => &["osd", "editor_bg", "editor_panel_w"],
         Page::Blocklist => &["app_block"],
@@ -8692,6 +8693,25 @@ impl Settings {
             ))
             .into_any_element();
 
+        // 「按下时不发送原始按键」对两个页签都成立：音量键和亮度键一视同仁，
+        // 所以它放在页签**下面**、两张页签都能看到，不跟着切。
+        let swallow_raw = self.toggle_row(
+            "hotkey-swallow-raw",
+            lang.pick(
+                "按下快捷键时不发送原始按键",
+                "Don't pass the original key through",
+            ),
+            lang.pick(
+                "比如 Ctrl+Alt+方向键：触发时那颗方向键不会落到前台程序，翻页、移动光标都不会发生。打开后这些组合改由键盘钩子接管（连用 Raw Input 读键盘的游戏也收不到）",
+                "With Ctrl+Alt+Arrow, the arrow never reaches the focused app — no page flip, no caret move. Combos are then taken by the keyboard hook, so even games reading Raw Input never see the key",
+            ),
+            config.hotkey_swallow_raw,
+            self.bind(|config| {
+                config.hotkey_swallow_raw = !config.hotkey_swallow_raw;
+                crate::platform::hotkey::apply_config(config);
+            }),
+        );
+
         // 两页签：音频设备（音量 / 媒体键）/ 屏幕设备（亮度）。
         let tabs = self.tab_bar(
             "shortcut-tabs",
@@ -8703,6 +8723,11 @@ impl Settings {
         );
 
         let mut out = vec![tabs];
+        out.push(self.section(
+            lang.pick("按键行为", "Key behaviour"),
+            "ban",
+            vec![swallow_raw],
+        ));
         // 「按住连续触发」那一行和它管辖的勾选框圈成同一个框：开关在最上面、
         // 勾在每行最前面，不放到一起看不出「下面这些勾归上面这个开关管」。
         if self.shortcut_tab == 0 {
