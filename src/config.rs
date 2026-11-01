@@ -1408,7 +1408,8 @@ impl StartupProfile {
 /// rev 38：文本元素改成按需新建、条数不限（`OsdPart::Text(n)`）；默认不再带三条空文字。
 /// rev 39：多了元素图层顺序 `z_order`（空 = 内置顺序），有 serde 默认值，不用搬数据。
 /// rev 40：OSD 卡片投影（`osd.shadow`，默认关）+ 应用滑条拖动解锁静音的两个开关。
-/// rev 45：`hotkey_numpad_raw` —— NumLock 关着也按小键盘数字匹配快捷键。
+/// rev 45：`hotkey_numpad_raw`（已在 0.91 移除：小键盘在 NumLock 关着时冒充方向键的
+/// 问题改成由钩子按扩展位分辨，见 `hotkey::is_numpad_alias`）。
 /// rev 46：主题可以「跟随系统亮暗」（`theme_follow_system` + 亮 / 暗两个槽位），
 /// 默认关闭、两槽各给一档默认主题，老配置读进来行为不变。
 /// rev 47：跟随系统的亮 / 暗两档各有自己的自选底色与强调色（四个空串默认）。
@@ -4797,14 +4798,6 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub hotkey_ignore_system_repeat: bool,
 
-    /// NumLock 关着的时候也把小键盘当数字看（Num0..Num9 / Num.）。
-    ///
-    /// 系统这会儿发的是方向键 / Ins / Del，低级钩子按扫描码把它们认回来再匹配：
-    /// 录过 `Num4` 之后，NumLock 开不开都能触发。默认**关** —— 关着才和 Windows
-    /// 一致（小键盘就是方向键）；打开后没配成快捷键的键照旧放过去，
-    /// 别的程序里还是方向键。
-    pub hotkey_numpad_raw: bool,
-
     /// 配色跟着 Windows 的亮暗走（默认开）。
     ///
     /// 打开后：系统亮色用浅色模板、深色用深色模板，系统一改界面立刻跟着换；
@@ -5001,7 +4994,6 @@ impl Default for Config {
             hotkey_repeat_delay: 0,
             hotkey_repeat_actions: default_repeat_actions(),
             hotkey_ignore_system_repeat: true,
-            hotkey_numpad_raw: false,
             theme_follow_system: true,
             theme_light_surface: DEFAULT_LIGHT_SURFACE.to_string(),
             theme_light_accent: String::new(),

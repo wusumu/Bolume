@@ -309,7 +309,6 @@ fn page_fields(page: Page) -> &'static [&'static str] {
             "hotkey_repeat_delay",
             "hotkey_repeat_actions",
             "hotkey_ignore_system_repeat",
-            "hotkey_numpad_raw",
         ],
         Page::Osd => &["osd", "editor_bg", "editor_panel_w"],
         Page::Blocklist => &["app_block"],
@@ -8655,25 +8654,6 @@ impl Settings {
             ),
         ];
 
-        // NumLock 关着的时候小键盘发的是方向 / Ins / Del，`RegisterHotKey` 那一路
-        // 认不出来；勾上就由键盘钩子按扫描码把它们认回数字再匹配。
-        let numpad_raw = self.toggle_row(
-            "hotkey-numpad-raw",
-            lang.pick(
-                "NumLock 关闭时仍识别小键盘数字",
-                "Read the numpad as digits when NumLock is off",
-            ),
-            lang.pick(
-                "关着 NumLock 时小键盘发出来的是方向 / 删除键；勾上后录过的 Num4 之类照样触发，没配成快捷键的键在你别的程序里还是方向键",
-                "With NumLock off the numpad sends arrows and Delete. Turn this on and Num4-style bindings still fire; keys you never bound stay arrows in other apps",
-            ),
-            config.hotkey_numpad_raw,
-            self.bind(|config| {
-                config.hotkey_numpad_raw = !config.hotkey_numpad_raw;
-                crate::platform::hotkey::set_numpad_raw(config.hotkey_numpad_raw);
-            }),
-        );
-
         // 亮度快捷键自己的步进：面板上的 +/− 想细，键盘按一下想大，分开配。
         let brightness_step = self.number_row(
             "hotkey-brightness-step",
@@ -8731,7 +8711,6 @@ impl Settings {
                 "keyboard",
                 vec![self.repeat_group(config, lang, rows, cx)],
             ));
-            out.push(self.section(lang.pick("小键盘", "Numpad"), "keyboard", vec![numpad_raw]));
             out.push(self.section(
                 lang.pick("步进", "Step"),
                 "volume-low",
