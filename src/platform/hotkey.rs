@@ -628,20 +628,6 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         return LRESULT(1);
     }
 
-    // 「禁用 Windows 音量条」：音量键不管带不带修饰都吞掉，交回主线程按普通音量键处理。
-    //
-    // 放在黑名单判断**前面**：黑名单是「让路给游戏」，让路就是把这个键还给系统，
-    // 而系统一收到音量键就会弹它那条音量条 —— 那正是这个开关要消灭的东西。
-    // 修饰键在这里也是刻意忽略的：系统那条条不认修饰键，`Ctrl+音量+` 放过去一样弹。
-    // 只在主程序活着的时候有效：没有守卫进程，退出 Bolume 系统就恢复原样。
-    if block_system_osd() && volume_action(key).is_some() {
-        if swallow_system_repeat(already_down, volume_action(key)) {
-            return LRESULT(1);
-        }
-        send_hotkey(Hotkey::new(0, key));
-        return LRESULT(1);
-    }
-
     // 前台命中黑名单：一个键都不留，原样还给系统 / 游戏。
     // 只看名单（不查全屏）：壳层的全屏查询在低级钩子里不敢调，慢一下按键就丢了；
     // 全屏那一路由主线程兜（`forward_to_system`）。
@@ -789,31 +775,6 @@ pub fn set_takeover_media(on: bool) {
 
 fn takeover_media() -> bool {
     TAKEOVER_MEDIA.load(Ordering::SeqCst)
-}
-
-/// 「禁用 Windows 音量条」：音量键连修饰键一起吞，绝不让资源管理器看到。
-///
-/// 系统那条音量条**不认修饰键** —— `Ctrl+音量+` 在它眼里跟裸键一模一样，
-/// 所以只吞裸键是没用的（带修饰的组合键也正是这么漏过去的）。
-/// 只在 Bolume 运行期间有效（钩子在主程序进程里）。
-static BLOCK_SYSTEM_OSD: AtomicBool = AtomicBool::new(false);
-
-/// 开关「禁用 Windows 音量条 / 隐藏播放信息卡片」（配置变更时由 `apply_config` 同步）。
-///
-/// 这里只是钩子那一半（吞掉音量键，让资源管理器收不到）；另一半在
-/// `platform::system_osd` —— 给系统那扇 OSD 窗口设裁剪区域。
-/// 两半都得有：Win10 上媒体键多半走 HID consumer，钩子根本看不见，
-/// 而「正在播放」那张卡片也不是按键触发的。
-///
-/// 两个参数对应设置里那两个开关：`volume` 整条不显示，`media` 只藏播放信息卡片。
-/// 只有 `volume` 影响钩子 —— 只藏卡片时音量键照常交给系统。
-pub fn set_block_system_osd(volume: bool, media: bool) {
-    BLOCK_SYSTEM_OSD.store(volume, Ordering::SeqCst);
-    crate::platform::system_osd::set_blocked(volume, media);
-}
-
-fn block_system_osd() -> bool {
-    BLOCK_SYSTEM_OSD.load(Ordering::SeqCst)
 }
 
 /// 「NumLock 关着也认小键盘数字」：默认关，跟 Windows 原生行为一致。
@@ -1026,7 +987,6 @@ pub fn apply(bindings: &[(Action, usize, Hotkey)]) {
 /// 按当前配置注册全部快捷键（每个动作最多三组）。
 pub fn apply_config(config: &Config) {
     set_takeover_media(config.osd.takeover_media_keys);
-    set_block_system_osd(config.osd.block_system_osd, config.osd.block_media_osd);
     set_numpad_raw(config.hotkey_numpad_raw);
     // 只有「按住连续触发」开着的时候才谈得上「忽略系统的长按重复」：关掉连发时
     // 我们自己是不会补的，再把系统那一路也关掉，按住音量键就彻底不动了。

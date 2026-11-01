@@ -3156,19 +3156,6 @@ pub struct OsdConfig {
     /// 弹一条提示，再把键原样转发给播放器。默认关（保持系统原生行为）。
     pub takeover_media_keys: bool,
 
-    /// 禁用 Windows 自己的音量 OSD（那条按音量键弹出来的音量条）。
-    ///
-    /// **只在 Bolume 运行时生效**：主程序的低级键盘钩子把音量键在到达 shell 之前
-    /// 吞掉（带 `Ctrl / Alt / Shift` 也吞 —— 系统那条条不认修饰键），改由 Bolume
-    /// 弹自己的卡片。退出 Bolume 之后系统行为恢复原样。
-    pub block_system_osd: bool,
-
-    /// 只藏音量条旁边那张「正在播放」卡片（封面 / 曲名），音量条本身留着。
-    ///
-    /// 和 `block_system_osd` 是同一扇窗口上的两种裁法：那条裁成空的（整条不见），
-    /// 这条只裁掉右边那一块。两个都开时按音量条算 —— 整条都没了，卡片自然也看不见。
-    pub block_media_osd: bool,
-
     /// 标题文字。空 = 用自动标题（「音量」「已静音」「下一曲」这种）。
     pub title_text: String,
     /// 自定义文字（一条都没有 = 不显示任何自定义文字）。
@@ -3416,8 +3403,6 @@ impl Default for OsdConfig {
             wheel_hover: true,
             snap: true,
             takeover_media_keys: false,
-            block_system_osd: false,
-            block_media_osd: false,
             title_text: String::new(),
             texts: Vec::new(),
             z_order: Vec::new(),
@@ -6278,18 +6263,6 @@ mod tests {
         assert_eq!(LaunchMethod::from_index(2), LaunchMethod::Task);
         // 认不出来的序号按注册表算 —— 那是老行为，最保守。
         assert_eq!(LaunchMethod::from_index(9), LaunchMethod::RunKey);
-    }
-
-    /// 「禁用 Windows 音量条」默认关着：不能一装好就把人家的音量条干掉。
-    #[test]
-    fn block_system_osd_defaults_off() {
-        let config = Config::default();
-        assert!(!config.osd.block_system_osd);
-        assert!(!config.osd.block_media_osd);
-        // 老配置（没有这两个字段）读进来也应该是关的。
-        let old: Config = serde_json::from_str("{\"config_rev\": 42}").unwrap();
-        assert!(!old.osd.block_system_osd);
-        assert!(!old.osd.block_media_osd);
     }
 
     /// 「滚轮悬浮调节」默认开着：滚轮本来就能调（以前只认音量条那一条），

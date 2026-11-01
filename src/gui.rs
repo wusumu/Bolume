@@ -1911,15 +1911,7 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
     let action = {
         let state = cx.global::<AppState>();
         let config = state.config.borrow();
-        // 没给音量键配快捷键时，开了「禁用 Windows 音量条」就按默认音量动作走 ——
-        // 键已经被我们吞了，再没人处理的话按音量键会变成什么都不发生。
-        crate::platform::hotkey::action_for(config.get(), hotkey).or_else(|| {
-            if config.get().osd.block_system_osd && hotkey.mods == 0 {
-                crate::platform::hotkey::volume_action(hotkey.key)
-            } else {
-                None
-            }
-        })
+        crate::platform::hotkey::action_for(config.get(), hotkey)
     };
     use crate::platform::hotkey::Action;
     crate::platform::hotkey::trace(&format!(
@@ -1935,28 +1927,13 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
             let config = state.config.borrow();
             app_blocked(config.get())
         };
-        // 「禁用 Windows 音量条」开着的时候，音量键要在黑名单里也照常生效：
-        // 那个开关的卖点就是「任何程序里都不弹」，游戏里按音量键没反应更奇怪。
-        // 这类键不转发、就地执行，既改了音量又不会让系统弹条。
-        let kill_osd = {
-            let state = cx.global::<AppState>();
-            let config = state.config.borrow();
-            config.get().osd.block_system_osd
-        };
-        let silent_volume = kill_osd
-            && hotkey.mods == 0
-            && matches!(
-                action,
-                Some(Action::VolumeUp) | Some(Action::VolumeDown) | Some(Action::MediaMute)
-            );
-        if block && !silent_volume {
+        // 「禁用 Windows 音量条」那套已经下线了：这里只剩「让路就给回系统」。
+        if block {
             // 键已经被（注册热键或低级钩子）吃下来了，这里不能再让它凭空消失：
             // 裸的媒体键 / 音量键重新注入一遍，等于 Bolume 从没碰过它 ——
             // 游戏里按播放暂停，该由游戏 / 播放器自己收。
             // 用户自己配的组合键（`Ctrl+Alt+0` 那种）不转发：那是专门配给 Bolume 的，
             // 让路就该什么都不做，不能凭空变成一次切歌。
-            // 音量键在 `kill_osd` 时走不到这里（上面被 `silent_volume` 放行），
-            // 所以这里能转发的一定是媒体键 —— 它们不会弹系统 OSD。
             let raw_key = crate::platform::hotkey::is_raw_system_key(hotkey.key, hotkey.mods);
             if raw_key {
                 if let Some(action) = action {
@@ -2423,8 +2400,6 @@ fn quit_now(cx: &mut App) -> ! {
     // 接管期间被我们压到 2% 的应用，要在这里还回去：`process::exit` 不跑析构，
     // 接管线程的 `close()` 根本没机会执行。
     crate::audio::boost::release_all();
-    // 被最小化的系统音量条也要放回来，否则用户下次开机会以为系统坏了。
-    crate::platform::system_osd::restore();
     std::process::exit(0)
 }
 
