@@ -147,7 +147,8 @@ fn swallow_system_repeat(already_down: bool, action: Option<Action>) -> bool {
 }
 /// 现在按着的键（VK 0..=255 的位图）。keyup 也走低级钩子，靠它分辨
 /// 「第一次按下」和「系统自动重复补出来的 keydown」。
-static DOWN_KEYS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// 前 4 个 64 位字覆盖真实键码 0..=255，最后一个是伪键码（小键盘 `Num Left` 那一档）0x100 起。
+static DOWN_KEYS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 fn desired() -> &'static Mutex<Vec<(u32, u32, u32)>> {
     DESIRED.get_or_init(|| Mutex::new(Vec::new()))
@@ -348,6 +349,34 @@ pub const VK_MOUSE_SIDE2: u32 = 0x106;
 /// 这一格是不是「鼠标键」。
 pub fn is_mouse_key(key: u32) -> bool {
     (VK_MOUSE_WHEEL_UP..=VK_MOUSE_SIDE2).contains(&key)
+}
+
+/// 小键盘在 **NumLock 关着** 时那几颗键的伪键码。
+///
+/// 这会儿它们干的是方向键的活儿，但用户心里那是「小键盘上的方向键」，不是真的
+/// 方向键、也不是 NumLock 开着时的数字（`Num4`）。三者得各算各的：
+///
+/// - `Left` 0x25          —— 方向键区那颗，带 E0 扩展位；
+/// - `Num Left` 0x124     —— 小键盘 4，NumLock 关着；
+/// - `Num4` 0x64          —— 小键盘 4，NumLock 开着（数字）。
+///
+/// 真键码只到 0xFF，所以这两档另开一段（和鼠标键 0x100 起同一套办法）：
+/// 配置里存这几个数，注册时跳过，全交给键盘钩子按扫描码认。
+pub const VK_NUMPAD_INS: u32 = 0x120;
+pub const VK_NUMPAD_END: u32 = 0x121;
+pub const VK_NUMPAD_DOWN: u32 = 0x122;
+pub const VK_NUMPAD_PGDN: u32 = 0x123;
+pub const VK_NUMPAD_LEFT: u32 = 0x124;
+pub const VK_NUMPAD_CLEAR: u32 = 0x125;
+pub const VK_NUMPAD_RIGHT: u32 = 0x126;
+pub const VK_NUMPAD_HOME: u32 = 0x127;
+pub const VK_NUMPAD_UP: u32 = 0x128;
+pub const VK_NUMPAD_PGUP: u32 = 0x129;
+pub const VK_NUMPAD_DEL: u32 = 0x12A;
+
+/// 这一格是不是「NumLock 关着的小键盘方向键」。
+pub fn is_numpad_nav(key: u32) -> bool {
+    (VK_NUMPAD_INS..=VK_NUMPAD_DEL).contains(&key)
 }
 
 /// 媒体键虚拟键码（`windows` crate 里没导出这几个常量，照 winuser.h 写死）。
@@ -573,20 +602,21 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if is_up {
         // 松开也走这个钩子：把「按下表」里那一位清掉，下一发才算新的一次按下。
         forget_key_down(info.vkCode);
-        // 小键盘在 NumLock 关着时按下记的是 `Num4`、松开报的是方向键，两位一起清，
-        // 否则连发循环以为那颗键一直按着，手松了还在往下走。
-        if let Some(numpad) = numpad_of(info) {
-            forget_key_down(numpad);
+        // 小键盘在 NumLock 关着时按下记的是 `Num Left` 那一档、松开报的是方向键，
+        // 两位一起清，否则连发循环以为那颗键一直按着，手松了还在往下走。
+        if let Some(identity) = key_identity(info) {
+            forget_key_down(identity);
         }
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     // 小键盘那几颗在 NumLock 关着时报的是方向 / Ins / Del 那一组：键码和真方向键
-    // 一模一样，只有扫描码（还有真方向键的扩展位）能分开。这里先认回小键盘自己的
-    // 键码（`Num4` 那一套）—— 录制、触发、连发全都按小键盘算。
+    // 一模一样，只有扫描码（还有真方向键的扩展位）能分开。这里先换成「Num Left」
+    // 那一档的身份 —— 录制、触发、连发全都按它算。
     //
-    // 这就是 AHK 里 `NumpadLeft` 与 `Left` 的分别：绑在 `Left` 上的动作只有真方向键
-    // 会触发，绑在 `Num4` 上的只有小键盘会触发，NumLock 开着关着都一样。
-    let key = numpad_of(info).unwrap_or(info.vkCode);
+    // 于是三颗键各算各的：`Left`（方向键区）、`Num Left`（NumLock 关着的小键盘 4）、
+    // `Num4`（NumLock 开着的小键盘 4）。绑在 `Left` 上的动作只认真方向键，
+    // 绑在 `Num Left` 上的只认 NumLock 关着时的小键盘。
+    let key = key_identity(info).unwrap_or(info.vkCode);
     // 这一发按下来之前，这颗键是不是还按着 —— 是的话就是系统「长按重复」补出来的
     // keydown（键盘按住不放时，系统按自己的重复延迟 / 速率一直补）。
     //
@@ -681,7 +711,7 @@ fn is_numpad_key(key: u32) -> bool {
 
 /// 按下表里那一位还挂着没有。
 fn tracked_down(key: u32) -> bool {
-    if key > 255 {
+    if key > 319 {
         return false;
     }
     DOWN_KEYS[(key / 64) as usize].load(Ordering::SeqCst) & (1u64 << (key % 64)) != 0
@@ -704,7 +734,7 @@ fn ignore_system_repeat() -> bool {
 /// 之前就按着 = 这一发 keydown 是系统按住重复补出来的。真实 VK 只到 0xFF，
 /// 四段 u64 一位一个键，够用而且不用加锁（钩子里不能慢慢来）。
 fn mark_key_down(key: u32) -> bool {
-    if key > 255 {
+    if key > 319 {
         return false;
     }
     let word = &DOWN_KEYS[(key / 64) as usize];
@@ -714,7 +744,7 @@ fn mark_key_down(key: u32) -> bool {
 
 /// 松开：把这一位清掉。
 fn forget_key_down(key: u32) {
-    if key > 255 {
+    if key > 319 {
         return;
     }
     DOWN_KEYS[(key / 64) as usize].fetch_and(!(1u64 << (key % 64)), Ordering::SeqCst);
@@ -744,9 +774,12 @@ pub fn current_modifiers() -> u32 {
 ///
 /// 后两组都必须走钩子、不能交给 `RegisterHotKey`：它只认键码，而小键盘在 NumLock
 /// 关着时发的就是 `VK_LEFT` 那一组，注册了 `Left` 就会被小键盘蹭响，也没法把
-/// `Num4` 和 `Left` 分开（见 `numpad_of`）。
+/// `Num4` / `Num Left` / `Left` 三者分开（见 `key_identity`）。
 pub fn is_hook_key(key: u32) -> bool {
-    (0xA6..=0xB7).contains(&key) || is_numpad_key(key) || is_nav_key(key)
+    (0xA6..=0xB7).contains(&key)
+        || is_numpad_key(key)
+        || is_numpad_nav(key)
+        || is_nav_key(key)
 }
 
 /// 会被小键盘在 NumLock 关着时冒充的键（见 `VK_INSERT` 那一段的说明）。
@@ -772,15 +805,14 @@ fn is_extended(info: &KBDLLHOOKSTRUCT) -> bool {
     info.flags.0 & LLKHF_EXTENDED.0 != 0
 }
 
-/// 这一发按键属于小键盘的哪一颗（`Num0`..`Num9` / `Num.`），认不出来返回 `None`。
+/// 这一发按键在 Bolume 眼里是哪颗键 —— 认不出来就用系统给的 `vkCode`。
 ///
-/// - NumLock 开着：报的就是 `VK_NUMPAD4` 那一套，原样返回；
+/// 小键盘两档身份都在这里定：
+/// - NumLock 开着：系统报的就是 `VK_NUMPAD4` 那一套，原样返回（数字）；
 /// - NumLock 关着：报的是方向 / Ins / Del 那一组，键码和真方向键**完全相同**，
-///   只有扫描码能认回它是小键盘（真方向键还额外带扩展位）。
-///
-/// 认回小键盘自己的键码之后，绑定和录制就按小键盘算，真方向键按另一个键算 ——
-/// AHK 里 `NumpadLeft` 与 `Left` 的分别就是这个。
-fn numpad_of(info: &KBDLLHOOKSTRUCT) -> Option<u32> {
+///   只有扫描码能认出来它其实在小键盘上，换成 `Num Left` 那几个伪键码
+///   （见 `VK_NUMPAD_LEFT`）—— 于是「真方向键」「小键盘方向键」互不相干。
+fn key_identity(info: &KBDLLHOOKSTRUCT) -> Option<u32> {
     if is_numpad_key(info.vkCode) {
         return Some(info.vkCode);
     }
@@ -789,17 +821,17 @@ fn numpad_of(info: &KBDLLHOOKSTRUCT) -> Option<u32> {
         return None;
     }
     Some(match info.scanCode {
-        0x52 => 0x60, // Ins → Num0
-        0x4F => 0x61, // End → Num1
-        0x50 => 0x62, // Down → Num2
-        0x51 => 0x63, // PgDn → Num3
-        0x4B => 0x64, // Left → Num4
-        0x4C => 0x65, // Clear → Num5
-        0x4D => 0x66, // Right → Num6
-        0x47 => 0x67, // Home → Num7
-        0x48 => 0x68, // Up → Num8
-        0x49 => 0x69, // PgUp → Num9
-        0x53 => 0x6E, // Del → Num.
+        0x52 => VK_NUMPAD_INS,   // Ins → 小键盘 0
+        0x4F => VK_NUMPAD_END,   // End → 小键盘 1
+        0x50 => VK_NUMPAD_DOWN,  // Down → 小键盘 2
+        0x51 => VK_NUMPAD_PGDN,  // PgDn → 小键盘 3
+        0x4B => VK_NUMPAD_LEFT,  // Left → 小键盘 4
+        0x4C => VK_NUMPAD_CLEAR, // Clear → 小键盘 5
+        0x4D => VK_NUMPAD_RIGHT, // Right → 小键盘 6
+        0x47 => VK_NUMPAD_HOME,  // Home → 小键盘 7
+        0x48 => VK_NUMPAD_UP,    // Up → 小键盘 8
+        0x49 => VK_NUMPAD_PGUP,  // PgUp → 小键盘 9
+        0x53 => VK_NUMPAD_DEL,   // Del → 小键盘 .
         _ => return None,
     })
 }
@@ -1045,8 +1077,34 @@ fn mouse_key_text(key: u32) -> Option<String> {
     )
 }
 
+/// 「NumLock 关着的小键盘」那几个键的显示名（伪键码，装不进 `u8`）。
+///
+/// 写全一点：`Num Left` 一眼能看出是「小键盘上那颗方向」，跟 `Left`、`Num4` 都不同。
+fn numpad_nav_text(key: u32) -> Option<String> {
+    Some(
+        match key {
+            VK_NUMPAD_INS => "Num Ins",
+            VK_NUMPAD_END => "Num End",
+            VK_NUMPAD_DOWN => "Num Down",
+            VK_NUMPAD_PGDN => "Num PgDn",
+            VK_NUMPAD_LEFT => "Num Left",
+            VK_NUMPAD_CLEAR => "Num Clear",
+            VK_NUMPAD_RIGHT => "Num Right",
+            VK_NUMPAD_HOME => "Num Home",
+            VK_NUMPAD_UP => "Num Up",
+            VK_NUMPAD_PGUP => "Num PgUp",
+            VK_NUMPAD_DEL => "Num Del",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
 fn key_text(key: u32) -> Option<String> {
     if let Some(name) = mouse_key_text(key) {
+        return Some(name);
+    }
+    if let Some(name) = numpad_nav_text(key) {
         return Some(name);
     }
     let key = u8::try_from(key).ok()?;
@@ -1454,13 +1512,15 @@ mod tests {
         assert!(!is_key_held(VK_MOUSE_WHEEL_UP));
     }
 
-    /// 小键盘在 NumLock 关着时冒充的方向键，要认回小键盘自己的键码。
+    /// 小键盘在 NumLock 关着时冒充的方向键，要按「小键盘那颗」记，不能记成真方向键，
+    /// 也不能记成 NumLock 开着时的数字。
     ///
-    /// 两边的 `vkCode` 一模一样，只有扫描码能分开（真方向键还额外带扩展位）：
-    /// 认回来之后绑 `Left` 只认真方向键、绑 `Num4` 只认小键盘 —— AHK 里
-    /// `NumpadLeft` 与 `Left` 的分别。
+    /// 三颗键的键码在这一刻是这样的：
+    /// - 真方向键 `VK_LEFT` + 扩展位；
+    /// - 小键盘 4（NumLock 关）`VK_LEFT` + 扫描码 0x4B，没有扩展位；
+    /// - 小键盘 4（NumLock 开）`VK_NUMPAD4`。
     #[test]
-    fn numpad_arrows_are_read_back_as_numpad_keys() {
+    fn numpad_arrows_get_their_own_identity() {
         let info = |vk: u32, scan: u32, extended: bool| {
             let mut info = KBDLLHOOKSTRUCT::default();
             info.vkCode = vk;
@@ -1470,24 +1530,49 @@ mod tests {
             }
             info
         };
-        // NumLock 关着：小键盘 4 / 5 / 0 / . / 1 / 9 的代表位。
-        assert_eq!(numpad_of(&info(VK_LEFT, 0x4B, false)), Some(0x64));
-        assert_eq!(numpad_of(&info(VK_CLEAR, 0x4C, false)), Some(0x65));
-        assert_eq!(numpad_of(&info(VK_INSERT, 0x52, false)), Some(0x60));
-        assert_eq!(numpad_of(&info(VK_DELETE, 0x53, false)), Some(0x6E));
-        assert_eq!(numpad_of(&info(VK_END, 0x4F, false)), Some(0x61));
-        assert_eq!(numpad_of(&info(VK_PRIOR, 0x49, false)), Some(0x69));
-        assert_eq!(numpad_of(&info(VK_HOME, 0x47, false)), Some(0x67));
-        // 真方向键 / Del 带扩展位 → 不算小键盘，正常当快捷键。
-        assert_eq!(numpad_of(&info(VK_LEFT, 0x4B, true)), None);
-        assert_eq!(numpad_of(&info(VK_DELETE, 0x53, true)), None);
-        assert_eq!(numpad_of(&info(VK_UP, 0x48, true)), None);
+        // NumLock 关着：11 颗全认一遍（含最容易混的 Del / Clear）。
+        assert_eq!(key_identity(&info(VK_LEFT, 0x4B, false)), Some(VK_NUMPAD_LEFT));
+        assert_eq!(key_identity(&info(VK_CLEAR, 0x4C, false)), Some(VK_NUMPAD_CLEAR));
+        assert_eq!(key_identity(&info(VK_INSERT, 0x52, false)), Some(VK_NUMPAD_INS));
+        assert_eq!(key_identity(&info(VK_DELETE, 0x53, false)), Some(VK_NUMPAD_DEL));
+        assert_eq!(key_identity(&info(VK_END, 0x4F, false)), Some(VK_NUMPAD_END));
+        assert_eq!(key_identity(&info(VK_PRIOR, 0x49, false)), Some(VK_NUMPAD_PGUP));
+        assert_eq!(key_identity(&info(VK_HOME, 0x47, false)), Some(VK_NUMPAD_HOME));
+        assert_eq!(key_identity(&info(VK_DOWN, 0x50, false)), Some(VK_NUMPAD_DOWN));
+        assert_eq!(key_identity(&info(VK_NEXT, 0x51, false)), Some(VK_NUMPAD_PGDN));
+        assert_eq!(key_identity(&info(VK_RIGHT, 0x4D, false)), Some(VK_NUMPAD_RIGHT));
+        assert_eq!(key_identity(&info(VK_UP, 0x48, false)), Some(VK_NUMPAD_UP));
+        // 真方向键 / Del 带扩展位 → 不认，照原键码走。
+        assert_eq!(key_identity(&info(VK_LEFT, 0x4B, true)), None);
+        assert_eq!(key_identity(&info(VK_DELETE, 0x53, true)), None);
+        assert_eq!(key_identity(&info(VK_UP, 0x48, true)), None);
         // 字母、主键盘数字压根不是这一组。
-        assert_eq!(numpad_of(&info(0x41, 0x1E, false)), None);
-        assert_eq!(numpad_of(&info(0x30, 0x0B, false)), None);
-        // NumLock 开着：键码本身就是小键盘那一套，原样返回。
-        assert_eq!(numpad_of(&info(0x64, 0x4B, false)), Some(0x64));
-        assert_eq!(numpad_of(&info(0x6E, 0x53, false)), Some(0x6E));
+        assert_eq!(key_identity(&info(0x41, 0x1E, false)), None);
+        assert_eq!(key_identity(&info(0x30, 0x0B, false)), None);
+        // NumLock 开着：键码本身就是小键盘那一套（数字），原样返回。
+        assert_eq!(key_identity(&info(0x64, 0x4B, false)), Some(0x64));
+        assert_eq!(key_identity(&info(0x6E, 0x53, false)), Some(0x6E));
+    }
+
+    /// 三种「4」互不相干，界面上也写得清楚。
+    #[test]
+    fn the_three_fours_stay_apart() {
+        assert_ne!(VK_LEFT, VK_NUMPAD_LEFT);
+        assert_ne!(VK_NUMPAD_LEFT, 0x64);
+        assert_eq!(key_text(VK_LEFT).as_deref(), Some("Left"));
+        assert_eq!(key_text(VK_NUMPAD_LEFT).as_deref(), Some("Num Left"));
+        assert_eq!(key_text(0x64).as_deref(), Some("Num4"));
+        assert_eq!(key_text(VK_NUMPAD_DEL).as_deref(), Some("Num Del"));
+        assert_eq!(key_text(VK_NUMPAD_PGUP).as_deref(), Some("Num PgUp"));
+        assert_eq!(key_text(VK_NUMPAD_CLEAR).as_deref(), Some("Num Clear"));
+        // 伪键码也走钩子、也进按下表（连发要问得到「还按着」）。
+        assert!(is_hook_key(VK_NUMPAD_LEFT));
+        forget_key_down(VK_NUMPAD_LEFT);
+        assert!(!is_key_held(VK_NUMPAD_LEFT));
+        assert!(!mark_key_down(VK_NUMPAD_LEFT), "第一次按下");
+        assert!(is_key_held(VK_NUMPAD_LEFT));
+        forget_key_down(VK_NUMPAD_LEFT);
+        assert!(!is_key_held(VK_NUMPAD_LEFT));
     }
 
     /// 小键盘和主键盘是两套键码：录下来的 `Num0` 不能跟主键盘的 `0` 撞。
