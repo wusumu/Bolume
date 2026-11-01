@@ -1408,8 +1408,8 @@ impl StartupProfile {
 /// rev 38：文本元素改成按需新建、条数不限（`OsdPart::Text(n)`）；默认不再带三条空文字。
 /// rev 39：多了元素图层顺序 `z_order`（空 = 内置顺序），有 serde 默认值，不用搬数据。
 /// rev 40：OSD 卡片投影（`osd.shadow`，默认关）+ 应用滑条拖动解锁静音的两个开关。
-/// rev 45：`hotkey_numpad_raw`（已在 0.91 移除：小键盘在 NumLock 关着时冒充方向键的
-/// 问题改成由钩子按扩展位分辨，见 `hotkey::is_numpad_alias`）。
+/// rev 45：`hotkey_numpad_raw`（已移除：小键盘在 NumLock 关着时冒充方向键的问题改成
+/// 由钩子按扫描码认回小键盘键码，见 `hotkey::numpad_of` —— 两个键从此各记各的）。
 /// rev 46：主题可以「跟随系统亮暗」（`theme_follow_system` + 亮 / 暗两个槽位），
 /// 默认关闭、两槽各给一档默认主题，老配置读进来行为不变。
 /// rev 47：跟随系统的亮 / 暗两档各有自己的自选底色与强调色（四个空串默认）。
