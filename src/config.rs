@@ -480,6 +480,11 @@ fn default_true() -> bool {
     true
 }
 
+/// 「按住连续触发」的间隔默认值（毫秒）：屏幕页那组字段缺省时用它。
+fn default_repeat_interval() -> u32 {
+    DEFAULT_HOTKEY_REPEAT_INTERVAL
+}
+
 /// 「按住连续触发」的默认勾选集合（音量四个 + 亮度六个）。
 fn default_repeat_actions() -> Vec<String> {
     DEFAULT_REPEAT_ACTIONS
@@ -1468,7 +1473,10 @@ impl StartupProfile {
 /// rev 75：快捷键多一个「按下时不发送原始按键」（`hotkey_swallow_raw`，默认关）——
 /// 打开后配过的组合整个从输入队列里拿掉，前台连 Raw Input 也读不到。
 /// 默认关 = 老配置的行为一个字不变，这里只留个记号。
-const CONFIG_REV: u32 = 75;
+/// rev 76：快捷键页两个页签的设置各存一份（`hotkey_screen_*`）—— 以前音量页和
+/// 屏幕页共用「按住连续触发 / 延迟 / 间隔 / 忽略系统重复 / 不发送原始按键」一组值，
+/// 改一边另一边跟着变。老配置由 rev 76 的迁移把旧值抄过去，行为不变。
+const CONFIG_REV: u32 = 76;
 
 /// 面板弹出动画的风格。
 ///
@@ -2424,14 +2432,18 @@ fn normalize_path(path: &str) -> String {
 
 /// OSD 卡片贴在屏幕的哪个位置。
 ///
-/// 除了八个固定位置，还有「指定坐标」（相对所选显示器左上角的像素偏移）
-/// 和「跟随鼠标指针」。默认下居中，和 Windows 自带的音量 OSD 一样。
+/// 九个固定位置（上中下 × 左中右），外加「指定坐标」（相对所选显示器左上角的
+/// 像素偏移）和「跟随鼠标指针」。默认下居中，和 Windows 自带的音量 OSD 一样。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OsdAnchor {
     TopLeft,
     TopCenter,
     TopRight,
+    /// 竖直居中的三档：高度一半的地方，两边距上下边缘一样远。
+    MiddleLeft,
+    MiddleCenter,
+    MiddleRight,
     BottomLeft,
     /// 下居中（默认，和 Windows 自带 OSD 同一位置）。
     #[default]
@@ -2449,11 +2461,14 @@ impl OsdAnchor {
             Self::TopLeft => 0,
             Self::TopCenter => 1,
             Self::TopRight => 2,
-            Self::BottomLeft => 3,
-            Self::BottomCenter => 4,
-            Self::BottomRight => 5,
-            Self::Custom => 6,
-            Self::Cursor => 7,
+            Self::MiddleLeft => 3,
+            Self::MiddleCenter => 4,
+            Self::MiddleRight => 5,
+            Self::BottomLeft => 6,
+            Self::BottomCenter => 7,
+            Self::BottomRight => 8,
+            Self::Custom => 9,
+            Self::Cursor => 10,
         }
     }
 
@@ -2462,10 +2477,13 @@ impl OsdAnchor {
             0 => Self::TopLeft,
             1 => Self::TopCenter,
             2 => Self::TopRight,
-            3 => Self::BottomLeft,
-            5 => Self::BottomRight,
-            6 => Self::Custom,
-            7 => Self::Cursor,
+            3 => Self::MiddleLeft,
+            4 => Self::MiddleCenter,
+            5 => Self::MiddleRight,
+            6 => Self::BottomLeft,
+            8 => Self::BottomRight,
+            9 => Self::Custom,
+            10 => Self::Cursor,
             _ => Self::BottomCenter,
         }
     }
@@ -3073,6 +3091,125 @@ pub enum OsdMonitorMode {
     All,
 }
 
+/// 提示条弹在哪：贴哪一角 / 指定坐标 / 在哪块屏上。
+///
+/// 三套模板（音量 / 媒体键 / 亮度）各存一份 —— 音量条压右下角、亮度条压右上角
+/// 这种搭配才做得出来。老配置里这五项只有一份，读进来时由 [`OsdConfig::placement`]
+/// 回落到音量那一套，行为不变。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OsdPlacement {
+    /// 贴哪儿。
+    pub anchor: OsdAnchor,
+    /// 指定坐标用：相对显示器左上角的偏移（逻辑像素）。
+    pub custom_x: u32,
+    pub custom_y: u32,
+    /// 0 = 主显示器；n = 按左上角排序后的第 n 台（从 1 开始）。
+    pub monitor: u32,
+    /// 显示器怎么选：指定一台 / 跟随鼠标 / 全部显示器。
+    pub monitor_mode: OsdMonitorMode,
+}
+
+impl Default for OsdPlacement {
+    fn default() -> Self {
+        Self {
+            anchor: OsdAnchor::BottomCenter,
+            custom_x: 0,
+            custom_y: 0,
+            monitor: 0,
+            monitor_mode: OsdMonitorMode::Single,
+        }
+    }
+}
+
+/// 提示条入场时「从哪儿冒出来」。
+///
+/// 系统那条音量条只会从任务栏后面往上滑，可卡片贴的角是可以任选的：压左上角的
+/// 亮度条再照旧从屏幕底往上滑，就成了飞越整块屏。所以来源跟贴角分开配 ——
+/// 默认「跟着最近的那条屏边」，也可以钉死四个方向，或者自己填位移。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OsdAnimFrom {
+    /// 卡片离哪条屏幕边最近就从哪条边进来（默认）。
+    ///
+    /// 「跟随系统」风格按这条边的整段距离滑入（起点整块在屏外）；
+    /// 「淡入淡出」风格不出屏，只是原地淡 —— 和加这一项之前完全一样。
+    #[default]
+    #[serde(rename = "nearest")]
+    Nearest,
+    #[serde(rename = "top")]
+    Top,
+    #[serde(rename = "bottom")]
+    Bottom,
+    #[serde(rename = "left")]
+    Left,
+    #[serde(rename = "right")]
+    Right,
+    /// 自己填一段位移：正 x 向右、正 y 向下，长度就是滑多远。
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+impl OsdAnimFrom {
+    /// 编辑器里的排列顺序（「跟随最近边」打头）。
+    pub fn all() -> [Self; 6] {
+        [
+            Self::Nearest,
+            Self::Top,
+            Self::Bottom,
+            Self::Left,
+            Self::Right,
+            Self::Custom,
+        ]
+    }
+
+    pub fn label(self, lang: Lang) -> &'static str {
+        match self {
+            Self::Nearest => lang.pick("跟随最近边", "Nearest edge"),
+            Self::Top => lang.pick("上", "Top"),
+            Self::Bottom => lang.pick("下", "Bottom"),
+            Self::Left => lang.pick("左", "Left"),
+            Self::Right => lang.pick("右", "Right"),
+            Self::Custom => lang.pick("自定义", "Custom"),
+        }
+    }
+}
+
+/// 提示条弹出来时的动画：开不开、哪种风格、两个时长、从哪边进来。
+///
+/// 三套模板各存一份 —— 音量条可以「跟系统滑上来」、亮度条「就地淡入」，
+/// 各按各的性子来，互不牵着走。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OsdAnim {
+    /// 关掉就直接出现、直接消失。
+    pub animate: bool,
+    /// 就地淡入淡出，还是照系统音量条那样滑上来。
+    pub style: OsdAnimStyle,
+    /// 淡入 / 淡出时长（毫秒）。`style` 是「跟随系统」时这两个不再生效。
+    pub fade_in_ms: u32,
+    pub fade_out_ms: u32,
+    /// 入场从哪儿来（贴角与来源分开配，见 [`OsdAnimFrom`]）。
+    pub from: OsdAnimFrom,
+    /// `from == Custom` 时的那一段位移（逻辑像素）。正 x 向右、正 y 向下。
+    pub custom_x: i32,
+    pub custom_y: i32,
+}
+
+impl Default for OsdAnim {
+    fn default() -> Self {
+        Self {
+            animate: true,
+            style: OsdAnimStyle::Fade,
+            fade_in_ms: 150,
+            fade_out_ms: 240,
+            from: OsdAnimFrom::Nearest,
+            custom_x: 0,
+            // 默认从下面 48px 的地方上来：和「贴底边」的默认位置对得上。
+            custom_y: 48,
+        }
+    }
+}
+
 /// 屏幕上的提示条（OSD）。
 ///
 /// 只显示「刚刚发生了什么」：调音量、静音、切歌。样式（圆角 / 透明度 /
@@ -3135,6 +3272,11 @@ pub struct OsdConfig {
     /// 淡入 / 淡出时长（毫秒）。
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    /// 入场来源（音量模板那一份；另两套见 `media_anim` / `brightness_anim`）。
+    pub anim_from: OsdAnimFrom,
+    /// `anim_from == Custom` 时的位移（逻辑像素）。
+    pub anim_custom_x: i32,
+    pub anim_custom_y: i32,
     /// 完全显示后停留多久（毫秒）。
     ///
     /// 连续调节（一直按音量键 / 一直滚轮 / 正在拖）期间只续时、不重新淡入，
@@ -3228,6 +3370,25 @@ pub struct OsdConfig {
     /// 亮度模板自己的外观。空 = 跟音量模板一样。
     #[serde(default)]
     pub brightness_style: Option<OsdStyle>,
+
+    /// 媒体键模板弹在哪（空 = 跟音量模板一样，同 `media_card` 的口径）。
+    ///
+    /// 位置与显示器也按模板分开存：三套卡片大小差得远，硬塞在同一个角落
+    /// 会把其中一套顶出屏幕。
+    #[serde(default)]
+    pub media_placement: Option<OsdPlacement>,
+
+    /// 亮度模板弹在哪。空 = 跟音量模板一样。
+    #[serde(default)]
+    pub brightness_placement: Option<OsdPlacement>,
+
+    /// 媒体键模板的弹出动画（空 = 跟音量模板一样）。
+    #[serde(default)]
+    pub media_anim: Option<OsdAnim>,
+
+    /// 亮度模板的弹出动画。空 = 跟音量模板一样。
+    #[serde(default)]
+    pub brightness_anim: Option<OsdAnim>,
 
     /// 编辑器当前停在亮度模板上。
     ///
@@ -3401,6 +3562,9 @@ impl Default for OsdConfig {
             anim_style: OsdAnimStyle::default(),
             fade_in_ms: 150,
             fade_out_ms: 240,
+            anim_from: OsdAnimFrom::Nearest,
+            anim_custom_x: 0,
+            anim_custom_y: 48,
             hold_ms: 1400,
             hover_hold: true,
             interactive: true,
@@ -3424,6 +3588,10 @@ impl Default for OsdConfig {
             brightness_card: None,
             media_style: None,
             brightness_style: None,
+            media_placement: None,
+            brightness_placement: None,
+            media_anim: None,
+            brightness_anim: None,
             brightness_template: false,
         }
     }
@@ -3488,6 +3656,104 @@ impl OsdConfig {
     pub fn set_template(&mut self, template: OsdTemplate) {
         self.detailed = template == OsdTemplate::Media;
         self.brightness_template = template == OsdTemplate::Brightness;
+    }
+
+    /// 音量模板弹在哪（存在主字段里）。
+    fn volume_placement(&self) -> OsdPlacement {
+        OsdPlacement {
+            anchor: self.anchor,
+            custom_x: self.custom_x,
+            custom_y: self.custom_y,
+            monitor: self.monitor,
+            monitor_mode: self.monitor_mode,
+        }
+    }
+
+    /// 当前模板弹在哪（贴哪一角 + 在哪块屏上）。
+    ///
+    /// 媒体键 / 亮度模板还没单独调过时返回音量那一套 —— 在用户动之前三套永远一致。
+    pub fn placement(&self) -> OsdPlacement {
+        match self.template() {
+            OsdTemplate::Volume => self.volume_placement(),
+            OsdTemplate::Media => self
+                .media_placement
+                .unwrap_or_else(|| self.volume_placement()),
+            OsdTemplate::Brightness => self
+                .brightness_placement
+                .unwrap_or_else(|| self.volume_placement()),
+        }
+    }
+
+    /// 改当前模板「弹在哪」。音量模板写回扁平字段，另两套各存一份自己的。
+    pub fn set_placement(&mut self, placement: OsdPlacement) {
+        match self.template() {
+            OsdTemplate::Volume => {
+                self.anchor = placement.anchor;
+                self.custom_x = placement.custom_x;
+                self.custom_y = placement.custom_y;
+                self.monitor = placement.monitor;
+                self.monitor_mode = placement.monitor_mode;
+            }
+            OsdTemplate::Media => self.media_placement = Some(placement),
+            OsdTemplate::Brightness => self.brightness_placement = Some(placement),
+        }
+    }
+
+    /// 在「当前模板弹在哪」上就地改一项（改位置 / 坐标 / 显示器都走这里）。
+    pub fn edit_placement(&mut self, edit: impl FnOnce(&mut OsdPlacement)) {
+        let mut placement = self.placement();
+        edit(&mut placement);
+        self.set_placement(placement);
+    }
+
+    /// 音量模板的弹出动画（存在主字段里）。
+    fn volume_anim(&self) -> OsdAnim {
+        OsdAnim {
+            animate: self.animate,
+            style: self.anim_style,
+            fade_in_ms: self.fade_in_ms,
+            fade_out_ms: self.fade_out_ms,
+            from: self.anim_from,
+            custom_x: self.anim_custom_x,
+            custom_y: self.anim_custom_y,
+        }
+    }
+
+    /// 当前模板的弹出动画。
+    ///
+    /// 媒体键 / 亮度模板还没单独调过时返回音量那一套 —— 在用户动之前三套永远一致。
+    pub fn anim(&self) -> OsdAnim {
+        match self.template() {
+            OsdTemplate::Volume => self.volume_anim(),
+            OsdTemplate::Media => self.media_anim.unwrap_or_else(|| self.volume_anim()),
+            OsdTemplate::Brightness => {
+                self.brightness_anim.unwrap_or_else(|| self.volume_anim())
+            }
+        }
+    }
+
+    /// 改当前模板的弹出动画。音量模板写回扁平字段，另两套各存一份自己的。
+    pub fn set_anim(&mut self, anim: OsdAnim) {
+        match self.template() {
+            OsdTemplate::Volume => {
+                self.animate = anim.animate;
+                self.anim_style = anim.style;
+                self.fade_in_ms = anim.fade_in_ms;
+                self.fade_out_ms = anim.fade_out_ms;
+                self.anim_from = anim.from;
+                self.anim_custom_x = anim.custom_x;
+                self.anim_custom_y = anim.custom_y;
+            }
+            OsdTemplate::Media => self.media_anim = Some(anim),
+            OsdTemplate::Brightness => self.brightness_anim = Some(anim),
+        }
+    }
+
+    /// 在「当前模板的弹出动画」上就地改一项。
+    pub fn edit_anim(&mut self, edit: impl FnOnce(&mut OsdAnim)) {
+        let mut anim = self.anim();
+        edit(&mut anim);
+        self.set_anim(anim);
     }
 
     /// 音量模板那一套背景（存在主字段里）。
@@ -3604,6 +3870,34 @@ impl OsdConfig {
         };
         if let Some(look) = look {
             look.write_flat(&mut self);
+        }
+        // 位置与显示器同理：弹窗定位读的也是这层扁平字段，入口处换一次。
+        let placement = match self.template() {
+            OsdTemplate::Volume => None,
+            OsdTemplate::Media => self.media_placement,
+            OsdTemplate::Brightness => self.brightness_placement,
+        };
+        if let Some(placement) = placement {
+            self.anchor = placement.anchor;
+            self.custom_x = placement.custom_x;
+            self.custom_y = placement.custom_y;
+            self.monitor = placement.monitor;
+            self.monitor_mode = placement.monitor_mode;
+        }
+        // 弹出动画同理。
+        let anim = match self.template() {
+            OsdTemplate::Volume => None,
+            OsdTemplate::Media => self.media_anim,
+            OsdTemplate::Brightness => self.brightness_anim,
+        };
+        if let Some(anim) = anim {
+            self.animate = anim.animate;
+            self.anim_style = anim.style;
+            self.fade_in_ms = anim.fade_in_ms;
+            self.fade_out_ms = anim.fade_out_ms;
+            self.anim_from = anim.from;
+            self.anim_custom_x = anim.custom_x;
+            self.anim_custom_y = anim.custom_y;
         }
         self
     }
@@ -4815,6 +5109,27 @@ pub struct Config {
     #[serde(default)]
     pub hotkey_swallow_raw: bool,
 
+    /// 屏幕页那一套：亮度快捷键的「按住连续触发」（rev 76 起与音频页分开）。
+    ///
+    /// 快捷键页有两个页签，各自的设置**互不相干**：音频页（音量 / 应用音量 /
+    /// 媒体键）用上面那组 `hotkey_*`，屏幕页（六个亮度动作）用这组
+    /// `hotkey_screen_*`。以前这一组只有一份，在音量页把间隔调成 60ms，
+    /// 亮度也跟着变成 60ms —— 两个页签看着各管各的，实际共用一套，很别扭。
+    ///
+    /// 默认值与音频那份一样（开、120ms、不延迟、忽略系统重复），
+    /// 老配置读进来时由 rev 76 的迁移把旧值抄过来，行为一个字不变。
+    #[serde(default = "default_true")]
+    pub hotkey_screen_hold_repeat: bool,
+    #[serde(default = "default_repeat_interval")]
+    pub hotkey_screen_repeat_interval: u32,
+    #[serde(default)]
+    pub hotkey_screen_repeat_delay: u32,
+    #[serde(default = "default_true")]
+    pub hotkey_screen_ignore_system_repeat: bool,
+    /// 屏幕页的「按下快捷键时不发送原始按键」，与音频页各自一份。
+    #[serde(default)]
+    pub hotkey_screen_swallow_raw: bool,
+
     /// 配色跟着 Windows 的亮暗走（默认开）。
     ///
     /// 打开后：系统亮色用浅色模板、深色用深色模板，系统一改界面立刻跟着换；
@@ -5012,6 +5327,11 @@ impl Default for Config {
             hotkey_repeat_actions: default_repeat_actions(),
             hotkey_ignore_system_repeat: true,
             hotkey_swallow_raw: false,
+            hotkey_screen_hold_repeat: true,
+            hotkey_screen_repeat_interval: DEFAULT_HOTKEY_REPEAT_INTERVAL,
+            hotkey_screen_repeat_delay: 0,
+            hotkey_screen_ignore_system_repeat: true,
+            hotkey_screen_swallow_raw: false,
             theme_follow_system: true,
             theme_light_surface: DEFAULT_LIGHT_SURFACE.to_string(),
             theme_light_accent: String::new(),
@@ -5564,6 +5884,17 @@ impl ConfigStore {
         });
         if let Some(segments) = legacy_brightness_segments {
             config.brightness.scroll_step = (100 / segments).max(1);
+            migrated = true;
+        }
+        // rev 76：快捷键页两个页签（音频 / 屏幕）的「按住连续触发」拆成各自一份。
+        // 老配置只有一份，读进来两份都取那一份 —— 在音量页调过间隔的人，
+        // 亮度那边还是原来的手感，等他自己去屏幕页改。
+        if config.config_rev < 76 {
+            config.hotkey_screen_hold_repeat = config.hotkey_hold_repeat;
+            config.hotkey_screen_repeat_interval = config.hotkey_repeat_interval;
+            config.hotkey_screen_repeat_delay = config.hotkey_repeat_delay;
+            config.hotkey_screen_ignore_system_repeat = config.hotkey_ignore_system_repeat;
+            config.hotkey_screen_swallow_raw = config.hotkey_swallow_raw;
             migrated = true;
         }
         // 旧版的默认时长是 140ms，那会儿托盘图标一弹出就是一条深色细线。
@@ -8191,6 +8522,106 @@ mod tests {
         assert_eq!(
             osd.for_function(OsdFunction::Brightness).colors.text,
             "#0d0e0f"
+        );
+    }
+
+    /// 弹在哪（贴角 + 显示器）一套模板一份：改亮度那套不能把音量那张也挪走。
+    #[test]
+    fn osd_placement_is_per_template() {
+        let mut osd = OsdConfig::default();
+        let volume = osd.placement();
+        assert_eq!(volume.anchor, OsdAnchor::BottomCenter);
+        assert_eq!(volume.monitor_mode, OsdMonitorMode::Single);
+
+        // 亮度那套挪到右上角、铺满所有屏。
+        osd.set_template(OsdTemplate::Brightness);
+        osd.edit_placement(|placement| {
+            placement.anchor = OsdAnchor::TopRight;
+            placement.monitor_mode = OsdMonitorMode::All;
+        });
+
+        // 音量那套原地不动。
+        osd.set_template(OsdTemplate::Volume);
+        assert_eq!(osd.placement(), volume);
+        // 媒体键还没单独调过，跟着音量。
+        osd.set_template(OsdTemplate::Media);
+        assert_eq!(osd.placement(), volume);
+
+        // 运行时按「这次是哪个操作」取，取到的是各自那一份。
+        assert_eq!(
+            osd.for_function(OsdFunction::Brightness).anchor,
+            OsdAnchor::TopRight
+        );
+        assert_eq!(
+            osd.for_function(OsdFunction::Brightness).monitor_mode,
+            OsdMonitorMode::All
+        );
+        assert_eq!(
+            osd.for_function(OsdFunction::Volume).anchor,
+            OsdAnchor::BottomCenter
+        );
+        assert_eq!(
+            osd.for_function(OsdFunction::NextTrack).anchor,
+            OsdAnchor::BottomCenter
+        );
+
+        // 音量那套自己改一次：写的是扁平字段，亮度那套不受影响。
+        osd.set_template(OsdTemplate::Volume);
+        osd.edit_placement(|placement| placement.monitor_mode = OsdMonitorMode::Cursor);
+        assert_eq!(
+            osd.monitor_mode,
+            OsdMonitorMode::Cursor,
+            "音量模板写回扁平字段"
+        );
+        assert_eq!(
+            osd.for_function(OsdFunction::Volume).monitor_mode,
+            OsdMonitorMode::Cursor
+        );
+        assert_eq!(
+            osd.for_function(OsdFunction::Brightness).monitor_mode,
+            OsdMonitorMode::All,
+            "改音量不该动亮度那一套"
+        );
+    }
+
+    /// 弹出动画也是一套模板一份：亮度那条滑上来，不该带着音量条一起滑。
+    #[test]
+    fn osd_anim_is_per_template() {
+        let mut osd = OsdConfig::default();
+        let volume = osd.anim();
+        assert!(volume.animate);
+        assert!(!volume.style.is_system());
+
+        osd.set_template(OsdTemplate::Brightness);
+        osd.edit_anim(|anim| {
+            anim.style = OsdAnimStyle::System;
+            anim.fade_in_ms = 80;
+            anim.from = OsdAnimFrom::Top;
+            anim.custom_x = -40;
+            anim.custom_y = -120;
+        });
+
+        // 音量那套没动。
+        osd.set_template(OsdTemplate::Volume);
+        assert_eq!(osd.anim(), volume);
+        // 媒体键还没单独调过，跟着音量。
+        osd.set_template(OsdTemplate::Media);
+        assert_eq!(osd.anim(), volume);
+
+        // 运行时按触发的操作取，取到各自那一份。
+        let brightness = osd.for_function(OsdFunction::Brightness);
+        assert!(brightness.anim_style.is_system());
+        assert_eq!(brightness.fade_in_ms, 80);
+        // 来源也是各存各的：亮度从上面来，音量还是「跟着最近边」。
+        assert_eq!(brightness.anim_from, OsdAnimFrom::Top);
+        assert_eq!(brightness.anim_custom_y, -120);
+        let volume_cfg = osd.for_function(OsdFunction::Volume);
+        assert!(!volume_cfg.anim_style.is_system());
+        assert_eq!(volume_cfg.fade_in_ms, volume.fade_in_ms);
+        assert_eq!(volume_cfg.anim_from, volume.from);
+        assert_eq!(
+            osd.for_function(OsdFunction::NextTrack).anim_style,
+            volume.style
         );
     }
 

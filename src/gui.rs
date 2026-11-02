@@ -12,9 +12,8 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, Bounds, Entity, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBackgroundAppearance as _WBA, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
-    WindowOptions, point, px, size,
+    App, AppContext as _, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use tray_icon::{
     MouseButton, MouseButtonState, TrayIconEvent,
@@ -202,8 +201,47 @@ pub fn displays_snapshot(cx: &App) -> Vec<DisplayInfo> {
     cx.global::<AppState>().displays.borrow().clone()
 }
 
-/// 有没有一台真调得动的显示器（DDC/CI 通、没开 HDR）。
+/// 亮度提示的「当前读数」：预览时用它当假数据。
 ///
+/// 音量的提示条能读音频快照，亮度没有可等的东西 —— 读数全靠调用方算好传进来
+/// （见 `build_state` 里 `request.predicted.unwrap_or(0.0)`）。设置页按「预览」
+/// 的时候没人算过，不补一个就恒显示 0%。这里按这次会弹到的那块屏现读一下。
+pub fn preview_brightness(cx: &App) -> Option<f32> {
+    let state = cx.global::<AppState>();
+    let cfg = state
+        .config
+        .borrow()
+        .get()
+        .osd
+        .for_function(OsdFunction::Brightness);
+    let keys = crate::windows::osd::monitor_keys(&cfg);
+    let displays = state.displays.borrow();
+    keys.iter().find_map(|index| {
+        displays
+            .iter()
+            .find(|info| {
+                info.key
+                    .split(':')
+                    .next()
+                    .and_then(|prefix| prefix.parse::<u32>().ok())
+                    == Some(*index)
+            })
+            .and_then(|info| info.brightness)
+            .map(|value| value as f32 / 100.0)
+    })
+}
+
+/// 设置页「预览」用的请求：亮度要带上当前读数，另两套照旧。
+pub fn preview_osd_request(cx: &App, function: OsdFunction) -> crate::windows::osd::OsdRequest {
+    let request = crate::windows::osd::OsdRequest::device(function);
+    if function == OsdFunction::Brightness {
+        request.predicted(preview_brightness(cx).unwrap_or(1.0))
+    } else {
+        request
+    }
+}
+
+/// 有没有一台真调得动的显示器（DDC/CI 通、没开 HDR）。
 /// 一台都没有的时候亮度面板整个不出场，设置页那两个开关也置灰 ——
 /// 弹一扇只能说「没有可调的显示器」的窗，不如干脆不弹。
 pub fn any_adjustable_display(cx: &App) -> bool {
@@ -1702,7 +1740,9 @@ pub fn show_osd(cx: &mut App, request: OsdRequest) {
         let cfg = config.get();
         (
             cfg.osd.shows(request.function),
-            cfg.osd.clone(),
+            // 位置与显示器按**这次触发的操作**取：三套模板各存一份，
+            // 亮度条压右上角、音量条压右下角这种搭配才成立。
+            cfg.osd.for_function(request.function),
             app_blocked(cfg),
         )
     };
@@ -1852,15 +1892,18 @@ pub fn osd_pinned(cx: &App) -> bool {
 /// 钉住 / 松开提示条（设置页的「保持显示」按钮）。
 ///
 /// 状态由设置页自己拿着：这里只负责把命令送到窗口上。
-/// 「全部显示器」时每块屏那张一起钉。
-pub fn set_osd_pinned(cx: &mut App, pinned: bool) {
+/// 「全部显示器」时每块屏那张一起钉。`function` 决定钉的是哪套模板 ——
+/// 三套的位置可以各不相同，按音量那句算出来的屏可能根本不是亮度那张所在的屏。
+pub fn set_osd_pinned(cx: &mut App, pinned: bool, function: crate::config::OsdFunction) {
     let keys = {
         let config = cx.global::<AppState>().config.borrow();
-        crate::windows::osd::monitor_keys(&config.get().osd)
+        crate::windows::osd::monitor_keys(&config.get().osd.for_function(function))
     };
     for key in keys {
         if let Some(handle) = ensure_osd_window(cx, key) {
-            let _ = handle.update(cx, |osd, window, cx| osd.set_pinned(pinned, window, cx));
+            let _ = handle.update(cx, |osd, window, cx| {
+                osd.set_pinned(pinned, function, window, cx)
+            });
         }
     }
 }
@@ -2053,6 +2096,7 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
             None
         }
     });
+    // 连发的开关、延迟、间隔都按**这颗键属于哪个页签**取：音频页和屏幕页各一份。
     let repeats = match repeat {
         Some(action) => {
             let state = cx.global::<AppState>();
@@ -2061,8 +2105,10 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
         }
         None => false,
     };
-    if !from_repeat && repeats {
-        start_hold_repeat(cx, hotkey);
+    if repeats && !from_repeat {
+        if let Some(action) = repeat {
+            start_hold_repeat(cx, hotkey, action);
+        }
     }
 }
 
@@ -2310,15 +2356,12 @@ fn release_hold_slot(token: u64, hotkey: crate::config::Hotkey) {
 /// 钩子把按键吞掉之后，系统自己的「按住重复」不会再来（那套逻辑在被吞掉的
 /// keydown 之后就断了），所以重复必须自己做。判断松没松走 `is_key_held`：
 /// 被吞过的键（媒体 / 音量键）在系统那边当没按过，只能问钩子自己的按下表。
-fn start_hold_repeat(cx: &mut App, hotkey: crate::config::Hotkey) {
+fn start_hold_repeat(cx: &mut App, hotkey: crate::config::Hotkey, action: crate::platform::hotkey::Action) {
+    // 开关、延迟、间隔都按这颗键属于哪个页签取（音频页一套、屏幕页一套）。
     let (enabled, interval, delay) = {
         let state = cx.global::<AppState>();
         let config = state.config.borrow();
-        (
-            config.get().hotkey_hold_repeat,
-            config.get().hotkey_repeat_interval,
-            config.get().hotkey_repeat_delay,
-        )
+        crate::platform::hotkey::repeat_settings(config.get(), action)
     };
     // 鼠标键（伪键码 0x100 起）没有「按住」这回事：一格滚轮就是一下。
     if !enabled || hotkey.key == 0 || crate::platform::hotkey::is_mouse_key(hotkey.key) {

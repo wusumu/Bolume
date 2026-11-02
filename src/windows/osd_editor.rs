@@ -233,10 +233,13 @@ struct Picker {
     picker: crate::ui::Picker,
     /// 正在屏幕上取色（窗口已藏起来）。
     picking: bool,
+    /// 右键菜单的位置（窗口坐标）。
+    menu: Option<(f32, f32)>,
 }
 
 // 色号 / HSV 的换算统一放在 `ui::color`：设置页的色轮用的是同一套。
-use crate::ui::color::{hex_of, hsv_to_rgb, parse_rgb, push_hex, rgb_to_hsv};
+use crate::ui::color::{hex_of, hsv_to_rgb, parse_rgb, rgb_to_hsv};
+use crate::ui::picker::{HexEdit, HexHandlers, hex_field};
 
 struct TextEdit {
     /// 正在改哪个元素：状态文字，或某一条自定义文字。
@@ -309,7 +312,7 @@ impl TextEdit {
 /// 数值项一共几项：`index()` 的最大值 + 1，数组长度也跟着它走。
 ///
 /// 加一项就改这里 —— 忘了改会在 `slider_bounds[index]` 上直接 panic（len 8 / index 8）。
-const NUM_FIELDS: usize = 11;
+const NUM_FIELDS: usize = 17;
 
 /// 转角度的是谁：整张卡片（背景）还是某个元素。
 ///
@@ -348,6 +351,15 @@ enum NumField {
     ShadowOpacity,
     /// 角度（元素自己或背景），手打时可以是负数。
     Rotation(RotationTarget),
+    /// 「指定坐标」时的水平 / 垂直偏移（相对所选显示器左上角）。
+    PlacementX,
+    PlacementY,
+    /// 弹出动画的淡入 / 淡出时长（毫秒）。
+    FadeIn,
+    FadeOut,
+    /// 弹出动画「自定义来源」的那一段位移（可为负：左 / 上）。
+    AnimX,
+    AnimY,
 }
 
 impl NumField {
@@ -369,6 +381,9 @@ impl NumField {
                 crate::config::OSD_SHADOW_OPACITY_RANGE.1 as i32,
             ),
             NumField::Rotation(_) => crate::config::OSD_ROTATION_RANGE,
+            NumField::PlacementX | NumField::PlacementY => (0, 4000),
+            NumField::FadeIn | NumField::FadeOut => (0, 2000),
+            NumField::AnimX | NumField::AnimY => (-2000, 2000),
         }
     }
 
@@ -376,6 +391,7 @@ impl NumField {
         match self {
             NumField::Opacity | NumField::ShadowOpacity | NumField::BarCorner => "%",
             NumField::Rotation(_) => "°",
+            NumField::FadeIn | NumField::FadeOut => "ms",
             _ => "px",
         }
     }
@@ -395,6 +411,12 @@ impl NumField {
             // 共用一个下标会让两格滑条抢同一个矩形。
             NumField::Rotation(RotationTarget::Card) => 9,
             NumField::Rotation(RotationTarget::Part(_)) => 10,
+            NumField::PlacementX => 11,
+            NumField::PlacementY => 12,
+            NumField::FadeIn => 13,
+            NumField::FadeOut => 14,
+            NumField::AnimX => 15,
+            NumField::AnimY => 16,
         }
     }
 
@@ -415,6 +437,13 @@ impl NumField {
             NumField::Rotation(RotationTarget::Part(part)) => {
                 osd.rotation_of(part).round() as i32
             }
+            // 坐标按**当前模板**读：切到亮度模板时显示的就是亮度那一套。
+            NumField::PlacementX => osd.placement().custom_x as i32,
+            NumField::PlacementY => osd.placement().custom_y as i32,
+            NumField::FadeIn => osd.anim().fade_in_ms as i32,
+            NumField::FadeOut => osd.anim().fade_out_ms as i32,
+            NumField::AnimX => osd.anim().custom_x,
+            NumField::AnimY => osd.anim().custom_y,
         }
     }
 
@@ -449,6 +478,18 @@ impl NumField {
             NumField::Rotation(RotationTarget::Part(part)) => {
                 osd.set_part_rotation(part, value as f32);
             }
+            // 坐标也按模板存：三套卡片大小不同，各自压各自的角落。
+            NumField::PlacementX => {
+                osd.edit_placement(|placement| placement.custom_x = value.max(0) as u32);
+            }
+            NumField::PlacementY => {
+                osd.edit_placement(|placement| placement.custom_y = value.max(0) as u32);
+            }
+            NumField::FadeIn => osd.edit_anim(|anim| anim.fade_in_ms = value.max(0) as u32),
+            NumField::FadeOut => osd.edit_anim(|anim| anim.fade_out_ms = value.max(0) as u32),
+            // 自定义来源的位移：负的有意义（往左 / 往上），别夹成 0。
+            NumField::AnimX => osd.edit_anim(|anim| anim.custom_x = value),
+            NumField::AnimY => osd.edit_anim(|anim| anim.custom_y = value),
         }
     }
 }
@@ -583,6 +624,10 @@ pub struct OsdEditor {
     /// 所以把 bounds 存下来做换算。
     /// 右侧参数栏的滚动位置（参数多了要能翻）。
     panel_scroll: gpui::ScrollHandle,
+    /// 「显示器」那个按钮的列表开着没有（位置卡里的内联菜单）。
+    display_menu: bool,
+    /// 上面那层「选择显示器」展开没有（列出每台显示器的名字）。
+    display_pick: bool,
     /// 右侧参数栏宽度（逻辑像素）。拖动时只改内存里的数，松手才写盘 ——
     /// 每一帧都写一次配置文件太重。
     panel_w: f32,
@@ -683,6 +728,8 @@ impl OsdEditor {
             picker_memory: std::collections::HashMap::new(),
             confirm_reset: false,
             panel_scroll: gpui::ScrollHandle::new(),
+            display_menu: false,
+            display_pick: false,
             panel_w: (if panel_w > 0.0 {
                 panel_w
             } else {
@@ -878,7 +925,7 @@ impl OsdEditor {
         cx.notify();
     }
 
-    /// 方向键微调：1px，按住 Shift 走 10px。
+    /// 方向键微调：1px，按住 Shift 走 10px。按的是**屏幕方向**（见下面的换算）。
     fn nudge(&mut self, key: &str, big: bool, cx: &mut Context<Self>) -> bool {
         let Some(part) = self.selected else {
             return false;
@@ -894,6 +941,12 @@ impl OsdEditor {
             _ => return false,
         };
         let position = cfg.part(part);
+        // 方向键走**屏幕方向**：按右就往屏幕右边走，跟元素自己转了多少度无关。
+        //
+        // 要换算的只有卡片的角度 —— 卡片转了，卡片里的「右」在屏幕上就斜过去了，
+        // 得把这一步反向转回来，跟拖拽 / 拉边框用的是同一个换算。
+        // 元素自己的 `rotation` 转的是它那张画（字、图标），中心点不动，不参与。
+        let (dx, dy) = unrotate_delta(dx, dy, cfg.rotation as f32);
         let x = (position.x * card_w + dx).clamp(0.0, card_w);
         let y = (position.y * card_h + dy).clamp(0.0, card_h);
         self.update(|osd| osd.set_part(part, x / card_w, y / card_h));
@@ -1486,7 +1539,8 @@ fn rotate_about(center: (f32, f32), point: (f32, f32), degrees: f32) -> (f32, f3
 /// 把屏幕上的位移按 `degrees` 反向转回去。
 ///
 /// 卡片转着的时候，往右拖元素在屏幕上看起来是斜的 —— 得把位移换回卡片自己的
-/// 坐标系里，元素才跟着光标走，而不是斜着跑。
+/// 坐标系里，元素才跟着光标走，而不是斜着跑。方向键同理（见 `nudge`）：
+/// 按了右键，屏幕上就得往右走，转的是卡片不是元素。
 fn unrotate_delta(dx: f32, dy: f32, degrees: f32) -> (f32, f32) {
     if degrees == 0.0 {
         return (dx, dy);
@@ -2411,7 +2465,7 @@ impl Render for OsdEditor {
             .top(px(box_top));
 
         let panel = self.panel(&cfg, lang, cx);
-        let picker = self.picker_overlay(lang, cx);
+        let picker = self.picker_overlay(lang, window.viewport_size(), cx);
         let confirm = self.confirm_overlay(lang, cx);
         let menu = self.menu_overlay(&cfg, lang, cx);
         let close_confirm = self.close_confirm_overlay(lang, cx);
@@ -3283,6 +3337,7 @@ impl OsdEditor {
         self.picker = Some(Picker {
             slot,
             picker: crate::ui::Picker::new(h, s, v, hex_of(rgb)),
+            menu: None,
             picking: false,
         });
         cx.notify();
@@ -3303,78 +3358,130 @@ impl OsdEditor {
     }
 
     /// 手输 / 粘贴色号时的按键处理；返回 true 表示这一键归取色器。
+    ///
+    /// 文本一变成合法色号就当场生效（原来得按回车）—— 和设置页那套一样：
+    /// 粘贴完立刻能看到颜色变了，不用再补一下回车。回车 / Esc 都只是收起输入框，
+    /// 落盘归编辑器底部那颗「保存」（预览本来就是实时的）。
     fn picker_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let Some(mut buffer) = self
+        let Some(mut edit) = self
             .picker
             .as_ref()
             .and_then(|picker| picker.picker.edit.clone())
         else {
             return false;
         };
-        // 刚点开输入框：第一下（打字 / 退格 / 粘贴）把整串换掉，
-        // 不用先退格七次才能输入新的。回车 / Esc 不算「换掉」，照原样提交 / 放弃。
-        let fresh = self
-            .picker
-            .as_ref()
-            .map(|picker| picker.picker.edit_fresh)
-            .unwrap_or(false);
         let key = event.keystroke.key.as_str();
-        let typed = key.chars().count() == 1;
-        let replaces = fresh && (typed || matches!(key, "backspace" | "v"));
-        if replaces {
-            buffer.clear();
-            if let Some(picker) = self.picker.as_mut() {
-                picker.picker.edit_fresh = false;
-            }
+        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        let shift = event.keystroke.modifiers.shift;
+        let typed = event
+            .keystroke
+            .key_char
+            .as_ref()
+            .is_some_and(|text| text.chars().count() == 1);
+
+        // 刚点开：第一下打字 / 退格 / 粘贴整串换掉，不用先删七个字符。
+        if edit.fresh && (typed || matches!(key, "backspace" | "delete" | "v" | "x")) {
+            edit.select_all();
+            edit.fresh = false;
         }
+
         match key {
-            "enter" | "escape" => {
-                let apply = key == "enter";
-                if let Some(picker) = self.picker.as_mut() {
-                    picker.picker.edit = None;
-                }
-                if apply {
-                    if let Some(rgb) = parse_rgb(&buffer) {
-                        let (h, s, v) = rgb_to_hsv(rgb.0, rgb.1, rgb.2);
-                        self.apply_hsv(h, s, v, cx);
-                        return true;
-                    }
-                }
-                cx.notify();
-                true
-            }
+            // 回车 / Esc 都只是收起这行输入：颜色在字母进来时就实时生效了，
+            // 落盘归编辑器底部那颗「保存」，框里不再单独确认一次。
+            "enter" | "escape" => self.finish_hex_edit(cx),
             "backspace" => {
-                buffer.pop();
-                if let Some(picker) = self.picker.as_mut() {
-                    picker.picker.edit = Some(buffer);
+                edit.backspace();
+                self.store_hex_edit(edit, cx);
+            }
+            "delete" => {
+                edit.delete();
+                self.store_hex_edit(edit, cx);
+            }
+            "left" => {
+                edit.left(shift);
+                self.store_hex_edit(edit, cx);
+            }
+            "right" => {
+                edit.right(shift);
+                self.store_hex_edit(edit, cx);
+            }
+            "home" => {
+                edit.home(shift);
+                self.store_hex_edit(edit, cx);
+            }
+            "end" => {
+                edit.end(shift);
+                self.store_hex_edit(edit, cx);
+            }
+            "a" if command => {
+                edit.select_all();
+                self.store_hex_edit(edit, cx);
+            }
+            "c" if command => {
+                if let Some(text) = edit.selected_text() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
                 }
                 cx.notify();
-                true
             }
-            "v" if event.keystroke.modifiers.control => {
+            "x" if command => {
+                if let Some(text) = edit.selected_text() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    edit.delete();
+                    self.store_hex_edit(edit, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            "v" if command => {
                 if let Some(text) = cx
                     .read_from_clipboard()
                     .and_then(|item| item.text().map(|text| text.to_string()))
                 {
-                    push_hex(&mut buffer, &text);
-                    if let Some(picker) = self.picker.as_mut() {
-                        picker.picker.edit = Some(buffer);
-                    }
+                    edit.insert(&text);
+                    self.store_hex_edit(edit, cx);
+                } else {
                     cx.notify();
                 }
-                true
             }
             _ => {
-                if let Some(text) = event.keystroke.key_char.as_ref() {
-                    push_hex(&mut buffer, text);
-                    if let Some(picker) = self.picker.as_mut() {
-                        picker.picker.edit = Some(buffer);
+                if typed {
+                    if let Some(text) = event.keystroke.key_char.as_ref() {
+                        edit.insert(text);
                     }
+                    self.store_hex_edit(edit, cx);
+                } else {
+                    cx.notify();
                 }
-                cx.notify();
-                true
             }
         }
+        true
+    }
+
+    /// 写回编辑状态；合法的色号当场生效（和设置页同一套规矩）。
+    fn store_hex_edit(&mut self, edit: HexEdit, cx: &mut Context<Self>) {
+        if let Some(rgb) = parse_rgb(&edit.text) {
+            let (h, s, v) = rgb_to_hsv(rgb.0, rgb.1, rgb.2);
+            self.apply_hsv(h, s, v, cx);
+        }
+        if let Some(picker) = self.picker.as_mut() {
+            picker.picker.edit = Some(edit);
+        }
+        cx.notify();
+    }
+
+    /// 收起色号编辑框。
+    fn finish_hex_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(picker) = self.picker.as_mut() {
+            picker.picker.edit = None;
+        }
+        cx.notify();
+    }
+
+    /// 关掉取色面板：色号早就实时生效了，直接收，不再多问一句。
+    fn close_hex_picker(&mut self, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.preview_muted = false;
+        cx.notify();
     }
 
     /// 屏幕取色：把窗口藏起来 → 等一次左键 → 采样 → 露回来。
@@ -3667,7 +3774,15 @@ impl OsdEditor {
     }
 
     /// 取色器面板。
-    fn picker_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
+    ///
+    /// `viewport` 只用在右键菜单的夹边：菜单按**窗口坐标**摆，点得靠下时不收一下
+    /// 就被窗口底边裁掉（最后一项「全选」直接看不见）。
+    fn picker_overlay(
+        &self,
+        lang: Lang,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         const SV_W: f32 = 224.0;
         const SV_H: f32 = 104.0;
         const HUE_H: f32 = 12.0;
@@ -3701,44 +3816,133 @@ impl OsdEditor {
         );
         let hue_box = crate::ui::picker::hue_box("ed", &picker.picker, SV_W, HUE_H, press, change);
 
-        let hex_text = match &edit {
-            Some(buffer) => format!("{}|", buffer),
-            None => hex.clone(),
-        };
-        let hex_box = div()
-            .id("ed-hex")
-            .flex_1()
-            .h(px(22.))
-            .px(px(7.))
-            .flex()
-            .items_center()
-            .rounded(px(4.))
-            .bg(theme::track())
-            .border_1()
-            .border_color(if edit.is_some() {
-                theme::accent()
-            } else {
-                theme::border()
-            })
-            .cursor_text()
-            .text_size(px(11.))
-            .text_color(theme::text_primary())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
-                    if let Some(picker) = this.picker.as_mut() {
-                        if picker.picker.edit.is_none() {
-                            picker.picker.edit = Some(picker.picker.hex.clone());
+        // 色号框：编辑中走共用的单行输入框（光标 / 选区 / 右键菜单都有），
+        // 不在编辑时就是一行只读的色号。
+        let hex_box = {
+            let this = cx.entity().downgrade();
+            let press_this = this.clone();
+            let press = Rc::new(
+                move |col: usize, extend: bool, window: &mut Window, cx: &mut App| {
+                    let _ = press_this.update(cx, |this, cx| {
+                        let hex = this
+                            .picker
+                            .as_ref()
+                            .map(|picker| picker.picker.hex.clone())
+                            .unwrap_or_default();
+                        if let Some(picker) = this.picker.as_mut() {
+                            if picker.picker.edit.is_none() {
+                                // 第一次点进来：整串选中（和浏览器地址栏一样）——
+                                // 想换一色直接打字，想改某一位再点一下那个字。
+                                let mut edit = HexEdit::new(&hex);
+                                edit.select_all();
+                                edit.drag = true;
+                                picker.picker.edit = Some(edit);
+                            } else if let Some(edit) = picker.picker.edit.as_mut() {
+                                // 已经在编辑：点哪站哪。
+                                // 光标既然落到具体位置了，下一键就该插在那儿，
+                                // 不能再当「整串换掉」。
+                                edit.fresh = false;
+                                edit.drag = true;
+                                edit.move_to(col, extend);
+                            }
                         }
-                        // 整串默认是「选中」状态：直接打字或退格就换掉。
-                        picker.picker.edit_fresh = true;
+                        this.focus.focus(window, cx);
+                        cx.notify();
+                    });
+                },
+            ) as Rc<dyn Fn(usize, bool, &mut Window, &mut App)>;
+            let drag_this = this.clone();
+            let drag = Rc::new(move |col: usize, _window: &mut Window, cx: &mut App| {
+                let _ = drag_this.update(cx, |this, cx| {
+                    let Some(picker) = this.picker.as_mut() else {
+                        return;
+                    };
+                    if !picker.picker.edit.as_ref().is_some_and(|edit| edit.drag) {
+                        return;
                     }
-                    this.focus.focus(window, cx);
-                    cx.stop_propagation();
+                    if let Some(edit) = picker.picker.edit.as_mut() {
+                        edit.move_to(col, true);
+                    }
                     cx.notify();
-                }),
-            )
-            .child(hex_text);
+                });
+            }) as Rc<dyn Fn(usize, &mut Window, &mut App)>;
+            let release_this = this.clone();
+            let release = Rc::new(move |cx: &mut App| {
+                let _ = release_this.update(cx, |this, _cx| {
+                    if let Some(picker) = this.picker.as_mut() {
+                        if let Some(edit) = picker.picker.edit.as_mut() {
+                            edit.drag = false;
+                        }
+                    }
+                });
+            }) as Rc<dyn Fn(&mut App)>;
+            let menu_this = this.clone();
+            let context = Rc::new(move |x: f32, y: f32, _window: &mut Window, cx: &mut App| {
+                let _ = menu_this.update(cx, |this, cx| {
+                    if let Some(picker) = this.picker.as_mut() {
+                        picker.menu = Some((x, y));
+                    }
+                    cx.notify();
+                });
+            }) as Rc<dyn Fn(f32, f32, &mut Window, &mut App)>;
+
+            div()
+                .id("ed-hex")
+                .flex_1()
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .bg(theme::track())
+                .border_1()
+                .border_color(if edit.is_some() {
+                    theme::accent()
+                } else {
+                    theme::border()
+                })
+                .cursor_text()
+                .text_size(px(11.))
+                .text_color(theme::text_primary())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
+                        // 兜底：点在字以外（左侧留白）时打开编辑框并全选。已在编辑态
+                        // 就别碰光标 —— 里面逐字命中区放好的位置会被全选抹掉。
+                        if let Some(picker) = this.picker.as_mut() {
+                            if picker.picker.edit.is_none() {
+                                let hex = picker.picker.hex.clone();
+                                let mut edit = HexEdit::new(&hex);
+                                edit.drag = true;
+                                picker.picker.edit = Some(edit);
+                            }
+                        }
+                        this.focus.focus(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(match &edit {
+                    Some(edit) => hex_field(
+                        "ed",
+                        edit,
+                        11.0,
+                        20.,
+                        HexHandlers {
+                            press,
+                            drag,
+                            release,
+                            context,
+                        },
+                    ),
+                    None => div()
+                        .flex()
+                        .items_center()
+                        .h(px(20.))
+                        .pl(px(6.))
+                        .child(hex.clone())
+                        .into_any_element(),
+                })
+        };
 
         let footer = div()
             .flex()
@@ -3768,7 +3972,100 @@ impl OsdEditor {
                     .child(lang.pick("屏幕取色", "Pick")),
             );
 
+        // 右键菜单 / 未保存提示按**窗口坐标**摆，所以外面套一层铺满窗口的层。
+        let mut extras: Vec<AnyElement> = Vec::new();
+        if let Some((menu_x, menu_y)) = picker.menu {
+            let item = |id: &'static str, label: String, kind: &'static str| {
+                let this = cx.entity().downgrade();
+                div()
+                    .id(id)
+                    .px(px(10.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(theme::text_primary())
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
+                        let _ = this.update(cx, |this, cx| {
+                            let Some(mut edit) = this
+                                .picker
+                                .as_ref()
+                                .and_then(|picker| picker.picker.edit.clone())
+                            else {
+                                return;
+                            };
+                            if let Some(picker) = this.picker.as_mut() {
+                                picker.menu = None;
+                            }
+                            match kind {
+                                "cut" => {
+                                    if let Some(text) = edit.selected_text() {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                                        edit.delete();
+                                    }
+                                }
+                                "copy" => {
+                                    if let Some(text) = edit.selected_text() {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                                    }
+                                }
+                                "paste" => {
+                                    if let Some(text) = cx.read_from_clipboard().and_then(|item| {
+                                        item.text().map(|text| text.to_string())
+                                    }) {
+                                        edit.insert(&text);
+                                    }
+                                }
+                                _ => edit.select_all(),
+                            }
+                            this.store_hex_edit(edit, cx);
+                        });
+                    })
+                    .child(label)
+                    .into_any_element()
+            };
+            extras.push(
+                div()
+                    .id("ed-hex-menu")
+                    .absolute()
+                    .left(px(menu_x.min(viewport.width.as_f32() - 130.0).max(4.0)))
+                    .top(px(menu_y.min(viewport.height.as_f32() - 118.0).max(4.0)))
+                    .w(px(118.))
+                    .p(px(3.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .occlude()
+                    .rounded(px(6.))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border_strong())
+                    // 菜单可能正压在色块上：拦一下，不然点「复制」会顺带把底色
+                    // 改成那个点的颜色（gpui 的鼠标事件不是独占的）。
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
+                    )
+                    .child(item("ed-hex-cut", lang.pick("剪切", "Cut").to_string(), "cut"))
+                    .child(item("ed-hex-copy", lang.pick("复制", "Copy").to_string(), "copy"))
+                    .child(item("ed-hex-paste", lang.pick("粘贴", "Paste").to_string(), "paste"))
+                    .child(item("ed-hex-all", lang.pick("全选", "Select all").to_string(), "all"))
+                    .into_any_element(),
+            );
+        }
+
+
         Some(
+            div()
+                .id("ed-picker-layer")
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full()
+                .child(
             div()
                 .id("ed-picker")
                 .absolute()
@@ -3846,9 +4143,7 @@ impl OsdEditor {
                                         .hover(|style| style.bg(theme::surface_hover()))
                                         .on_click(cx.listener(
                                             |this, _: &gpui::ClickEvent, _window, cx| {
-                                                this.picker = None;
-                                                this.preview_muted = false;
-                                                cx.notify();
+                                                this.close_hex_picker(cx);
                                             },
                                         ))
                                         .child("×"),
@@ -3863,10 +4158,12 @@ impl OsdEditor {
                         .text_size(px(9.5))
                         .text_color(theme::text_tertiary())
                         .child(lang.pick(
-                            "拖色块选色 · 点色号可粘贴 · 取色后点屏幕任意位置",
-                            "Drag to pick · click the hex to paste · then click anywhere on screen",
+                            "拖色块选色 · 色号可编辑 · 取色后点屏幕任意位置",
+                            "Drag to pick · the hex is editable · then click anywhere on screen",
                         )),
                 )
+                )
+                .children(extras)
                 .into_any_element(),
         )
     }
@@ -4413,6 +4710,11 @@ impl OsdEditor {
                 )),
         );
 
+        // 弹在哪（贴哪一角 + 在哪块屏上）：三套模板各存一份，切模板就换这一块。
+        column = column.child(self.placement_card(cfg, lang, cx));
+        // 弹出来怎么动：同样三套模板各一份。
+        column = column.child(self.anim_card(cfg, lang, cx));
+
         // 元素区（右边带「恢复默认布局」）。
         let header_row = div()
             .flex()
@@ -4941,6 +5243,651 @@ impl OsdEditor {
             card = card.child(child);
         }
         card.into_any_element()
+    }
+
+    /// 参数卡里的一颗小胶囊（选中就亮起来）。位置 / 显示器两排都是它。
+    fn placement_chip(
+        &self,
+        id: &str,
+        label: String,
+        on: bool,
+        cx: &mut Context<Self>,
+        apply: impl Fn(&mut crate::config::OsdConfig) + 'static,
+    ) -> AnyElement {
+        let store = self.config.clone();
+        div()
+            .id(SharedString::from(id.to_string()))
+            .flex_none()
+            .max_w(px(112.))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .px(px(6.))
+            .py(px(1.))
+            .rounded(px(4.))
+            .text_size(px(10.))
+            .cursor_pointer()
+            .when(on, |style| {
+                style
+                    .bg(theme::accent_soft())
+                    .text_color(theme::text_primary())
+            })
+            .when(!on, |style| {
+                style
+                    .bg(theme::track())
+                    .text_color(theme::text_secondary())
+                    // 选中的那颗点完鼠标还压在它上面：悬停底色会把自己盖掉，
+                    // 看着就像「点完没选中」。所以只给没选中的换悬停色。
+                    .hover(|style| style.bg(theme::surface_hover()))
+            })
+            .on_click(cx.listener(move |_this, _: &gpui::ClickEvent, _window, cx| {
+                let _ = store
+                    .borrow_mut()
+                    .update(|config| apply(&mut config.osd));
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element()
+    }
+
+    /// 「指定坐标」时的偏移行：− / 数值（双击手打）/ ＋。
+    fn placement_num_row(
+        &self,
+        field: NumField,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let value = field.get(&self.cfg());
+        let editing = self.num.as_ref().map(|edit| edit.field) == Some(field);
+        let id = SharedString::from(format!("ed-place-{}", field.index()));
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(10.5))
+                    .text_color(theme::text_secondary())
+                    .child(label),
+            );
+        for (suffix, delta) in [("-", -8i32), ("+", 8)] {
+            let store = self.config.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("{id}-{suffix}")))
+                    .w(px(16.))
+                    .h(px(15.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .bg(theme::track())
+                    .cursor_pointer()
+                    .text_size(px(10.5))
+                    .text_color(theme::text_secondary())
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _window, cx| {
+                        // 手打没提交就先按当前缓冲算，别让 ± 把输入吃掉。
+                        if this.num.as_ref().map(|edit| edit.field) == Some(field) {
+                            this.commit_num(cx);
+                        }
+                        let next = field.get(&this.cfg()).saturating_add(delta);
+                        let _ = store
+                            .borrow_mut()
+                            .update(|config| field.set(&mut config.osd, next));
+                        cx.notify();
+                    }))
+                    .child(suffix),
+            );
+        }
+        let value_view: AnyElement = if editing {
+            let buffer = self
+                .num
+                .as_ref()
+                .map(|edit| edit.buffer.clone())
+                .unwrap_or_default();
+            div()
+                .id(SharedString::from(format!("{id}-num")))
+                .w(px(46.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(1.))
+                .text_size(px(10.5))
+                .text_color(theme::text_primary())
+                .child(format!("{buffer}{}", field.unit()))
+                .child(div().w(px(1.5)).h(px(10.)).flex_none().bg(theme::accent()))
+                .into_any_element()
+        } else {
+            div()
+                .id(SharedString::from(format!("{id}-num")))
+                .w(px(46.))
+                .flex_none()
+                .text_align(gpui::TextAlign::Right)
+                .text_size(px(10.5))
+                .text_color(if value == 0 {
+                    theme::text_secondary()
+                } else {
+                    theme::text_primary()
+                })
+                .cursor_pointer()
+                .child(format!("{value}{}", field.unit()))
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        this.begin_num(field, window, cx);
+                    }
+                }))
+                .into_any_element()
+        };
+        row.child(value_view).into_any_element()
+    }
+
+    /// 「显示位置」那张卡：贴哪一角 / 指定坐标 / 在哪块屏上。
+    ///
+    /// 三套模板各存一份（见 `OsdConfig::placement`），切模板它就跟着换成那一套 ——
+    /// 音量条压右下、亮度条压右上这种搭配直接在这里调。
+    fn placement_card(
+        &self,
+        cfg: &crate::config::OsdConfig,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::config::{OsdAnchor, OsdMonitorMode};
+
+        let placement = cfg.placement();
+        let cursor = matches!(placement.anchor, OsdAnchor::Cursor);
+        let custom = placement.anchor.is_custom();
+
+        // 九宫格：上 / 中 / 下三排各三格（九档贴角位置），
+        // 「指定坐标」「跟随鼠标」在右边单独两个胶囊里。
+        let mut grid = div().flex().flex_col().gap(px(2.));
+        for row in 0..3u32 {
+            let mut line = div().flex().gap(px(2.));
+            for column in 0..3u32 {
+                let index = row * 3 + column;
+                let anchor = OsdAnchor::from_index(index);
+                let on = !cursor && !custom && placement.anchor == anchor;
+                let store = self.config.clone();
+                line = line.child(
+                    div()
+                        .id(SharedString::from(format!("ed-anchor-{index}")))
+                        .w(px(18.))
+                        .h(px(13.))
+                        .flex_none()
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .when(on, |style| style.bg(theme::accent()))
+                        .when(!on, |style| style.bg(theme::track()))
+                        // 悬停只给没选中的格子换底色：选中的那个点完鼠标还压在它上面，
+                        // 盖掉高亮就看不见「到底选中哪一格」了。
+                        .when(!on, |style| {
+                            style.hover(|style| style.bg(theme::surface_hover()))
+                        })
+                        .on_click(cx.listener(
+                            move |_this, _: &gpui::ClickEvent, _window, cx| {
+                                let _ = store.borrow_mut().update(|config| {
+                                    config
+                                        .osd
+                                        .edit_placement(|placement| placement.anchor = anchor);
+                                });
+                                cx.notify();
+                            },
+                        )),
+                );
+            }
+            grid = grid.child(line);
+        }
+
+        // 九宫格右边竖排两个「不贴角」的档：跟随鼠标 / 指定坐标。
+        let mut modes = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(self.placement_chip(
+                "ed-anchor-cursor",
+                lang.pick("跟随鼠标", "Follow cursor").to_string(),
+                cursor,
+                cx,
+                |osd| osd.edit_placement(|placement| placement.anchor = OsdAnchor::Cursor),
+            ))
+            .child(self.placement_chip(
+                "ed-anchor-custom",
+                lang.pick("指定坐标", "Custom").to_string(),
+                custom,
+                cx,
+                |osd| osd.edit_placement(|placement| placement.anchor = OsdAnchor::Custom),
+            ));
+        // 指定坐标时把当前那对数写在旁边：不用展开就知道卡片此刻偏了多少。
+        if custom {
+            modes = modes.child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(theme::text_tertiary())
+                    .child(format!("{}, {}", placement.custom_x, placement.custom_y)),
+            );
+        }
+
+        let mut children: Vec<AnyElement> = vec![
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(grid)
+                .child(modes)
+                .into_any_element(),
+        ];
+
+        // 指定坐标才展开两根偏移。
+        if custom {
+            children.push(self.placement_num_row(
+                NumField::PlacementX,
+                lang.pick("水平偏移", "Horizontal"),
+                cx,
+            ));
+            children.push(self.placement_num_row(
+                NumField::PlacementY,
+                lang.pick("垂直偏移", "Vertical"),
+                cx,
+            ));
+        }
+
+        // 在哪块屏上：一个按钮，点开是一个列表 ——
+        // 选择显示器 / 主屏幕 / 全部屏幕 / 当前屏幕（= 鼠标所在那块屏）。
+        let options = crate::windows::osd::display_options();
+        let single = matches!(placement.monitor_mode, OsdMonitorMode::Single);
+        let picked = options
+            .iter()
+            .find(|(index, _)| *index == placement.monitor)
+            .map(|(_, name)| name.clone());
+        let current_label = match placement.monitor_mode {
+            OsdMonitorMode::All => lang.pick("全部屏幕", "All screens").to_string(),
+            OsdMonitorMode::Cursor => lang.pick("当前屏幕", "Current screen").to_string(),
+            OsdMonitorMode::Single => match picked {
+                Some(name) if placement.monitor != 0 => name,
+                _ => lang.pick("主屏幕", "Primary screen").to_string(),
+            },
+        };
+        children.push(
+            div()
+                .text_size(px(9.5))
+                .text_color(theme::text_tertiary())
+                .child(lang.pick("显示器", "Display"))
+                .into_any_element(),
+        );
+        let open = self.display_menu;
+        children.push(
+            div()
+                .id("ed-display-btn")
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(6.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(px(10.5))
+                .text_color(theme::text_primary())
+                .bg(if open {
+                    theme::accent_soft()
+                } else {
+                    theme::track()
+                })
+                .hover(|style| style.bg(theme::surface_hover()))
+                .on_click(cx.listener(|this, _: &gpui::ClickEvent, _window, cx| {
+                    this.display_menu = !this.display_menu;
+                    this.display_pick = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(current_label),
+                )
+                .child(if open { "▴" } else { "▾" })
+                .into_any_element(),
+        );
+
+        if open {
+            let pick_open = self.display_pick;
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .p(px(3.))
+                .rounded(px(5.))
+                .bg(theme::surface_elevated())
+                .border_1()
+                .border_color(theme::border());
+
+            // 第一项：「选择显示器」—— 点开才列出具体每一台。
+            list = list.child(
+                div()
+                    .id("ed-display-pick")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(5.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(10.5))
+                    .text_color(theme::text_primary())
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, _window, cx| {
+                        this.display_pick = !this.display_pick;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(lang.pick("选择显示器", "Choose a display")),
+                    )
+                    .child(if pick_open { "▴" } else { "▸" }),
+            );
+
+            // 展开的那一层：每台显示器一行，选中的打勾。
+            if pick_open {
+                if options.is_empty() {
+                    list = list.child(
+                        div()
+                            .px(px(5.))
+                            .py(px(2.))
+                            .text_size(px(10.))
+                            .text_color(theme::text_tertiary())
+                            .child(lang.pick("没有检测到显示器", "No displays found")),
+                    );
+                }
+                for (index, name) in &options {
+                    let index = *index;
+                    list = list.child(self.display_menu_row(
+                        &format!("ed-display-item-{index}"),
+                        name.clone(),
+                        single && placement.monitor == index,
+                        None,
+                        false,
+                        cx,
+                        move |osd| {
+                            osd.edit_placement(|placement| {
+                                placement.monitor_mode = OsdMonitorMode::Single;
+                                placement.monitor = index;
+                            });
+                        },
+                    ));
+                }
+            }
+
+            list = list.child(self.display_menu_row(
+                "ed-display-primary",
+                lang.pick("主屏幕", "Primary screen").to_string(),
+                single && placement.monitor == 0,
+                None,
+                false,
+                cx,
+                |osd| {
+                    osd.edit_placement(|placement| {
+                        placement.monitor_mode = OsdMonitorMode::Single;
+                        placement.monitor = 0;
+                    });
+                },
+            ));
+            list = list.child(self.display_menu_row(
+                "ed-display-all",
+                lang.pick("全部屏幕", "All screens").to_string(),
+                matches!(placement.monitor_mode, OsdMonitorMode::All),
+                None,
+                false,
+                cx,
+                |osd| {
+                    osd.edit_placement(|placement| {
+                        placement.monitor_mode = OsdMonitorMode::All;
+                    });
+                },
+            ));
+            list = list.child(self.display_menu_row(
+                "ed-display-cursor",
+                lang.pick("当前屏幕（鼠标所在）", "Current screen (under cursor)").to_string(),
+                matches!(placement.monitor_mode, OsdMonitorMode::Cursor),
+                None,
+                false,
+                cx,
+                |osd| {
+                    osd.edit_placement(|placement| {
+                        placement.monitor_mode = OsdMonitorMode::Cursor;
+                    });
+                },
+            ));
+            children.push(list.into_any_element());
+        }
+
+        self.group(lang.pick("显示位置", "Placement"), children)
+    }
+
+    /// 显示器列表里的一行：点一下就把这一档写进配置，并把列表收起来。
+    fn display_menu_row(
+        &self,
+        id: &str,
+        label: String,
+        on: bool,
+        arrow: Option<&'static str>,
+        toggle_pick: bool,
+        cx: &mut Context<Self>,
+        apply: impl Fn(&mut crate::config::OsdConfig) + 'static,
+    ) -> AnyElement {
+        let store = self.config.clone();
+        let mut row = div()
+            .id(SharedString::from(id.to_string()))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .px(px(5.))
+            .py(px(2.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_size(px(10.5))
+            .when(on, |style| {
+                style
+                    .bg(theme::accent_soft())
+                    .text_color(theme::text_primary())
+            })
+            .when(!on, |style| style.text_color(theme::text_secondary()))
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _window, cx| {
+                if toggle_pick {
+                    this.display_pick = !this.display_pick;
+                } else {
+                    let _ = store
+                        .borrow_mut()
+                        .update(|config| apply(&mut config.osd));
+                    this.display_menu = false;
+                    this.display_pick = false;
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(label),
+            );
+        if let Some(arrow) = arrow {
+            row = row.child(arrow);
+        } else if on {
+            row = row.child(ui::icon("check", 10.0, theme::accent()));
+        }
+        row.into_any_element()
+    }
+
+    /// 「弹出动画」那张卡：开关 / 风格 / 两个时长。
+    ///
+    /// 也按模板分开存 —— 音量条「跟系统滑上来」、亮度条「就地淡入」这种搭配，
+    /// 以前得三套一起改，现在各调各的。
+    fn anim_card(
+        &self,
+        cfg: &crate::config::OsdConfig,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::config::OsdAnimStyle;
+
+        let anim = cfg.anim();
+        let mut children: Vec<AnyElement> = Vec::new();
+
+        let store = self.config.clone();
+        children.push(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.5))
+                        .text_color(theme::text_secondary())
+                        .child(lang.pick("启用动画", "Animate")),
+                )
+                .child(
+                    div()
+                        .id("ed-anim-toggle")
+                        .w(px(12.))
+                        .h(px(12.))
+                        .flex_none()
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(theme::border_strong())
+                        .when(anim.animate, |style| style.bg(theme::accent()))
+                        .cursor_pointer()
+                        .on_click(cx.listener(
+                            move |_this, _: &gpui::ClickEvent, _window, cx| {
+                                let next = !store.borrow().get().osd.anim().animate;
+                                let _ = store.borrow_mut().update(|config| {
+                                    config.osd.edit_anim(|anim| anim.animate = next);
+                                });
+                                cx.notify();
+                            },
+                        )),
+                )
+                .into_any_element(),
+        );
+
+        if anim.animate {
+            children.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .w(px(46.))
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(theme::text_secondary())
+                            .child(lang.pick("风格", "Style")),
+                    )
+                    .child(self.placement_chip(
+                        "ed-anim-fade",
+                        lang.pick("淡入淡出", "Fade").to_string(),
+                        !anim.style.is_system(),
+                        cx,
+                        |osd| osd.edit_anim(|anim| anim.style = OsdAnimStyle::Fade),
+                    ))
+                    .child(self.placement_chip(
+                        "ed-anim-system",
+                        lang.pick("跟随系统", "Follow system").to_string(),
+                        anim.style.is_system(),
+                        cx,
+                        |osd| osd.edit_anim(|anim| anim.style = OsdAnimStyle::System),
+                    ))
+                    .into_any_element(),
+            );
+            // 从哪边进来：贴哪条边就从哪条边来（默认），也可以钉死四个方向，
+            // 或者自己填一段位移 —— 压左上角的卡片照样能从屏幕底升上来。
+            children.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .w(px(46.))
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(theme::text_secondary())
+                            .child(lang.pick("来源", "From")),
+                    )
+                    .child(div().flex().flex_wrap().gap(px(3.)).children(
+                        crate::config::OsdAnimFrom::all()
+                            .into_iter()
+                            .map(|choice| {
+                                self.placement_chip(
+                                    &format!("ed-anim-from-{choice:?}"),
+                                    choice.label(lang).to_string(),
+                                    anim.from == choice,
+                                    cx,
+                                    move |osd| osd.edit_anim(|anim| anim.from = choice),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                    .into_any_element(),
+            );
+            // 「跟随最近边」在两种风格下表现不同，写一句免得以为选了没反应。
+            if anim.from == crate::config::OsdAnimFrom::Nearest {
+                children.push(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(theme::text_tertiary())
+                        .child(if anim.style.is_system() {
+                            lang.pick(
+                                "从卡片离得最近的那条屏边滑进来",
+                                "Slides in from the closest screen edge",
+                            )
+                        } else {
+                            lang.pick(
+                                "淡入淡出不出屏，选上下左右或自定义才会滑",
+                                "Fade stays in place — pick a side or custom to slide",
+                            )
+                        })
+                        .into_any_element(),
+                );
+            }
+            // 自定义才摆这两个位移：正 x 向右、正 y 向下，长度就是滑多远。
+            if anim.from == crate::config::OsdAnimFrom::Custom {
+                children.push(self.placement_num_row(
+                    NumField::AnimX,
+                    lang.pick("水平位移", "Offset X"),
+                    cx,
+                ));
+                children.push(self.placement_num_row(
+                    NumField::AnimY,
+                    lang.pick("垂直位移", "Offset Y"),
+                    cx,
+                ));
+            }
+            // 「跟随系统」的时长由系统那套节奏定，两格数字这时候不摆出来。
+            if !anim.style.is_system() {
+                children.push(self.placement_num_row(
+                    NumField::FadeIn,
+                    lang.pick("淡入", "Fade in"),
+                    cx,
+                ));
+                children.push(self.placement_num_row(
+                    NumField::FadeOut,
+                    lang.pick("淡出", "Fade out"),
+                    cx,
+                ));
+            }
+        }
+
+        self.group(lang.pick("弹出动画", "Animation"), children)
     }
 
     /// 选中元素后展开在它下面那张卡：对齐 / 元素颜色 / 音量条那几项。
@@ -5745,8 +6692,33 @@ mod tests {
         assert!(!same_look(&edited, &opened), "亮度条改了色应该算改动");
     }
 
-    /// 加了数值项忘记把 `NUM_FIELDS` 加上去，会在 `slider_bounds[index]` 上 panic。
+    /// 方向键走屏幕方向：按右就往屏幕右边走，卡片转了也一样。
+    ///
+    /// 卡片的角度会带着坐标系一起转，所以「屏幕的右」在卡片坐标里不是右；
+    /// 换算（`unrotate_delta` 传卡片角度）对不对，看「换回卡片坐标再正着转回来」
+    /// 能不能还原成屏幕的右 —— 符号搞反的话上下左右全换位，比不换算还难用。
     #[test]
+    fn nudge_moves_towards_the_screen_direction() {
+        // 卡片没转：原样。
+        assert_eq!(unrotate_delta(1.0, 0.0, 0.0), (1.0, 0.0));
+
+        // 卡片顺时针转了 90°：卡片自己的「上」才是屏幕的「右」。
+        let (dx, dy) = unrotate_delta(1.0, 0.0, 90.0);
+        assert!(dx.abs() < 1e-4, "卡片转 90° 时屏幕的右不该剩水平分量：{dx}");
+        assert!((dy + 1.0).abs() < 1e-4, "卡片转 90° 时屏幕的右在卡片里是上：{dy}");
+
+        // 任意角度来回转一遍，必须还原成 (1,0)：按右就是屏幕右。
+        for degrees in [30.0f32, -30.0, 45.0, 180.0, -150.0] {
+            let (dx, dy) = unrotate_delta(1.0, 0.0, degrees);
+            let back = unrotate_delta(dx, dy, -degrees);
+            assert!(
+                (back.0 - 1.0).abs() < 1e-3 && back.1.abs() < 1e-3,
+                "卡片转 {degrees}° 时屏幕的右被换歪了：{back:?}"
+            );
+        }
+    }
+
+    /// 加了数值项忘记把 `NUM_FIELDS` 加上去，会在 `slider_bounds[index]` 上 panic。    #[test]
     fn num_fields_cover_every_index() {
         let max = [
             NumField::Width,
@@ -5760,6 +6732,12 @@ mod tests {
             NumField::ShadowOpacity,
             NumField::Rotation(RotationTarget::Card),
             NumField::Rotation(RotationTarget::Part(OsdPart::Bar)),
+            NumField::PlacementX,
+            NumField::PlacementY,
+            NumField::FadeIn,
+            NumField::FadeOut,
+            NumField::AnimX,
+            NumField::AnimY,
         ]
         .iter()
         .map(|field| field.index())
@@ -5825,19 +6803,42 @@ mod tests {
         assert_eq!(parse_rgb("zzzzzz"), None);
     }
 
+    /// 色号框的字符规矩：开头那个 `#` 只留一个、整串最多七个字符，
+    /// 而且现在能**插在中间**（原来只能整串换，改一位要删到那儿）。
     #[test]
-    fn push_hex_keeps_one_hash_and_caps_length() {
-        let mut buffer = String::new();
-        push_hex(&mut buffer, "#7c9cff");
-        assert_eq!(buffer, "#7c9cff");
+    fn hex_edit_keeps_one_hash_and_caps_length() {
+        let mut edit = HexEdit::new("");
+        edit.insert("#7c9cff");
+        assert_eq!(edit.text, "#7c9cff");
 
-        // 已有的 # 不会被顶掉，超出长度的字符直接丢。
-        push_hex(&mut buffer, "#ff");
-        assert_eq!(buffer, "#7c9cff");
+        // 已有 # 之后再来一个丢掉，超出七个字符也直接丢。
+        edit.insert("#ff");
+        assert_eq!(edit.text, "#7c9cff");
 
-        let mut short = String::from("#12");
-        push_hex(&mut short, "3456789");
-        assert_eq!(short, "#123456");
+        let mut short = HexEdit::new("#12");
+        short.insert("3456789");
+        assert_eq!(short.text, "#123456");
+
+        // 光标在中间：插进那一格，末尾被挤掉而不是覆盖整串。
+        let mut mid = HexEdit::new("#123456");
+        mid.move_to(3, false);
+        mid.insert("ff");
+        assert_eq!(mid.text, "#12ff34");
+    }
+
+    /// 整串选中后直接打六位，`#` 得自己补回来（不然框里只剩 `ff0000`）。
+    #[test]
+    fn hex_edit_puts_the_hash_back() {
+        let mut edit = HexEdit::new("#1f2937");
+        edit.select_all();
+        edit.insert("ff0000");
+        assert_eq!(edit.text, "#ff0000");
+        assert_eq!(edit.caret, 7);
+
+        // 空框里第一下打字也带 #。
+        let mut empty = HexEdit::new("");
+        empty.insert("a");
+        assert_eq!(empty.text, "#a");
     }
 
     #[test]

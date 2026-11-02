@@ -479,6 +479,9 @@ pub fn run_slide(window: &Window, run: SlideRun) -> SlideHandle {
                 if run.fade_ms > 0.0 {
                     let byte = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
                     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), byte, LWA_ALPHA);
+                    // 淡出收尾那一帧 alpha 到 0：窗口从此看不见，可它还留在屏幕上
+                    // （这一档本来就不挪窗口）—— 不挂穿透就会把那块地方的点击吃掉。
+                    sync_click_through(hwnd, byte);
                 }
             }
         };
@@ -647,12 +650,13 @@ fn covered_by_other_topmost(window: &Window) -> bool {
     let Ok(mut cur) = (unsafe { GetTopWindow(None) }) else {
         return false;
     };
-    // 还没走到提示条自己：这一段里的置顶窗口都压在它上面。
-    let mut ahead = true;
     loop {
+        // 走到提示条自己了：排在前面的窗口都检查过，没找到压着的；
+        // 后面的在 z 序上都在它下面，不可能盖住它。
         if cur == hwnd {
-            ahead = false;
-        } else if ahead && unsafe { IsWindowVisible(cur) }.as_bool() {
+            return false;
+        }
+        if unsafe { IsWindowVisible(cur) }.as_bool() {
             let ex = unsafe { GetWindowLongPtrW(cur, GWL_EXSTYLE) } as u32;
             if ex & WS_EX_TOPMOST.0 != 0 && !is_taskbar(cur) {
                 let mut other = RECT::default();
@@ -665,6 +669,118 @@ fn covered_by_other_topmost(window: &Window) -> bool {
             Ok(next) if !next.is_invalid() => next,
             _ => return false,
         };
+    }
+}
+
+/// 提示条现在是 z 序最前面的那个顶层窗口吗（一次 `GetTopWindow`，很便宜）。
+///
+/// 显示期间每帧问一遍：新冒出来的窗口会插到 z 序最前面（置顶窗口还会插到
+/// TOPMOST 组首），不处理的话它就压在提示条上 —— 用户看到的是「OSD 出来以后
+/// 又弹个窗口，提示条被盖住了」。
+pub fn osd_is_top(window: &Window) -> bool {
+    let Some(hwnd) = hwnd_of(window) else {
+        return false;
+    };
+    matches!(unsafe { GetTopWindow(None) }, Ok(top) if top == hwnd)
+}
+
+/// 有别的置顶窗口压在提示条上吗。
+///
+/// 要枚举 z 序（比 [`osd_is_top`] 贵得多），只在组首已经不是自己时问。
+pub fn osd_is_covered(window: &Window) -> bool {
+    covered_by_other_topmost(window)
+}
+
+/// 正在「保顶」的提示条窗口（0 = 没有）。
+static WATCHED_OSD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// 钩子线程是不是已经起来了（只起一次）。
+static WATCHER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 提示条显示期间盯住 z 序：谁插到它前面就立刻顶回去。
+///
+/// `tick` 里的 4ms 轮询受系统定时器精度限制，实测被插队后要 30ms 左右才抢回来
+/// （桌面右键菜单这种置顶弹窗会实打实亮一帧）。这里换成事件钩子：窗口一重排就
+/// 在 1ms 量级把提示条提到 TOPMOST 组首，空闲时零开销。
+pub fn watch_osd_top(window: &Window) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    WATCHED_OSD.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
+    if !WATCHER_READY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        spawn_reorder_watcher();
+    }
+}
+
+/// 提示条收起来了：不用再抢 z 序。
+pub fn unwatch_osd_top() {
+    WATCHED_OSD.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 钩子要一个带消息循环的线程（`WINEVENT_OUTOFCONTEXT` 的回调在里面跑）。
+fn spawn_reorder_watcher() {
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+    };
+
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_REORDER;
+
+        let hook = SetWinEventHook(
+            EVENT_OBJECT_REORDER,
+            EVENT_OBJECT_REORDER,
+            None,
+            Some(reorder_callback),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if !hook.is_invalid() {
+            let _ = UnhookWinEvent(hook);
+        }
+    });
+}
+
+/// z 序一重排就看一眼：提示条是不是已经被挤下去了。
+unsafe extern "system" fn reorder_callback(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    use std::sync::atomic::Ordering;
+
+    let raw = WATCHED_OSD.load(Ordering::SeqCst);
+    if raw == 0 {
+        return;
+    }
+    let osd = HWND(raw as *mut _);
+    let Ok(top) = (unsafe { GetTopWindow(None) }) else {
+        return;
+    };
+    if top == osd {
+        return;
+    }
+    // 组首换人了（新窗口、菜单、其它置顶软件）：立刻把提示条顶回去。
+    // 只动 z 序，不带 SWP_NOZORDER 之外的活 —— 位置 / 尺寸 / 焦点都不碰。
+    unsafe {
+        let _ = SetWindowPos(
+            osd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -694,6 +810,70 @@ pub fn raise_osd(window: &Window) {
     bring_to_front(window);
 }
 
+/// 「整扇窗现在不接鼠标」的标记（按 HWND 记）。
+///
+/// 提示条只在卡片本体上要点击（点图标静音、滚轮调音量），影子那一圈不该吃鼠标：
+/// `WS_EX_TRANSPARENT` 是整窗的开关，所以得由 OSD 的 tick 跟着光标位置来回切。
+fn hollow_windows() -> &'static std::sync::Mutex<std::collections::HashMap<isize, bool>> {
+    static HOLLOW: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<isize, bool>>> =
+        std::sync::OnceLock::new();
+    HOLLOW.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 增删 `WS_EX_TRANSPARENT`（值没变就不碰窗口）。
+fn apply_click_through(hwnd: HWND, want: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::WS_EX_TRANSPARENT;
+
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let on = style & WS_EX_TRANSPARENT.0 as isize != 0;
+    if on == want {
+        return;
+    }
+    let style = if want {
+        style | WS_EX_TRANSPARENT.0 as isize
+    } else {
+        style & !(WS_EX_TRANSPARENT.0 as isize)
+    };
+    unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style) };
+}
+
+/// 提示条：现在整扇窗要不要让点击穿过去。
+///
+/// `WM_NCHITTEST` 回 `HTTRANSPARENT` 只在同一个线程的窗口之间转发 —— 窗口下面
+/// 是别的进程时，那一下点击照样被吃掉（实测过）。按区域穿透只能整窗
+/// `WS_EX_TRANSPARENT`，由 OSD 的 tick（4ms 一次）跟着光标在不在卡片上来回切。
+pub fn set_click_through(window: &Window, through: bool) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    {
+        let mut hollow = hollow_windows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        hollow.insert(hwnd.0 as isize, through);
+    }
+    apply_click_through(hwnd, through);
+}
+
+/// 整窗透明时把点击让给下面：`alpha = 0` 挂 `WS_EX_TRANSPARENT`，一有可见度就摘掉。
+///
+/// Windows 的命中测试只看矩形、不看 alpha —— 全透明的分层窗口照样把点击吃掉。
+/// 面板「淡入淡出」这一档收起时**不挪窗口**，只把 alpha 压到 0，于是它就隐形地
+/// 杵在屏幕角落上：任务栏在顶上时，面板贴的正是右上角，那块地方是窗口的关闭按钮，
+/// 用户点不着还找不到是谁挡的（关掉动画时 `park_window` 走的是同一条路）。
+///
+/// 挪到屏幕外是另一条路；这里兜住所有「看不见但还在屏上」的情况，包括动画收尾那一帧。
+unsafe fn sync_click_through(hwnd: HWND, alpha: u8) {
+    // 提示条自己按光标位置开关的穿透也要算进来：淡出那一帧 alpha 从 255 往下掉，
+    // 不能顺手把「影子那一圈穿透」重新打开成「整窗可点」。
+    let hollow = hollow_windows()
+        .lock()
+        .ok()
+        .and_then(|windows| windows.get(&(hwnd.0 as isize)).copied())
+        .unwrap_or(false);
+    apply_click_through(hwnd, alpha == 0 || hollow);
+}
+
 /// 整个窗口的不透明度（0.0 ~ 1.0），照搬 QcClip 的 `set_window_opacity`。
 ///
 /// 弹出时必须先把窗口设成全透明再 `ShowWindow`：窗口一露头，DWM 会立刻画出
@@ -714,6 +894,8 @@ pub fn set_opacity(window: &Window, opacity: f32) {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED.0 as isize);
         }
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+        // 全透明 = 看不见，却还占着那块屏幕：不挂穿透的话点击会被它吃掉。
+        sync_click_through(hwnd, alpha);
     }
 }
 

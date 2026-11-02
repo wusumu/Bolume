@@ -21,7 +21,7 @@ use crate::{
         ActivityEffect, AppBlockEntry, AppBlockKind, BrightnessMergeSide, BrightnessPlacement,
         Config, ConfigStore,
         DisplayNameMode, FooterSide, Hotkey, HotkeySlots, MAX_TOOLTIP_LINE_CHARS, MAX_TOOLTIP_LINES,
-        OsdAnchor, OsdAnimStyle, OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout,
+        OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout,
         PopupAnimStyle, TrayIconStyle, TrayMotion,
     },
     display::DisplayInfo,
@@ -30,7 +30,8 @@ use crate::{
     tray::render_tooltip,
     ui::{
         DEVICE_ICON_CHOICES, Picker, ScrollDragState, Scrollbar,
-        color::{hex_of, hsv_to_rgb, parse_rgb, push_hex, rgb_to_hsv},
+        color::{hex_of, hsv_to_rgb, parse_rgb, rgb_to_hsv},
+        picker::{HexEdit, HexHandlers, hex_field},
         device_icon_resolved,
         footer_preview::FooterEdit,
         icon, theme,
@@ -310,6 +311,11 @@ fn page_fields(page: Page) -> &'static [&'static str] {
             "hotkey_repeat_actions",
             "hotkey_ignore_system_repeat",
             "hotkey_swallow_raw",
+            "hotkey_screen_hold_repeat",
+            "hotkey_screen_repeat_interval",
+            "hotkey_screen_repeat_delay",
+            "hotkey_screen_ignore_system_repeat",
+            "hotkey_screen_swallow_raw",
         ],
         Page::Osd => &["osd", "editor_bg", "editor_panel_w"],
         Page::Blocklist => &["app_block"],
@@ -496,6 +502,11 @@ pub struct Settings {
     osd_text_edit: Option<(u8, String)>,
     /// 「保持显示」是不是开着（设置页自己的状态，和按钮文案一致）。
     osd_pinned: bool,
+    /// 「预览屏幕提示」正在预览哪一套模板（音量 / 媒体键 / 亮度）。
+    ///
+    /// 三套的尺寸、位置、内容都不一样，只弹音量那套的话，按媒体键和亮度键
+    /// 时卡片长什么样、压在哪个角落，在设置页根本看不到。
+    osd_preview: crate::config::OsdTemplate,
     /// 标题栏按下了但还没开始拖：真正的拖动等鼠标动起来再交给系统。
     ///
     /// **不能在按下的瞬间就 `start_window_move()`** —— 那会立刻进系统的标题栏拖动
@@ -615,8 +626,6 @@ enum DevicePicker {
     AddDeviceState,
     /// 手动往「启动时设置应用音量」的名单里加一个应用。
     AddAppVolume,
-    /// 屏幕提示「手动选择显示器」那行的下拉（列所有显示器）。
-    OsdMonitor,
 }
 
 /// 托盘提示的编辑目标：正常状态 / 静音状态，各有一份模板。
@@ -1176,12 +1185,7 @@ enum NumberField {
     OsdCorner,
     /// OSD 不透明度（百分比）。
     OsdOpacity,
-    /// OSD 指定坐标：相对显示器左上角的水平 / 垂直偏移。
-    OsdX,
-    OsdY,
-    /// OSD 淡入 / 淡出 / 停留时长（毫秒）。
-    OsdFadeIn,
-    OsdFadeOut,
+    /// OSD 停留时长（毫秒）。
     OsdHold,
     /// OSD 里某个元素自己的尺寸（图标边长 / 字号 / 音量条厚度，逻辑像素）。
     OsdSize(OsdPart),
@@ -1209,6 +1213,11 @@ enum NumberField {
     HotkeyRepeatInterval,
     /// 按住多久才开始连发（毫秒，0 = 不等）。
     HotkeyRepeatDelay,
+    /// 屏幕页那一套的连发间隔（毫秒）。和 `HotkeyRepeatInterval` 是两个字段：
+    /// 两个页签的设置互不共用。
+    ScreenRepeatInterval,
+    /// 屏幕页那一套的连发延迟（毫秒）。
+    ScreenRepeatDelay,
     /// 「指定显示器」那组亮度快捷键调第几台（1 起）。
     BrightnessHotkeyMonitor,
     /// 亮度快捷键自己的步进（百分点，0 = 跟面板的「亮度步进」）。
@@ -1295,10 +1304,6 @@ impl NumberField {
             Self::OsdHeight => config.osd.height,
             Self::OsdCorner => config.osd.corner,
             Self::OsdOpacity => config.osd.opacity,
-            Self::OsdX => config.osd.custom_x,
-            Self::OsdY => config.osd.custom_y,
-            Self::OsdFadeIn => config.osd.fade_in_ms,
-            Self::OsdFadeOut => config.osd.fade_out_ms,
             Self::OsdHold => config.osd.hold_ms,
             Self::OsdSize(part) => config.osd.part(part).size,
             Self::DeviceNameSize => config.device_name_size,
@@ -1309,6 +1314,8 @@ impl NumberField {
             Self::TrayMotionGain => config.tray_motion_gain,
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval,
             Self::HotkeyRepeatDelay => config.hotkey_repeat_delay,
+            Self::ScreenRepeatInterval => config.hotkey_screen_repeat_interval,
+            Self::ScreenRepeatDelay => config.hotkey_screen_repeat_delay,
             Self::BrightnessHotkeyMonitor => config.brightness.hotkey_monitor,
             Self::BrightnessHotkeyStep => config.brightness.hotkey_step,
             // 两个都是整数百分比 / 级别，直接就是显示值。
@@ -1390,8 +1397,6 @@ impl NumberField {
             Self::OsdCorner => (0, 160),
             // 太透明就看不见字了，最低给 20%。
             Self::OsdOpacity => (20, 100),
-            Self::OsdX | Self::OsdY => (0, 4000),
-            Self::OsdFadeIn | Self::OsdFadeOut => (0, 2000),
             Self::OsdHold => (200, 10000),
             Self::OsdSize(part) => part.size_range(),
             // 比 9 号再小就糊成一团，20 号以外设备名会溢出成三行。
@@ -1403,8 +1408,12 @@ impl NumberField {
             Self::UiContrast => crate::config::UI_CONTRAST_RANGE,
             Self::TrayMenuWidth => crate::config::TRAY_MENU_WIDTH_RANGE,
             Self::TrayMotionGain => crate::config::TRAY_MOTION_GAIN_RANGE,
-            Self::HotkeyRepeatInterval => crate::config::HOTKEY_REPEAT_RANGE,
-            Self::HotkeyRepeatDelay => crate::config::HOTKEY_REPEAT_DELAY_RANGE,
+            Self::HotkeyRepeatInterval | Self::ScreenRepeatInterval => {
+                crate::config::HOTKEY_REPEAT_RANGE
+            }
+            Self::HotkeyRepeatDelay | Self::ScreenRepeatDelay => {
+                crate::config::HOTKEY_REPEAT_DELAY_RANGE
+            }
             // 台数上限按 8 给：再多的场面亮度面板本来也放不下。
             Self::BrightnessHotkeyMonitor => (1, 8),
             Self::BrightnessHotkeyStep => crate::config::BRIGHTNESS_HOTKEY_STEP_RANGE,
@@ -1474,10 +1483,6 @@ impl NumberField {
             Self::OsdHeight => with_volume_osd(config, |osd| osd.set_card(|c| c.height = value)),
             Self::OsdCorner => with_volume_osd(config, |osd| osd.set_card(|c| c.corner = value)),
             Self::OsdOpacity => with_volume_osd(config, |osd| osd.set_card(|c| c.opacity = value)),
-            Self::OsdX => config.osd.custom_x = value,
-            Self::OsdY => config.osd.custom_y = value,
-            Self::OsdFadeIn => config.osd.fade_in_ms = value,
-            Self::OsdFadeOut => config.osd.fade_out_ms = value,
             Self::OsdHold => config.osd.hold_ms = value,
             Self::OsdSize(part) => with_volume_osd(config, |osd| osd.set_part_size(part, value)),
             Self::DeviceNameSize => config.device_name_size = value,
@@ -1488,6 +1493,8 @@ impl NumberField {
             Self::TrayMotionGain => config.tray_motion_gain = value,
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval = value,
             Self::HotkeyRepeatDelay => config.hotkey_repeat_delay = value,
+            Self::ScreenRepeatInterval => config.hotkey_screen_repeat_interval = value,
+            Self::ScreenRepeatDelay => config.hotkey_screen_repeat_delay = value,
             Self::BrightnessHotkeyMonitor => config.brightness.hotkey_monitor = value,
             Self::BrightnessHotkeyStep => config.brightness.hotkey_step = value,
             Self::LoudnessLevel => config.loudness.level = value.clamp(1, 100),
@@ -1581,8 +1588,6 @@ impl NumberField {
             Self::PanelBarRound => format!("{value}%"),
             Self::OsdWidth | Self::OsdHeight | Self::OsdCorner => format!("{value} px"),
             Self::OsdOpacity => format!("{value}%"),
-            Self::OsdX | Self::OsdY => format!("{value} px"),
-            Self::OsdFadeIn | Self::OsdFadeOut => format!("{value} ms"),
             Self::OsdHold => format!("{:.1} s", value as f32 / 1000.0),
             Self::OsdSize(_) => format!("{value} px"),
             Self::DeviceNameSize => format!("{value} px"),
@@ -1590,7 +1595,10 @@ impl NumberField {
             Self::UiOpacity | Self::UiContrast => format!("{value}%"),
             Self::TrayMenuWidth => format!("{value} px"),
             Self::TrayMotionGain => format!("{value}%"),
-            Self::HotkeyRepeatInterval | Self::HotkeyRepeatDelay => format!("{value} ms"),
+            Self::HotkeyRepeatInterval
+            | Self::HotkeyRepeatDelay
+            | Self::ScreenRepeatInterval
+            | Self::ScreenRepeatDelay => format!("{value} ms"),
             Self::BrightnessHotkeyMonitor => format!("#{value}"),
             Self::BrightnessHotkeyStep => {
                 if value == 0 {
@@ -1632,15 +1640,13 @@ impl NumberField {
             5
         } else if matches!(
             self,
-            Self::OsdX
-                | Self::OsdY
-                | Self::OsdFadeIn
-                | Self::OsdFadeOut
                 | Self::OsdWidth
                 | Self::OsdHeight
                 | Self::PopupAnimation
                 | Self::HotkeyRepeatInterval
                 | Self::HotkeyRepeatDelay
+                | Self::ScreenRepeatInterval
+                | Self::ScreenRepeatDelay
         ) {
             4
         } else {
@@ -1668,7 +1674,7 @@ impl NumberField {
     fn stepped(self, current: i32, direction: i32) -> i32 {
         let (low, high) = self.range();
         // 连发延迟的 0 是正经值（「不等」），不是占位值：往上按一格就是 50ms。
-        if matches!(self, Self::HotkeyRepeatDelay) {
+        if matches!(self, Self::HotkeyRepeatDelay | Self::ScreenRepeatDelay) {
             return (current + direction * self.step_size()).clamp(low, high);
         }
         if direction > 0 && current == low && low == 0 {
@@ -1695,7 +1701,7 @@ impl NumberField {
     /// 给一个「一眼能看出来」的步长；要精确值直接点数字输入。
     fn step_size(self) -> i32 {
         match self {
-            Self::OsdWidth | Self::OsdHeight | Self::OsdX | Self::OsdY => 8,
+            Self::OsdWidth | Self::OsdHeight => 8,
             // 面板宽度一像素一像素地调才有意义（滑条长度直接跟着变）。
             Self::BrightnessWidth => 1,
             Self::FlyoutWidth | Self::TrayMenuWidth => 8,
@@ -1704,7 +1710,6 @@ impl NumberField {
             Self::BrightnessVerticalHeight | Self::FlyoutVerticalHeight => 8,
             Self::OsdCorner => 2,
             Self::OsdOpacity => 5,
-            Self::OsdFadeIn | Self::OsdFadeOut => 20,
             Self::OsdHold => 100,
             // 字号按 0.5px 走（内部十分之一），不透明度按 5%：
             // 一像素 / 1% 一按看不出来，精确值直接点数字输入。
@@ -1968,6 +1973,8 @@ struct ColorWheel {
     picker: Picker,
     /// 正在屏幕上取色（窗口已藏起来）。
     picking: bool,
+    /// 右键菜单的位置（窗口坐标）。`None` = 没弹。
+    menu: Option<(f32, f32)>,
 }
 
 impl ColorWheel {
@@ -1986,6 +1993,7 @@ impl ColorWheel {
             y,
             picker: Picker::new(h, s, v, hex_of(rgb)),
             picking: false,
+            menu: None,
         }
     }
 }
@@ -2139,6 +2147,7 @@ impl Settings {
             text_marked: None,
             osd_text_edit: None,
             osd_pinned: false,
+            osd_preview: crate::config::OsdTemplate::Volume,
             titlebar_armed: false,
             window_closed: None,
             block_pick: None,
@@ -8693,21 +8702,34 @@ impl Settings {
             ))
             .into_any_element();
 
-        // 「按下时不发送原始按键」对两个页签都成立：音量键和亮度键一视同仁，
-        // 所以它放在页签**下面**、两张页签都能看到，不跟着切。
-        let swallow_raw = self.toggle_row(
+        // 「按下时不发送原始按键」也是**按页签各存一份**：音频页开了只管音量 /
+        // 媒体键那一套，屏幕页的组合照旧发给前台。所以两张页签各建一行，
+        // 共用同一段文案，切到哪页显示哪份的值。
+        let swallow_hint = lang.pick(
+            "比如 Ctrl+Alt+方向键：打开后那颗方向键不会落到前台程序，翻页、移动光标都不会发生 —— 这些组合改由键盘钩子拦下，连用 Raw Input 读键盘的游戏也收不到；关掉则照常发给前台程序（音量、播放键除外，它们本来就被接管，放行会重复触发）",
+            "With Ctrl+Alt+Arrow, the arrow never reaches the focused app while this is on — no page flip, no caret move, and even games reading Raw Input never see the key. Turn it off and the key is passed through as usual — except the volume and playback keys, which are taken over anyway and would fire twice",
+        );
+        let swallow_title = lang.pick(
+            "按下快捷键时不发送原始按键",
+            "Don't pass the original key through",
+        );
+        let swallow_raw_audio = self.toggle_row(
             "hotkey-swallow-raw",
-            lang.pick(
-                "按下快捷键时不发送原始按键",
-                "Don't pass the original key through",
-            ),
-            lang.pick(
-                "比如 Ctrl+Alt+方向键：触发时那颗方向键不会落到前台程序，翻页、移动光标都不会发生。打开后这些组合改由键盘钩子接管（连用 Raw Input 读键盘的游戏也收不到）",
-                "With Ctrl+Alt+Arrow, the arrow never reaches the focused app — no page flip, no caret move. Combos are then taken by the keyboard hook, so even games reading Raw Input never see the key",
-            ),
+            swallow_title,
+            swallow_hint,
             config.hotkey_swallow_raw,
             self.bind(|config| {
                 config.hotkey_swallow_raw = !config.hotkey_swallow_raw;
+                crate::platform::hotkey::apply_config(config);
+            }),
+        );
+        let swallow_raw_screen = self.toggle_row(
+            "hotkey-screen-swallow-raw",
+            swallow_title,
+            swallow_hint,
+            config.hotkey_screen_swallow_raw,
+            self.bind(|config| {
+                config.hotkey_screen_swallow_raw = !config.hotkey_screen_swallow_raw;
                 crate::platform::hotkey::apply_config(config);
             }),
         );
@@ -8726,7 +8748,11 @@ impl Settings {
         out.push(self.section(
             lang.pick("按键行为", "Key behaviour"),
             "ban",
-            vec![swallow_raw],
+            vec![if self.shortcut_tab == 0 {
+                swallow_raw_audio
+            } else {
+                swallow_raw_screen
+            }],
         ));
         // 「按住连续触发」那一行和它管辖的勾选框圈成同一个框：开关在最上面、
         // 勾在每行最前面，不放到一起看不出「下面这些勾归上面这个开关管」。
@@ -8734,7 +8760,7 @@ impl Settings {
             out.push(self.section(
                 lang.pick("快捷键", "Shortcuts"),
                 "keyboard",
-                vec![self.repeat_group(config, lang, rows, cx)],
+                vec![self.repeat_group(config, lang, rows, false, cx)],
             ));
             out.push(self.section(
                 lang.pick("步进", "Step"),
@@ -8763,7 +8789,7 @@ impl Settings {
             out.push(self.section(
                 lang.pick("亮度快捷键", "Brightness shortcuts"),
                 "keyboard",
-                vec![self.repeat_group(config, lang, screen_rows, cx)],
+                vec![self.repeat_group(config, lang, screen_rows, true, cx)],
             ));
             out.push(self.section(
                 lang.pick("亮度快捷键设置", "Brightness shortcut settings"),
@@ -8779,11 +8805,15 @@ impl Settings {
     /// 只并成一张卡还不够：开关在最顶上、勾选框在每一行最前面，中间隔着七八行，
     /// 看着像两回事。给它们共同的一层边框和下沉底色，一眼就知道
     /// 「下面这些勾归上面这个开关管」。
+    ///
+    /// `screen` 决定写哪一份：音量页用 `hotkey_*`，屏幕页用 `hotkey_screen_*`。
+    /// 两个页签的设置互不共用 —— 在音量页把间隔调成 60ms，亮度的节奏不该跟着变。
     fn repeat_group(
         &self,
         config: &Config,
         lang: Lang,
         rows: Vec<AnyElement>,
+        screen: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
@@ -8795,7 +8825,7 @@ impl Settings {
             .border(px(1.))
             .border_color(theme::border())
             .bg(theme::surface_sunken())
-            .child(self.repeat_bar(config, lang, cx))
+            .child(self.repeat_bar(config, lang, screen, cx))
             .children(rows)
             .into_any_element()
     }
@@ -8805,23 +8835,43 @@ impl Settings {
     /// 原来这是单独一张卡片（标题一行、开关一行、子项两行），和「快捷键」卡片
     /// 上下叠着看很碎。并进来之后压成一行，具体哪个键连发交给每一行
     /// 最前面那个勾 —— 总闸只负责「全开 / 全关」。
-    fn repeat_bar(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
-        let toggle_on = self.bind(|config| {
-            config.hotkey_hold_repeat = !config.hotkey_hold_repeat;
+    fn repeat_bar(
+        &self,
+        config: &Config,
+        lang: Lang,
+        screen: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let toggle_on = self.bind(move |config| {
+            if screen {
+                config.hotkey_screen_hold_repeat = !config.hotkey_screen_hold_repeat;
+            } else {
+                config.hotkey_hold_repeat = !config.hotkey_hold_repeat;
+            }
             crate::platform::hotkey::apply_config(config);
         });
-        let toggle_ignore = self.bind(|config| {
-            config.hotkey_ignore_system_repeat = !config.hotkey_ignore_system_repeat;
+        let toggle_ignore = self.bind(move |config| {
+            if screen {
+                config.hotkey_screen_ignore_system_repeat =
+                    !config.hotkey_screen_ignore_system_repeat;
+            } else {
+                config.hotkey_ignore_system_repeat = !config.hotkey_ignore_system_repeat;
+            }
             crate::platform::hotkey::apply_config(config);
         });
 
-        let knob_x = if config.hotkey_hold_repeat { 16.0 } else { 2.0 };
+        let hold_on = if screen {
+            config.hotkey_screen_hold_repeat
+        } else {
+            config.hotkey_hold_repeat
+        };
+        let knob_x = if hold_on { 16.0 } else { 2.0 };
         let switch = div()
             .w(px(34.))
             .h(px(20.))
             .flex_none()
             .rounded(px(10.))
-            .bg(if config.hotkey_hold_repeat {
+            .bg(if hold_on {
                 theme::accent()
             } else {
                 theme::track()
@@ -8838,7 +8888,11 @@ impl Settings {
             );
 
         div()
-            .id("hotkey-repeat-bar")
+            .id(if screen {
+                "hotkey-screen-repeat-bar"
+            } else {
+                "hotkey-repeat-bar"
+            })
             .flex()
             .items_center()
             .gap(px(12.))
@@ -8847,7 +8901,11 @@ impl Settings {
             .rounded(px(theme::RADIUS_ROW))
             .child(
                 div()
-                    .id("hotkey-repeat-toggle")
+                    .id(if screen {
+                        "hotkey-screen-repeat-toggle"
+                    } else {
+                        "hotkey-repeat-toggle"
+                    })
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -8874,9 +8932,21 @@ impl Settings {
                             .child(lang.pick("延迟", "Delay")),
                     )
                     .child(self.number_stepper(
-                        "hotkey-repeat-delay",
-                        NumberField::HotkeyRepeatDelay,
-                        config.hotkey_repeat_delay as i32,
+                        if screen {
+                            "hotkey-screen-repeat-delay"
+                        } else {
+                            "hotkey-repeat-delay"
+                        },
+                        if screen {
+                            NumberField::ScreenRepeatDelay
+                        } else {
+                            NumberField::HotkeyRepeatDelay
+                        },
+                        if screen {
+                            config.hotkey_screen_repeat_delay as i32
+                        } else {
+                            config.hotkey_repeat_delay as i32
+                        },
                         lang,
                         cx,
                     )),
@@ -8893,16 +8963,32 @@ impl Settings {
                             .child(lang.pick("间隔", "Every")),
                     )
                     .child(self.number_stepper(
-                        "hotkey-repeat-interval",
-                        NumberField::HotkeyRepeatInterval,
-                        config.hotkey_repeat_interval as i32,
+                        if screen {
+                            "hotkey-screen-repeat-interval"
+                        } else {
+                            "hotkey-repeat-interval"
+                        },
+                        if screen {
+                            NumberField::ScreenRepeatInterval
+                        } else {
+                            NumberField::HotkeyRepeatInterval
+                        },
+                        if screen {
+                            config.hotkey_screen_repeat_interval as i32
+                        } else {
+                            config.hotkey_repeat_interval as i32
+                        },
                         lang,
                         cx,
                     )),
             )
             .child(
                 div()
-                    .id("hotkey-ignore-system-repeat")
+                    .id(if screen {
+                        "hotkey-screen-ignore-system-repeat"
+                    } else {
+                        "hotkey-ignore-system-repeat"
+                    })
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -8915,7 +9001,11 @@ impl Settings {
                             .text_color(theme::text_tertiary())
                             .child(lang.pick("忽略系统长按重复", "Ignore the system repeat")),
                     )
-                    .child(self.mini_switch(config.hotkey_ignore_system_repeat)),
+                    .child(self.mini_switch(if screen {
+                        config.hotkey_screen_ignore_system_repeat
+                    } else {
+                        config.hotkey_ignore_system_repeat
+                    })),
             )
             .into_any_element()
     }
@@ -9903,11 +9993,21 @@ impl Settings {
         // 「预览屏幕提示」：右边两个按钮 —— 弹一次看效果，或者钉住不消失。
         // 这两件事本来就是「看一眼」的两种做法，分成两行还各带一句说明，
         // 白占一行高度，所以并成一行。
+        // 「预览屏幕提示」：先挑要看哪一套（三套模板的大小、位置、内容都不同），
+        // 再看效果 —— 弹一次看看，或者钉住不消失、边看边调。
+        let previewed = self.osd_preview;
+        let preview_fn = match previewed {
+            crate::config::OsdTemplate::Volume => OsdFunction::Volume,
+            // 媒体键那一套随便挑一个媒体动作即可：四颗键共用同一套模板。
+            crate::config::OsdTemplate::Media => OsdFunction::PlayPause,
+            crate::config::OsdTemplate::Brightness => OsdFunction::Brightness,
+        };
         let pinned = self.osd_pinned;
-        let preview_row = div()
+
+        let mut preview_row = div()
             .flex()
-            .items_center()
-            .gap(px(10.))
+            .flex_col()
+            .gap(px(6.))
             .px(px(9.))
             .py(px(5.))
             .rounded(px(theme::RADIUS_ROW))
@@ -9915,8 +10015,6 @@ impl Settings {
                 div()
                     .flex()
                     .flex_col()
-                    .flex_1()
-                    .min_w_0()
                     .gap(px(2.))
                     .child(
                         div()
@@ -9929,233 +10027,140 @@ impl Settings {
                             .text_size(theme::fs(10.5))
                             .text_color(theme::text_tertiary())
                             .child(lang.pick(
-                                "弹出一次看看效果；保持显示则不自动消失，便于对照调整外观",
-                                "Show it once to check the look, or keep it on screen while you tweak",
+                                "三套模板各弹各的：挑一套看看效果；保持显示则不自动消失，便于对照调整外观",
+                                "Each template shows its own card. Pick one to check the look, or keep it on screen while you tweak",
                             )),
                     ),
-            )
-            .child(
+            );
+
+        // 三颗模板胶囊 + 两个按钮。
+        let mut controls = div().flex().items_center().gap(px(4.));
+        for (slot, label) in [
+            (
+                crate::config::OsdTemplate::Volume,
+                lang.pick("音量", "Volume"),
+            ),
+            (
+                crate::config::OsdTemplate::Media,
+                lang.pick("媒体键", "Media keys"),
+            ),
+            (
+                crate::config::OsdTemplate::Brightness,
+                lang.pick("亮度", "Brightness"),
+            ),
+        ] {
+            let on = previewed == slot;
+            let function = match slot {
+                crate::config::OsdTemplate::Volume => OsdFunction::Volume,
+                crate::config::OsdTemplate::Media => OsdFunction::PlayPause,
+                crate::config::OsdTemplate::Brightness => OsdFunction::Brightness,
+            };
+            controls = controls.child(
                 div()
-                    .id("osd-try-button")
+                    .id(SharedString::from(format!("osd-preview-{slot:?}")))
                     .flex_none()
-                    .px(px(9.))
-                    .py(px(3.))
+                    .px(px(8.))
+                    .py(px(2.))
                     .rounded(px(theme::RADIUS_SMALL))
-                    .bg(theme::track())
                     .cursor_pointer()
                     .text_size(theme::fs(11.))
-                    .text_color(theme::text_secondary())
-                    .hover(|style| style.bg(theme::surface_hover()))
-                    .on_click(cx.listener(|_, _: &ClickEvent, _window, cx| {
-                        crate::gui::show_osd(
-                            cx,
-                            crate::windows::osd::OsdRequest::device(OsdFunction::Volume),
-                        );
-                    }))
-                    .child(lang.pick("弹出一次", "Show once")),
-            )
-            .child(
-                div()
-                    .id("osd-pin-button")
-                    .flex_none()
-                    .px(px(9.))
-                    .py(px(3.))
-                    .rounded(px(theme::RADIUS_SMALL))
-                    .bg(if pinned {
-                        theme::accent_soft()
-                    } else {
-                        theme::track()
+                    .when(on, |style| {
+                        style
+                            .bg(theme::accent_soft())
+                            .text_color(theme::text_primary())
                     })
-                    .cursor_pointer()
-                    .text_size(theme::fs(11.))
-                    .text_color(if pinned {
-                        theme::text_primary()
-                    } else {
-                        theme::text_secondary()
+                    .when(!on, |style| {
+                        style
+                            .bg(theme::track())
+                            .text_color(theme::text_secondary())
+                            // 选中的那颗点完鼠标还压在它上面：悬停底色别把选中色盖掉。
+                            .hover(|style| style.bg(theme::surface_hover()))
                     })
-                    .hover(|style| style.bg(theme::surface_hover()))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        // 状态在设置页自己手里：按钮文案和实际命令永远一致。
-                        let next = !this.osd_pinned;
-                        crate::gui::set_osd_pinned(cx, next);
-                        this.osd_pinned = next;
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        if this.osd_preview == slot {
+                            return;
+                        }
+                        let previous = this.osd_preview;
+                        let previous_fn = match previous {
+                            crate::config::OsdTemplate::Volume => OsdFunction::Volume,
+                            crate::config::OsdTemplate::Media => OsdFunction::PlayPause,
+                            crate::config::OsdTemplate::Brightness => OsdFunction::Brightness,
+                        };
+                        this.osd_preview = slot;
+                        // 钉着的时候换一套：先把旧那张收掉，新的这套直接钉上，
+                        // 不然屏幕上会同时挂着两张不同的卡片。
+                        if this.osd_pinned {
+                            crate::gui::set_osd_pinned(cx, false, previous_fn);
+                            let request = crate::gui::preview_osd_request(cx, function);
+                            crate::gui::show_osd(cx, request);
+                            crate::gui::set_osd_pinned(cx, true, function);
+                        }
                         cx.notify();
                     }))
-                    .child(if pinned {
-                        lang.pick("收起", "Hide")
-                    } else {
-                        lang.pick("保持显示", "Keep on screen")
-                    }),
-            )
-            .into_any_element();
-
-        let anchor_options: &'static [(u32, &'static str)] = if lang.is_en() {
-            &[
-                (0, "Top left"),
-                (1, "Top"),
-                (2, "Top right"),
-                (3, "Bottom left"),
-                (4, "Bottom"),
-                (5, "Bottom right"),
-                (6, "Custom"),
-                (7, "Cursor"),
-            ]
-        } else {
-            &[
-                (0, "左上"),
-                (1, "中上"),
-                (2, "右上"),
-                (3, "左下"),
-                (4, "中下"),
-                (5, "右下"),
-                (6, "指定坐标"),
-                (7, "跟随鼠标"),
-            ]
-        };
-        let position = {
-            let store = self.config.clone();
-            self.choice_row(
-                "osd-anchor",
-                lang.pick("位置", "Position"),
-                lang.pick(
-                    "默认下居中，和 Windows 自带的音量提示同一位置",
-                    "Bottom centre by default, the same spot as the Windows volume flyout",
-                ),
-                anchor_options,
-                config.osd.anchor.index(),
-                move |value, window, cx| {
-                    let anchor = OsdAnchor::from_index(value);
-                    let _ = store
-                        .borrow_mut()
-                        .update(|config| config.osd.anchor = anchor);
-                    refresh_ui(window, cx);
-                },
-            )
-        };
-
-        // 指定坐标只在选中「指定坐标」时展开。
-        let mut coordinate_rows: Vec<AnyElement> = Vec::new();
-        if config.osd.anchor.is_custom() {
-            coordinate_rows.push(self.number_row(
-                "osd-x",
-                lang.pick("水平偏移", "Horizontal offset"),
-                lang.pick(
-                    "从所选显示器左上角往右多少像素",
-                    "Pixels from the left edge of the chosen display",
-                ),
-                NumberField::OsdX,
-                config,
-                lang,
-                cx,
-            ));
-            coordinate_rows.push(self.number_row(
-                "osd-y",
-                lang.pick("垂直偏移", "Vertical offset"),
-                lang.pick(
-                    "从所选显示器左上角往下多少像素",
-                    "Pixels from the top edge of the chosen display",
-                ),
-                NumberField::OsdY,
-                config,
-                lang,
-                cx,
-            ));
+                    .child(label),
+            );
         }
 
-        // 显示器：三段固定模式 + 「手动选择」（选中后下面才展开显示器下拉）。
-        //
-        // 以前是把每台显示器都摊成一个分段按钮，屏一多就横向铺不下；
-        // 现在固定四项，具体哪一台走下面那行下拉（`DevicePicker::OsdMonitor`）。
-        // 分段按钮上用两个不会和显示器序号撞车的值表示后两个模式。
-        const MONITOR_CURSOR: u32 = 1_000;
-        const MONITOR_ALL: u32 = 1_001;
-        const MONITOR_MANUAL: u32 = 1_002;
-        // 指定了某一台（`monitor != 0`）就是「手动选择」，`monitor == 0` 是主显示器。
-        let manual = config.osd.monitor_mode == crate::config::OsdMonitorMode::Single
-            && config.osd.monitor != 0;
-        let monitor = {
-            let store = self.config.clone();
-            let selected = match config.osd.monitor_mode {
-                crate::config::OsdMonitorMode::Single => {
-                    if config.osd.monitor == 0 { 0 } else { MONITOR_MANUAL }
-                }
-                crate::config::OsdMonitorMode::Cursor => MONITOR_CURSOR,
-                crate::config::OsdMonitorMode::All => MONITOR_ALL,
-            };
-            self.choice_row_owned(
-                "osd-monitor",
-                lang.pick("显示器", "Display"),
-                lang.pick(
-                    "提示条出现在哪块屏幕上；「手动选择」选中后下面会多一行下拉，全部显示器会每块屏各弹一张",
-                    "Which screen the card appears on. \"Pick a display\" opens a dropdown below; All displays shows one card per screen",
-                ),
-                vec![
-                    (0, lang.pick("主显示器", "Primary").to_string()),
-                    (
-                        MONITOR_MANUAL,
-                        lang.pick("手动选择", "Pick a display").to_string(),
-                    ),
-                    (
-                        MONITOR_CURSOR,
-                        lang.pick("跟随鼠标", "Follow cursor").to_string(),
-                    ),
-                    (
-                        MONITOR_ALL,
-                        lang.pick("全部显示器", "All displays").to_string(),
-                    ),
-                ],
-                selected,
-                move |value, window, cx| {
-                    let _ = store.borrow_mut().update(|config| match value {
-                        MONITOR_CURSOR => {
-                            config.osd.monitor_mode = crate::config::OsdMonitorMode::Cursor;
-                        }
-                        MONITOR_ALL => {
-                            config.osd.monitor_mode = crate::config::OsdMonitorMode::All;
-                        }
-                        MONITOR_MANUAL => {
-                            config.osd.monitor_mode = crate::config::OsdMonitorMode::Single;
-                            // 还没挑过具体哪台：先落到第一台，下拉才有东西可显示。
-                            if config.osd.monitor == 0 {
-                                if let Some((first, _)) =
-                                    crate::windows::osd::display_options().first()
-                                {
-                                    config.osd.monitor = *first;
-                                }
+        preview_row = preview_row.child(
+            controls
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("osd-try-button")
+                        .flex_none()
+                        .px(px(9.))
+                        .py(px(3.))
+                        .rounded(px(theme::RADIUS_SMALL))
+                        .bg(theme::track())
+                        .cursor_pointer()
+                        .text_size(theme::fs(11.))
+                        .text_color(theme::text_secondary())
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _window, cx| {
+                            let request = crate::gui::preview_osd_request(cx, preview_fn);
+                            crate::gui::show_osd(cx, request);
+                        }))
+                        .child(lang.pick("弹出一次", "Show once")),
+                )
+                .child(
+                    div()
+                        .id("osd-pin-button")
+                        .flex_none()
+                        .px(px(9.))
+                        .py(px(3.))
+                        .rounded(px(theme::RADIUS_SMALL))
+                        .bg(if pinned {
+                            theme::accent_soft()
+                        } else {
+                            theme::track()
+                        })
+                        .cursor_pointer()
+                        .text_size(theme::fs(11.))
+                        .text_color(if pinned {
+                            theme::text_primary()
+                        } else {
+                            theme::text_secondary()
+                        })
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            // 状态在设置页自己手里：按钮文案和实际命令永远一致。
+                            let next = !this.osd_pinned;
+                            if next {
+                                let request = crate::gui::preview_osd_request(cx, preview_fn);
+                                crate::gui::show_osd(cx, request);
                             }
-                        }
-                        _ => {
-                            config.osd.monitor_mode = crate::config::OsdMonitorMode::Single;
-                            config.osd.monitor = 0;
-                        }
-                    });
-                    refresh_ui(window, cx);
-                },
-            )
-        };
-
-        // 手动选择时才出现：一行下拉，显示当前那台，点开选。
-        let monitor_pick = if manual {
-            let current = crate::windows::osd::display_options()
-                .into_iter()
-                .find(|(value, _)| *value == config.osd.monitor)
-                .map(|(_, name)| name)
-                .unwrap_or_default();
-            Some(self.device_picker_row(
-                "osd-monitor-pick",
-                lang.pick("选择显示器", "Choose a display"),
-                lang.pick(
-                    "点开挑具体哪一台；选完下拉自动收起",
-                    "Click to pick the exact display; the list closes once you choose",
+                            crate::gui::set_osd_pinned(cx, next, preview_fn);
+                            this.osd_pinned = next;
+                            cx.notify();
+                        }))
+                        .child(if pinned {
+                            lang.pick("收起", "Hide")
+                        } else {
+                            lang.pick("保持显示", "Keep on screen")
+                        }),
                 ),
-                &current,
-                lang.pick("选择显示器", "Choose a display"),
-                DevicePicker::OsdMonitor,
-                cx,
-            ))
-        } else {
-            None
-        };
+        );
+        let preview_row = preview_row.into_any_element();
 
         let open_editor = self.action_row(
             "osd-open-editor",
@@ -10237,75 +10242,6 @@ impl Settings {
             ),
         ];
 
-        // 标题跟着风格走：选了「跟随系统」之后，这一项管的已经不是「淡入淡出」了。
-        let animate_title = if config.osd.anim_style.is_system() {
-            lang.pick("弹出动画", "Popup animation")
-        } else {
-            lang.pick("淡入淡出", "Fade")
-        };
-        let animate = self.toggle_row(
-            "osd-animate",
-            animate_title,
-            lang.pick(
-                "关掉就直接出现、直接消失",
-                "Turn off to appear and disappear instantly",
-            ),
-            config.osd.animate,
-            self.bind(|config| config.osd.animate = !config.osd.animate),
-        );
-        // 动画风格：就地淡入淡出，还是照系统音量条「滑上来 + 淡入」。
-        let anim_style = if config.osd.animate {
-            let store = self.config.clone();
-            Some(self.choice_row_owned(
-                "osd-anim-style",
-                lang.pick("动画风格", "Animation style"),
-                lang.pick(
-                    "「跟随系统」和 Windows 自己的音量条一样从下方滑上来，消失时滑回去",
-                    "\"Follow system\" slides up from below like the Windows volume bar, and slides back out",
-                ),
-                vec![
-                    (0, lang.pick("淡入淡出", "Fade").to_string()),
-                    (1, lang.pick("跟随系统", "Follow system").to_string()),
-                ],
-                config.osd.anim_style.index(),
-                move |value, window, cx| {
-                    let _ = store.borrow_mut().update(|config| {
-                        config.osd.anim_style = OsdAnimStyle::from_index(value)
-                    });
-                    refresh_ui(window, cx);
-                },
-            ))
-        } else {
-            None
-        };
-        let mut fade_rows: Vec<AnyElement> = Vec::new();
-        if config.osd.animate {
-            if let Some(style_row) = anim_style {
-                fade_rows.push(style_row);
-            }
-        }
-        // 「跟随系统」的时长由系统那套定，两个数字框这时候不摆出来。
-        if config.osd.animate && !config.osd.anim_style.is_system() {
-            let fade_in = self.number_row(
-                "osd-fade-in",
-                lang.pick("淡入时长", "Fade in"),
-                "",
-                NumberField::OsdFadeIn,
-                config,
-                lang,
-                cx,
-            );
-            let fade_out = self.number_row(
-                "osd-fade-out",
-                lang.pick("淡出时长", "Fade out"),
-                "",
-                NumberField::OsdFadeOut,
-                config,
-                lang,
-                cx,
-            );
-            fade_rows.push(self.sub_group(vec![fade_in, fade_out]));
-        }
         let hold = self.number_row(
             "osd-hold",
             lang.pick("停留时长", "Stay visible"),
@@ -10470,12 +10406,6 @@ impl Settings {
             }
         }
 
-        let mut position_rows = vec![position, monitor];
-        if let Some(pick) = monitor_pick {
-            position_rows.push(pick);
-        }
-        position_rows.extend(coordinate_rows);
-
         vec![
             self.section(
                 lang.pick("屏幕提示", "On-screen display"),
@@ -10488,11 +10418,6 @@ impl Settings {
                 vec![open_editor, preview],
             ),
             self.section(
-                lang.pick("屏幕提示弹出位置", "On-screen display position"),
-                "monitor",
-                position_rows,
-            ),
-            self.section(
                 lang.pick("显示内容", "Content"),
                 "info",
                 vec![takeover, self.sub_group(function_toggles)],
@@ -10503,14 +10428,9 @@ impl Settings {
                 filter_rows,
             ),
             self.section(
-                lang.pick("动画", "Animation"),
+                lang.pick("显示时长", "Display time"),
                 "power",
-                {
-                    let mut rows = vec![animate];
-                    rows.extend(fade_rows);
-                    rows.push(hold);
-                    rows
-                },
+                vec![hold],
             ),
             self.section(
                 lang.pick("鼠标", "Mouse"),
@@ -11087,94 +11007,142 @@ impl Settings {
     }
 
     /// 手输 / 粘贴色号时的按键；返回 true 表示这一键归取色器。
+    ///
+    /// 文本一变成合法色号就**立刻**应用 —— 原来非得回车才生效，粘贴完看着没反应，
+    /// 很容易以为没粘上。改动的落盘不归这里：设置页是草稿模式，攒到用户点底部
+    /// 「应用 / 保存」（或关窗时选「保存」）才算数，所以框里没有自己的「保存」。
+    /// 回车 / Esc 都只是**收起**这行输入，颜色该生效的早就生效了。
+    ///
+    /// 这一版还带光标和选区：点哪站哪、按住拖一段、`Ctrl+A / C / X / V`。
+    /// 色号只有七个字符，可以前「改中间一位」得删到那儿再重打。
     fn handle_color_key(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(mut buffer) = self
+        let Some(mut edit) = self
             .color_wheel
             .as_ref()
             .and_then(|wheel| wheel.picker.edit.clone())
         else {
             return false;
         };
-        // 刚点开输入框：第一下（打字 / 退格 / 粘贴）整串换掉，
-        // 不用先退格七次才能输入新的。回车 / Esc 不算「换掉」，照原样提交 / 放弃。
-        let fresh = self
-            .color_wheel
-            .as_ref()
-            .map(|wheel| wheel.picker.edit_fresh)
-            .unwrap_or(false);
         let key = event.keystroke.key.as_str();
-        let typed = key.chars().count() == 1;
-        let replaces = fresh && (typed || matches!(key, "backspace" | "v"));
-        if replaces {
-            buffer.clear();
-            if let Some(wheel) = self.color_wheel.as_mut() {
-                wheel.picker.edit_fresh = false;
-            }
+        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        let shift = event.keystroke.modifiers.shift;
+        let typed = event
+            .keystroke
+            .key_char
+            .as_ref()
+            .is_some_and(|text| text.chars().count() == 1);
+
+        // 刚点开：第一下打字 / 退格 / 粘贴整串换掉，不用先删七个字符。
+        if edit.fresh && (typed || matches!(key, "backspace" | "delete" | "v" | "x")) {
+            edit.select_all();
+            edit.fresh = false;
         }
+
         match key {
+            // 回车 / Esc：收起这行输入。没有「确认」这一步 —— 该生效的字母一进来
+            // 就生效了，剩下的事（写进配置）归底部那两颗按钮。
             "enter" | "escape" => {
-                let apply = key == "enter";
-                let target = self.color_wheel.as_ref().map(|wheel| wheel.target);
-                if let Some(wheel) = self.color_wheel.as_mut() {
-                    wheel.picker.edit = None;
-                }
-                // 空串 + 回车 = 清掉自选色，回到跟随。
-                if apply {
-                    if let Some(target) = target {
-                        match parse_rgb(&buffer) {
-                            Some(rgb) => {
-                                let (h, s, v) = rgb_to_hsv(rgb.0, rgb.1, rgb.2);
-                                self.apply_wheel_hsv(h, s, v, window, cx);
-                                return true;
-                            }
-                            None if buffer.trim().is_empty() => {
-                                self.set_custom_color(target, String::new(), window, cx);
-                                return true;
-                            }
-                            None => {}
-                        }
-                    }
-                }
-                refresh_ui(window, cx);
-                true
+                self.finish_color_edit(window, cx);
             }
             "backspace" => {
-                buffer.pop();
-                if let Some(wheel) = self.color_wheel.as_mut() {
-                    wheel.picker.edit = Some(buffer);
+                edit.backspace();
+                self.store_color_edit(edit, window, cx);
+            }
+            "delete" => {
+                edit.delete();
+                self.store_color_edit(edit, window, cx);
+            }
+            "left" => {
+                edit.left(shift);
+                self.store_color_edit(edit, window, cx);
+            }
+            "right" => {
+                edit.right(shift);
+                self.store_color_edit(edit, window, cx);
+            }
+            "home" => {
+                edit.home(shift);
+                self.store_color_edit(edit, window, cx);
+            }
+            "end" => {
+                edit.end(shift);
+                self.store_color_edit(edit, window, cx);
+            }
+            "a" if command => {
+                edit.select_all();
+                self.store_color_edit(edit, window, cx);
+            }
+            "c" if command => {
+                if let Some(text) = edit.selected_text() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
                 }
                 refresh_ui(window, cx);
-                true
             }
-            "v" if event.keystroke.modifiers.control => {
+            "x" if command => {
+                if let Some(text) = edit.selected_text() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    edit.delete();
+                    self.store_color_edit(edit, window, cx);
+                } else {
+                    refresh_ui(window, cx);
+                }
+            }
+            "v" if command => {
                 if let Some(text) = cx
                     .read_from_clipboard()
                     .and_then(|item| item.text().map(|text| text.to_string()))
                 {
-                    push_hex(&mut buffer, &text);
-                    if let Some(wheel) = self.color_wheel.as_mut() {
-                        wheel.picker.edit = Some(buffer);
-                    }
+                    edit.insert(&text);
+                    self.store_color_edit(edit, window, cx);
+                } else {
                     refresh_ui(window, cx);
                 }
-                true
             }
             _ => {
-                if let Some(text) = event.keystroke.key_char.as_ref() {
-                    push_hex(&mut buffer, text);
-                    if let Some(wheel) = self.color_wheel.as_mut() {
-                        wheel.picker.edit = Some(buffer);
+                if typed {
+                    if let Some(text) = event.keystroke.key_char.as_ref() {
+                        edit.insert(text);
                     }
+                    self.store_color_edit(edit, window, cx);
+                } else {
+                    refresh_ui(window, cx);
                 }
-                refresh_ui(window, cx);
-                true
             }
         }
+        true
+    }
+
+    /// 把编辑状态写回去，顺手实时预览：合法的色号当场生效（写进草稿），
+    /// 不合法就先只留在框里，等用户接着打。
+    fn store_color_edit(&mut self, edit: HexEdit, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(rgb) = parse_rgb(&edit.text) {
+            let (h, s, v) = rgb_to_hsv(rgb.0, rgb.1, rgb.2);
+            self.apply_wheel_hsv(h, s, v, window, cx);
+        }
+        if let Some(wheel) = self.color_wheel.as_mut() {
+            wheel.picker.edit = Some(edit);
+        }
+        refresh_ui(window, cx);
+    }
+
+    /// 收起色号编辑框：框里那一串已经实时生效了，收起后显示回色号读数。
+    fn finish_color_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(wheel) = self.color_wheel.as_mut() {
+            wheel.picker.edit = None;
+        }
+        refresh_ui(window, cx);
+    }
+
+    /// 点了弹层外面：直接收起。色号框没有自己的「保存」—— 颜色早就实时写进
+    /// 草稿了，落不落盘由底部「应用 / 保存」说了算，这里再问一遍只会多一道。
+    fn close_color_wheel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.color_wheel = None;
+        refresh_ui(window, cx);
     }
 
     /// 屏幕取色：把设置窗藏起来 → 等一次左键 → 采样 → 露回来。
@@ -13169,44 +13137,134 @@ impl Settings {
             (46.0_f32).min((height - PANEL_H - 8.0).max(8.0))
         };
 
-        let hex_text = match &edit {
-            Some(buffer) => format!("{buffer}|"),
-            None => hex.clone(),
-        };
-        let hex_box = div()
-            .id("set-hex")
-            .flex_1()
-            .h(px(24.))
-            .px(px(7.))
-            .flex()
-            .items_center()
-            .rounded(px(4.))
-            .bg(theme::track())
-            .border_1()
-            .border_color(if edit.is_some() {
-                theme::accent()
-            } else {
-                theme::border()
-            })
-            .cursor_text()
-            .text_size(theme::fs(11.))
-            .text_color(theme::text_primary())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
-                    if let Some(wheel) = this.color_wheel.as_mut() {
-                        if wheel.picker.edit.is_none() {
-                            wheel.picker.edit = Some(wheel.picker.hex.clone());
+        // 色号框：编辑中走共用的单行输入框（光标 / 选区 / 右键菜单都有），
+        // 不在编辑时就是一行只读的色号。
+        let hex_box = {
+            let this = this.clone();
+            let press_this = this.clone();
+            let press = Rc::new(
+                move |col: usize, extend: bool, window: &mut Window, cx: &mut App| {
+                    let _ = press_this.update(cx, |this, cx| {
+                        let hex = this
+                            .color_wheel
+                            .as_ref()
+                            .map(|wheel| wheel.picker.hex.clone())
+                            .unwrap_or_default();
+                        if let Some(wheel) = this.color_wheel.as_mut() {
+                            if wheel.picker.edit.is_none() {
+                                // 第一次点进来：整串选中（和浏览器地址栏一样）——
+                                // 想换一色直接打字，想改某一位再点一下那个字。
+                                let mut edit = HexEdit::new(&hex);
+                                edit.select_all();
+                                edit.drag = true;
+                                wheel.picker.edit = Some(edit);
+                            } else if let Some(edit) = wheel.picker.edit.as_mut() {
+                                // 已经在编辑：点哪站哪（点第几个字由逐字命中区给）。
+                                // 光标既然落到具体位置了，下一键就该插在那儿，
+                                // 不能再当「整串换掉」。
+                                edit.fresh = false;
+                                edit.drag = true;
+                                edit.move_to(col, extend);
+                            }
                         }
-                        // 整串默认是「选中」状态：直接打字 / 粘贴 / 退格就换掉。
-                        wheel.picker.edit_fresh = true;
+                        this.focus.focus(window, cx);
+                        refresh_ui(window, cx);
+                    });
+                },
+            ) as Rc<dyn Fn(usize, bool, &mut Window, &mut App)>;
+            let drag_this = this.clone();
+            let drag = Rc::new(move |col: usize, window: &mut Window, cx: &mut App| {
+                let _ = drag_this.update(cx, |this, cx| {
+                    let Some(wheel) = this.color_wheel.as_mut() else {
+                        return;
+                    };
+                    if !wheel.picker.edit.as_ref().is_some_and(|edit| edit.drag) {
+                        return;
                     }
-                    this.focus.focus(window, cx);
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(hex_text);
+                    if let Some(edit) = wheel.picker.edit.as_mut() {
+                        edit.move_to(col, true);
+                    }
+                    refresh_ui(window, cx);
+                });
+            }) as Rc<dyn Fn(usize, &mut Window, &mut App)>;
+            let release_this = this.clone();
+            let release = Rc::new(move |cx: &mut App| {
+                let _ = release_this.update(cx, |this, _cx| {
+                    if let Some(wheel) = this.color_wheel.as_mut() {
+                        if let Some(edit) = wheel.picker.edit.as_mut() {
+                            edit.drag = false;
+                        }
+                    }
+                });
+            }) as Rc<dyn Fn(&mut App)>;
+            let menu_this = this.clone();
+            let context = Rc::new(move |x: f32, y: f32, window: &mut Window, cx: &mut App| {
+                let _ = menu_this.update(cx, |this, cx| {
+                    if let Some(wheel) = this.color_wheel.as_mut() {
+                        wheel.menu = Some((x, y));
+                    }
+                    refresh_ui(window, cx);
+                });
+            }) as Rc<dyn Fn(f32, f32, &mut Window, &mut App)>;
+
+            div()
+                .id("set-hex")
+                .flex_1()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .bg(theme::track())
+                .border_1()
+                .border_color(if edit.is_some() {
+                    theme::accent()
+                } else {
+                    theme::border()
+                })
+                .cursor_text()
+                .text_size(theme::fs(11.))
+                .text_color(theme::text_primary())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
+                        // 只负责兜底：点在字以外的地方（左侧留白 / 竖条）时把编辑框
+                        // 打开并全选。已经在编辑态就别动光标 —— 里面的逐字命中区
+                        // 已经把光标放好了，这里再来一次全选会把它抹掉。
+                        if let Some(wheel) = this.color_wheel.as_mut() {
+                            if wheel.picker.edit.is_none() {
+                                let hex = wheel.picker.hex.clone();
+                                let mut edit = HexEdit::new(&hex);
+                                edit.drag = true;
+                                wheel.picker.edit = Some(edit);
+                            }
+                        }
+                        this.focus.focus(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(match &edit {
+                    Some(edit) => hex_field(
+                        "set",
+                        edit,
+                        11.0,
+                        22.,
+                        HexHandlers {
+                            press,
+                            drag,
+                            release,
+                            context,
+                        },
+                    ),
+                    None => div()
+                        .flex()
+                        .items_center()
+                        .h(px(22.))
+                        .pl(px(6.))
+                        .child(hex.clone())
+                        .into_any_element(),
+                })
+        };
 
         let footer = div()
             .flex()
@@ -13262,7 +13320,6 @@ impl Settings {
                         wheel.picker.set_hex(hex.clone());
                     }
                     wheel.picker.edit = None;
-                    wheel.picker.edit_fresh = false;
                 }
                 refresh_ui(window, cx);
             }))
@@ -13271,6 +13328,113 @@ impl Settings {
             } else {
                 lang.pick("跟随系统", "Follow Windows")
             });
+
+        // 右键菜单：剪切 / 复制 / 粘贴 / 全选。
+        let mut extras: Vec<AnyElement> = Vec::new();
+        if let Some((menu_x, menu_y)) = wheel.menu {
+            let item = |id: &'static str,
+                        label: String,
+                        kind: &'static str,
+                        lang: Lang| {
+                let this = cx.entity().downgrade();
+                div()
+                    .id(id)
+                    .px(px(10.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(theme::fs(11.))
+                    .text_color(theme::text_primary())
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = this.update(cx, |this, cx| {
+                            let Some(mut edit) = this
+                                .color_wheel
+                                .as_ref()
+                                .and_then(|wheel| wheel.picker.edit.clone())
+                            else {
+                                return;
+                            };
+                            if let Some(wheel) = this.color_wheel.as_mut() {
+                                wheel.menu = None;
+                            }
+                            match kind {
+                                "cut" => {
+                                    if let Some(text) = edit.selected_text() {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                                        edit.delete();
+                                    }
+                                }
+                                "copy" => {
+                                    if let Some(text) = edit.selected_text() {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                                    }
+                                }
+                                "paste" => {
+                                    if let Some(text) = cx.read_from_clipboard().and_then(|item| {
+                                        item.text().map(|text| text.to_string())
+                                    }) {
+                                        edit.insert(&text);
+                                    }
+                                }
+                                _ => edit.select_all(),
+                            }
+                            this.store_color_edit(edit, window, cx);
+                        });
+                    })
+                    .child(label)
+                    .into_any_element()
+            };
+            extras.push(
+                div()
+                    .id("set-hex-menu")
+                    .absolute()
+                    // 右键给的是**窗口坐标**，而这块是弹层的孩子（定位基准是弹层
+                    // 左上角），不减掉原点菜单会跑到窗口另一头去；减完再按窗口
+                    // 尺寸收一下，别让菜单出界。
+                    .left(px(menu_x.min(width - 130.0).max(4.0) - left))
+                    .top(px(menu_y.min(height - 120.0).max(4.0) - top))
+                    .w(px(120.))
+                    .p(px(3.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .occlude()
+                    .rounded(px(theme::RADIUS_ROW))
+                    .bg(theme::opaque(theme::surface_elevated()))
+                    .border_1()
+                    .border_color(theme::border_strong())
+                    // 菜单多半就摆在色块上面：不拦一下，点「复制」会顺手把
+                    // 底下的色块拖成那个点的颜色（gpui 的鼠标事件不是独占的）。
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
+                    )
+                    .child(item("set-hex-cut", lang.pick("剪切", "Cut").to_string(), "cut", lang))
+                    .child(item(
+                        "set-hex-copy",
+                        lang.pick("复制", "Copy").to_string(),
+                        "copy",
+                        lang,
+                    ))
+                    .child(item(
+                        "set-hex-paste",
+                        lang.pick("粘贴", "Paste").to_string(),
+                        "paste",
+                        lang,
+                    ))
+                    .child(item(
+                        "set-hex-all",
+                        lang.pick("全选", "Select all").to_string(),
+                        "all",
+                        lang,
+                    ))
+                    .into_any_element(),
+            );
+        }
+
 
         Some(
             div()
@@ -13283,9 +13447,8 @@ impl Settings {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
-                        if this.color_wheel.take().is_some() {
-                            refresh_ui(window, cx);
-                        }
+                        // 色号框里还有没保存的改动时先问一句，别让改动悄悄留下或丢掉。
+                        this.close_color_wheel(window, cx);
                     }),
                 )
                 .child(
@@ -13330,10 +13493,11 @@ impl Settings {
                                 .text_size(theme::fs(9.5))
                                 .text_color(theme::text_tertiary())
                                 .child(lang.pick(
-                                    "拖色块选色 · 点色号可粘贴 · 回车确认",
-                                    "Drag to pick · click the hex to paste · Enter to apply",
+                                    "拖色块选色 · 色号可直接编辑",
+                                    "Drag to pick · the hex is editable",
                                 )),
-                        ),
+                        )
+                        .children(extras),
                 )
                 .into_any_element(),
         )
@@ -13582,23 +13746,8 @@ impl Settings {
                 .child(text)
         };
 
-        // 「添加到名单」、选设备、选显示器共用一套弹出层：选项来源不同而已。
+        // 「添加到名单」、选设备共用一套弹出层：选项来源不同而已。
         match which {
-            DevicePicker::OsdMonitor => {
-                let options = crate::windows::osd::display_options();
-                if options.is_empty() {
-                    list = list.child(hint(lang.pick("没有检测到显示器", "No displays found")));
-                } else {
-                    for (value, name) in options {
-                        list = list.child(self.monitor_menu_row(
-                            value,
-                            &name,
-                            value == config.osd.monitor,
-                            cx,
-                        ));
-                    }
-                }
-            }
             DevicePicker::StartupDefault | DevicePicker::BoundDevice => {
                 let current_id = match which {
                     DevicePicker::StartupDefault => config.startup.default_device_id.clone(),
@@ -13763,57 +13912,6 @@ impl Settings {
         )
     }
 
-    /// 设备列表里的一行：图标 + 名字 +（选中的那个打勾）。
-    /// 显示器下拉里的一行：名字 + 勾选，点一下定下 `osd.monitor`。
-    fn monitor_menu_row(
-        &self,
-        value: u32,
-        name: &str,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let store = self.config.clone();
-        let name = SharedString::from(name.to_string());
-        div()
-            .id(SharedString::from(format!("osd-monitor-{value}")))
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(8.))
-            .px(px(6.))
-            .py(px(5.))
-            .rounded(px(theme::RADIUS_SMALL))
-            .cursor_pointer()
-            .when(selected, |style| style.bg(theme::accent_soft()))
-            .hover(|style| style.bg(theme::surface_hover()))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                let _ = store.borrow_mut().update(|config| {
-                    config.osd.monitor_mode = crate::config::OsdMonitorMode::Single;
-                    config.osd.monitor = value;
-                });
-                // 选完就收起来，不用再点一下。
-                this.picker = None;
-                refresh_ui(window, cx);
-            }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(theme::fs(11.5))
-                    .text_color(if selected {
-                        theme::accent()
-                    } else {
-                        theme::text_primary()
-                    })
-                    .child(name),
-            )
-            .when(selected, |style| {
-                style.child(icon("check", 13.0, theme::accent()))
-            })
-            .into_any_element()
-    }
-
     fn device_menu_row(
         &self,
         id: &str,
@@ -13852,10 +13950,8 @@ impl Settings {
                         config.volume_cap.device_id = id.clone();
                         config.volume_cap.device_name = name.clone();
                     }
-                    // 「添加」两种各有一行，显示器那行也各有一份，都走不到这里。
-                    DevicePicker::AddDeviceState
-                    | DevicePicker::AddAppVolume
-                    | DevicePicker::OsdMonitor => {}
+                    // 「添加」那两行各有各的入口，都走不到这里。
+                    DevicePicker::AddDeviceState | DevicePicker::AddAppVolume => {}
                 });
                 if which == DevicePicker::BoundDevice {
                     crate::gui::refresh_volume_cap(cx);
@@ -16333,7 +16429,27 @@ impl Settings {
             })
         };
 
-        let _ = self.config.borrow_mut().commit_draft();
+        // 写不进去就别装作保存好了：留着草稿、也别关窗，把原因记一笔 ——
+        // 否则用户按了「保存」，窗口一关改动全没了，还查不出为什么。
+        if let Err(error) = self.config.borrow_mut().commit_draft() {
+            crate::platform::logfile::append(
+                "crash.log",
+                &format!("配置保存失败：{error}"),
+            );
+            let lang = self.config.borrow().get().language;
+            self.profile_notice_seq += 1;
+            self.profile_notice = Some((
+                lang.pick(
+                    "保存失败：改动还留在草稿里",
+                    "Could not save — your changes are still here",
+                )
+                .to_string(),
+                self.profile_notice_seq,
+            ));
+            window.refresh();
+            cx.notify();
+            return;
+        }
         let config = self.config.borrow().get().clone();
         // 落盘之后档文件也更新过了（镜像），列表里的「正在使用」与「多久之前」跟着重算。
         self.reload_profiles();
@@ -16909,11 +17025,6 @@ impl Render for Settings {
                 }
                 DevicePicker::AddDeviceState => config.startup.device_state_mode.uses_list(),
                 DevicePicker::AddAppVolume => config.startup.set_app_volumes,
-                // 选了「手动选择」那一档这一行才存在。
-                DevicePicker::OsdMonitor => {
-                    config.osd.monitor_mode == crate::config::OsdMonitorMode::Single
-                        && config.osd.monitor != 0
-                }
             };
             if !alive {
                 self.picker = None;

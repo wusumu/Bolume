@@ -88,9 +88,12 @@ const WM_APPLY: u32 = WM_APP + 1;
 static DESIRED: OnceLock<Mutex<Vec<(u32, u32, u32)>>> = OnceLock::new();
 /// 实际注册成功的 id，重新注册前先按它逐个注销。
 static REGISTERED: OnceLock<Mutex<Vec<i32>>> = OnceLock::new();
-/// 需要走低级钩子的组合：(mods, vk)。媒体键 / 浏览器键，以及会被小键盘冒充的
+/// 需要走低级钩子的组合：(mods, vk, 动作 id)。媒体键 / 浏览器键，以及会被小键盘冒充的
 /// 方向键那一组（那组要按扩展位分辨真假，`RegisterHotKey` 分不出来）。
-static HOOK_BINDINGS: OnceLock<Mutex<Vec<(u32, u32)>>> = OnceLock::new();
+///
+/// 带上动作 id 是因为「不发送原始按键」「忽略系统重复」两项目前都是**按页签**存的：
+/// 钩子里只拿得到键码，得先认出这个组合是哪个动作，才知道该问哪一份设置。
+static HOOK_BINDINGS: OnceLock<Mutex<Vec<(u32, u32, u32)>>> = OnceLock::new();
 /// 鼠标组合：(mods, 伪键码)。鼠标钩子（`mouse_wheel.rs`）按这张表拦。
 static MOUSE_BINDINGS: OnceLock<Mutex<Vec<(u32, u32)>>> = OnceLock::new();
 /// 热键线程的窗口句柄（0 = 还没建好）。
@@ -103,10 +106,16 @@ static CAPTURING: AtomicBool = AtomicBool::new(false);
 static HOOK: AtomicIsize = AtomicIsize::new(0);
 /// 「按住连续触发」开着，而且用户没勾「理会系统的长按重复」：系统补出来的重复
 /// 一律不理会，重复节奏完全由我们自己掌握。
-static IGNORE_SYSTEM_REPEAT: AtomicBool = AtomicBool::new(false);
+///
+/// 两个页签各一份：音频页那套管音量 / 应用音量 / 媒体键，屏幕页那套管六个亮度动作。
+static IGNORE_SYSTEM_REPEAT_AUDIO: AtomicBool = AtomicBool::new(false);
+static IGNORE_SYSTEM_REPEAT_SCREEN: AtomicBool = AtomicBool::new(false);
 /// 「按下快捷键时不发送原始按键」：配过的组合一律交给低级钩子吞掉，
 /// 连 `RegisterHotKey` 那一路都不注册（它拦不住用 Raw Input 读键盘的程序）。
-static SWALLOW_RAW: AtomicBool = AtomicBool::new(false);
+///
+/// 同样是两个页签各一份：在音频页打开，屏幕页的组合照旧发给前台。
+static SWALLOW_RAW_AUDIO: AtomicBool = AtomicBool::new(false);
+static SWALLOW_RAW_SCREEN: AtomicBool = AtomicBool::new(false);
 /// 按住会连发的动作（`Action` 的 repr 值）。`apply_config` 里按配置重算。
 ///
 /// 钩子拿它判断「系统补出来的重复 keydown」该不该吞：没勾连发的动作按住只该动
@@ -134,16 +143,21 @@ fn repeats_action_id(id: u32) -> bool {
         .contains(&(id / 8))
 }
 
+/// 动作号反查动作（配置里存的是 `Action` 的 repr 值）。
+fn action_of_id(id: u32) -> Option<Action> {
+    Action::all().into_iter().find(|action| *action as u32 == id)
+}
+
 /// 这一发按下来之前就已经按着了（= 系统长按重复补的），要不要吞掉。
 ///
-/// 两道闸：总开关开着就一律吞（重复由 `start_hold_repeat` 自己走）；总开关关着时
-/// 只看这个动作有没有勾连发 —— 没勾的按住只该动一下。认不出动作的（比如没配成
-/// 快捷键的键）不额外吞，保持原来的行为。
+/// 两道闸：这个动作那一页的「忽略系统重复」开着就一律吞（重复由
+/// `start_hold_repeat` 自己走）；关着时只看这个动作有没有勾连发 —— 没勾的按住
+/// 只该动一下。认不出动作的（比如没配成快捷键的键）不额外吞，保持原来的行为。
 fn swallow_system_repeat(already_down: bool, action: Option<Action>) -> bool {
     if !already_down {
         return false;
     }
-    if ignore_system_repeat() {
+    if ignore_system_repeat_for(action) {
         return true;
     }
     matches!(action, Some(action) if !repeats_action(action))
@@ -161,7 +175,7 @@ fn registered() -> &'static Mutex<Vec<i32>> {
     REGISTERED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn hook_bindings() -> &'static Mutex<Vec<(u32, u32)>> {
+fn hook_bindings() -> &'static Mutex<Vec<(u32, u32, u32)>> {
     HOOK_BINDINGS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -318,6 +332,23 @@ impl Action {
         }
     }
 
+    /// 这个动作归哪一页：`true` = 屏幕页（六个亮度动作），`false` = 音频页。
+    ///
+    /// 快捷键页的两个页签各有一套「按住连续触发」和「不发送原始按键」，钩子里
+    /// 只拿得到键码，得靠这个把命中的组合映射回它属于哪一套 —— 在音频页把间隔
+    /// 调成 60ms，不该把亮度的节奏也一起改掉。
+    pub fn is_screen(self) -> bool {
+        matches!(
+            self,
+            Action::BrightnessUp
+                | Action::BrightnessDown
+                | Action::BrightnessAllUp
+                | Action::BrightnessAllDown
+                | Action::BrightnessMonitorUp
+                | Action::BrightnessMonitorDown
+        )
+    }
+
     /// 第 n 组快捷键的注册 id。
     fn id(self, slot: usize) -> u32 {
         self as u32 * 8 + slot as u32
@@ -326,14 +357,36 @@ impl Action {
 
 /// 这个动作按住不松手时要不要连续触发。
 ///
-/// 两道闸都要过：总闸 `hotkey_hold_repeat` 开着，而且这个动作在
-/// `hotkey_repeat_actions` 里（设置页里每个快捷键前面那个勾）。
+/// 两道闸都要过：**它那一页**的总闸开着（音频页 `hotkey_hold_repeat`、屏幕页
+/// `hotkey_screen_hold_repeat`），而且这个动作在 `hotkey_repeat_actions` 里
+/// （设置页里每个快捷键前面那个勾）。
 pub fn repeats_on_hold(config: &Config, action: Action) -> bool {
-    config.hotkey_hold_repeat
-        && config
-            .hotkey_repeat_actions
-            .iter()
-            .any(|name| name == action.key())
+    let gate = if action.is_screen() {
+        config.hotkey_screen_hold_repeat
+    } else {
+        config.hotkey_hold_repeat
+    };
+    gate && config
+        .hotkey_repeat_actions
+        .iter()
+        .any(|name| name == action.key())
+}
+
+/// 这个动作那个页签的连发参数：(总闸, 间隔, 延迟)。
+///
+/// 两个页签各存一份，按住音量键和按住亮度键可以完全不同步。
+pub fn repeat_settings(config: &Config, action: Action) -> (bool, u32, u32) {
+    let screen = action.is_screen();
+    let on = repeats_on_hold(config, action);
+    if screen {
+        (
+            on,
+            config.hotkey_screen_repeat_interval,
+            config.hotkey_screen_repeat_delay,
+        )
+    } else {
+        (on, config.hotkey_repeat_interval, config.hotkey_repeat_delay)
+    }
 }
 
 /// 鼠标键在配置里的伪键码。
@@ -627,24 +680,28 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     // keydown 根本不会进系统的按键状态（吞掉就是没发生过），问出来的永远是「没按着」，
     // 那样判一次错一次，等于没做。表是 keyup 清的，而 keyup 也走这个钩子。
     let already_down = mark_key_down(key);
-    let system_repeat = already_down && ignore_system_repeat();
 
     let mods = current_modifiers();
+    // 这一发命中的是哪个动作（没绑定就是空）。两项「按页签」的设置都靠它分辨：
+    // 音频页和屏幕页各存一份，钩子里只拿得到键码。
+    let binding = binding_action(mods, key);
+    let action = binding.or_else(|| media_action(key));
+    let system_repeat = already_down && ignore_system_repeat_for(action);
 
     // 普通键（字母 / F 键那一类）平时根本不归钩子管。只有开着「按下时不发送
     // 原始按键」、并且这一发正好是配过的组合时才接管 —— 其余一律原样放行。
     // 录制期间也放行：录制靠设置页窗口自己的 keydown，钩子插一手会把
     // Esc / Backspace 这类也吞掉，反而录不下去。
     if !is_hook_key(key) {
-        if !swallow_raw()
+        if !swallow_raw_for(binding)
             || CAPTURING.load(Ordering::SeqCst)
             || list_blocked()
-            || !bindings_match(mods, key)
+            || binding.is_none()
         {
             return unsafe { CallNextHookEx(None, code, wparam, lparam) };
         }
         trace(&format!("hook swallow raw vk=0x{key:02X} mods={mods}"));
-        if swallow_system_repeat(already_down, media_action(key)) {
+        if swallow_system_repeat(already_down, action) {
             return LRESULT(1);
         }
         send_hotkey(Hotkey::new(mods, key));
@@ -674,13 +731,27 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    let bound = bindings_match(mods, key);
+    let bound = binding.is_some();
     trace(&format!(
         "hook vk=0x{key:02X} mods={mods} bound={bound} injected={injected} capturing={}",
         CAPTURING.load(Ordering::SeqCst)
     ));
     if bound {
-        if swallow_system_repeat(already_down, media_action(key)) {
+        // 「按下快捷键时不发送原始按键」关着：这一发照常还给系统（那本来就是
+        // 开关的意思），系统补出来的重复也照样放行，前台该怎么重复怎么重复。
+        // 例外见 `taken_over`。这一项**按页签**看：音频页开着只管音量那一套，
+        // 屏幕页的组合照旧发给前台。
+        //
+        // 放行之后动作只认第一次按下：系统的重复 keydown 每秒几十发，每一发都
+        // 派一次动作会跟 `start_hold_repeat` 叠成两套节奏，按住一颗键音量涨得飞快。
+        if !swallow_raw_for(binding) && !taken_over(key) {
+            if !already_down {
+                send_hotkey(hotkey);
+            }
+            trace(&format!("hook pass-through vk=0x{key:02X} (raw allowed)"));
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+        if swallow_system_repeat(already_down, action) {
             return LRESULT(1);
         }
         send_hotkey(hotkey);
@@ -698,13 +769,17 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// 这一发（修饰键 + 键码）是不是配过的组合。
-fn bindings_match(mods: u32, key: u32) -> bool {
+/// 这一发（修饰键 + 键码）命中的是哪个动作；没配过就是 `None`。
+///
+/// 钩子里要用它分辨「这属于音频页还是屏幕页」—— 两页的「不发送原始按键」
+/// 和「忽略系统重复」各存一份。
+fn binding_action(mods: u32, key: u32) -> Option<Action> {
     hook_bindings()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .iter()
-        .any(|binding| *binding == (mods, key))
+        .find(|binding| binding.0 == mods && binding.1 == key)
+        .and_then(|binding| action_of_id(binding.2))
 }
 
 /// 这个键现在还按着没有。
@@ -746,14 +821,28 @@ fn tracked_down(key: u32) -> bool {
 
 /// 开 / 关「按下快捷键时不发送原始按键」（配置变更时由 `apply_config` 同步）。
 ///
+/// 两个页签各一份：`audio` 管音量 / 应用音量 / 媒体键那一套，`screen` 管六个亮度动作。
+///
 /// 只置个原子量：真正「把这颗键从输入队列里拿掉」的是钩子，而哪张表进钩子
 /// 是 `apply_desired` 算的 —— 那边会读这个值，所以这里之后还得走一次 `apply`。
-pub fn set_swallow_raw(on: bool) {
-    SWALLOW_RAW.store(on, Ordering::SeqCst);
+pub fn set_swallow_raw(audio: bool, screen: bool) {
+    SWALLOW_RAW_AUDIO.store(audio, Ordering::SeqCst);
+    SWALLOW_RAW_SCREEN.store(screen, Ordering::SeqCst);
 }
 
-fn swallow_raw() -> bool {
-    SWALLOW_RAW.load(Ordering::SeqCst)
+/// 这个动作那一页开没开「不发送原始按键」；认不出动作按音频页算。
+fn swallow_raw_for(action: Option<Action>) -> bool {
+    if action.is_some_and(|action| action.is_screen()) {
+        SWALLOW_RAW_SCREEN.load(Ordering::SeqCst)
+    } else {
+        SWALLOW_RAW_AUDIO.load(Ordering::SeqCst)
+    }
+}
+
+/// 任何一页开着都算「普通键也归钩子管」：钩子外面分不出页签，先收进来，
+/// 进钩子之后再按命中的动作决定吞不吞（见 `keyboard_proc`）。
+fn swallow_raw_any() -> bool {
+    SWALLOW_RAW_AUDIO.load(Ordering::SeqCst) || SWALLOW_RAW_SCREEN.load(Ordering::SeqCst)
 }
 
 /// 这颗键归不归钩子管：媒体 / 小键盘 / 方向那一组本来就走钩子；
@@ -762,19 +851,26 @@ fn swallow_raw() -> bool {
 /// 普通键在钩子里只做一件事 —— 命中了绑定就吞掉，没命中照常放行
 /// （见 `keyboard_proc`），所以「算进来」不影响别的按键。
 fn hook_covers(key: u32) -> bool {
-    is_hook_key(key) || swallow_raw()
+    is_hook_key(key) || swallow_raw_any()
 }
 
 /// 开 / 关「忽略系统的长按重复」（配置变更时由 `apply_config` 同步）。
 ///
-/// 只影响我们**自己接管**的键：`RegisterHotKey` 那一路靠 `MOD_NOREPEAT`（要重新注册，
-/// 所以这个函数之后还得走一次 `apply`），低级钩子那一路看的就是这个开关。
-pub fn set_ignore_system_repeat(on: bool) {
-    IGNORE_SYSTEM_REPEAT.store(on, Ordering::SeqCst);
+/// 同样按页签分两份。只影响我们**自己接管**的键：`RegisterHotKey` 那一路靠
+/// `MOD_NOREPEAT`（要重新注册，所以这个函数之后还得走一次 `apply`），
+/// 低级钩子那一路看的就是这个开关。
+pub fn set_ignore_system_repeat(audio: bool, screen: bool) {
+    IGNORE_SYSTEM_REPEAT_AUDIO.store(audio, Ordering::SeqCst);
+    IGNORE_SYSTEM_REPEAT_SCREEN.store(screen, Ordering::SeqCst);
 }
 
-fn ignore_system_repeat() -> bool {
-    IGNORE_SYSTEM_REPEAT.load(Ordering::SeqCst)
+/// 这个动作那一页要不要无视系统自己补的长按重复；认不出动作按音频页算。
+fn ignore_system_repeat_for(action: Option<Action>) -> bool {
+    if action.is_some_and(|action| action.is_screen()) {
+        IGNORE_SYSTEM_REPEAT_SCREEN.load(Ordering::SeqCst)
+    } else {
+        IGNORE_SYSTEM_REPEAT_AUDIO.load(Ordering::SeqCst)
+    }
 }
 
 /// 记下「这颗键现在按着」，返回它之前是不是就已经按着了。
@@ -950,6 +1046,15 @@ pub fn media_action(key: u32) -> Option<Action> {
     }
 }
 
+/// 这颗键就算「按下快捷键时不发送原始按键」关着，也得从输入队列里拿掉 ——
+/// 它本身就是被我们接管的系统键，放出去会再动一次：音量 / 静音键叠一档，
+/// 顺便把系统那条音量条叫出来；媒体键会让播放器自己也跳一下。
+///
+/// 其余的键（普通键、方向 / Ins / Del 那一组、小键盘）关着时一律原样还给系统。
+fn taken_over(key: u32) -> bool {
+    volume_action(key).is_some() || media_action(key).is_some()
+}
+
 /// 录制快捷键期间开关钩子的接管（只影响媒体键那一小撮）。
 /// 现在是不是在录快捷键（鼠标钩子用它决定拦不拦）。
 pub fn is_capturing() -> bool {
@@ -976,7 +1081,7 @@ unsafe fn apply_desired(hwnd: HWND) {
         .unwrap_or_else(|error| error.into_inner())
         .clone();
     let mut seen: Vec<(u32, u32)> = Vec::new();
-    let mut hooked: Vec<(u32, u32)> = Vec::new();
+    let mut hooked: Vec<(u32, u32, u32)> = Vec::new();
     let mut moused: Vec<(u32, u32)> = Vec::new();
     for (id, mods, key) in bindings {
         if key == 0 || seen.contains(&(mods, key)) {
@@ -988,17 +1093,19 @@ unsafe fn apply_desired(hwnd: HWND) {
             moused.push((mods, key));
             continue;
         }
+        // 两项「按页签」的设置都得先认出这个组合是哪个动作：音频页和屏幕页各存一份。
+        let action = action_of_id(id / 8);
         // 钩子活着的时候，「按下时不发送原始按键」把所有配过的组合都收进钩子：
         // `RegisterHotKey` 只能让窗口收不到，拦不住用 Raw Input 读键盘的程序，
         // 而低级钩子返回 1 是真的从输入队列里抹掉。
         // 钩子没装上（HOOK = 0）时仍然走注册 —— 宁可按键漏出去，也别让快捷键整个失效。
         let hook_alive = HOOK.load(Ordering::SeqCst) != 0;
-        if is_hook_key(key) || (hook_alive && swallow_raw()) {
+        if is_hook_key(key) || (hook_alive && swallow_raw_for(action)) {
             // 媒体键交给低级钩子，不走 RegisterHotKey（那类键注册不上，
             // 万一注册上了还会和钩子重复触发）。方向 / Ins / Del 那一组也走钩子：
             // `RegisterHotKey` 只认键码，小键盘在 NumLock 关着时冒充的就是同一个
             // 键码，注册了就会被小键盘蹭响；钩子能看扩展位，分得出真假。
-            hooked.push((mods, key));
+            hooked.push((mods, key, id / 8));
             continue;
         }
         // 「忽略系统的长按重复」：按住组合键时只要第一发，后面的重复交给我们
@@ -1007,7 +1114,7 @@ unsafe fn apply_desired(hwnd: HWND) {
         //
         // 没勾连发的动作**永远**带这个标志：总开关关着时也不能让系统的重复把它
         // 继续往下推 —— 那样「这个键不连发」的勾就形同虚设。
-        let api_mods = if ignore_system_repeat() || !repeats_action_id(id) {
+        let api_mods = if ignore_system_repeat_for(action) || !repeats_action_id(id) {
             mods | MOD_NOREPEAT
         } else {
             mods
@@ -1059,9 +1166,16 @@ pub fn apply_config(config: &Config) {
     set_takeover_media(config.osd.takeover_media_keys);
     // 只有「按住连续触发」开着的时候才谈得上「忽略系统的长按重复」：关掉连发时
     // 我们自己是不会补的，再把系统那一路也关掉，按住音量键就彻底不动了。
-    set_ignore_system_repeat(config.hotkey_hold_repeat && config.hotkey_ignore_system_repeat);
+    // 两个页签各一份，各自受自己那个总闸管。
+    set_ignore_system_repeat(
+        config.hotkey_hold_repeat && config.hotkey_ignore_system_repeat,
+        config.hotkey_screen_hold_repeat && config.hotkey_screen_ignore_system_repeat,
+    );
     // 这一项决定「配过的组合交给钩子还是 RegisterHotKey」，得赶在下面的 `apply` 前面。
-    set_swallow_raw(config.hotkey_swallow_raw);
+    set_swallow_raw(
+        config.hotkey_swallow_raw,
+        config.hotkey_screen_swallow_raw,
+    );
     // 钩子按这张表判断「系统补出来的重复要不要吞」，所以它得先于下面的注册更新。
     *repeat_actions()
         .lock()
@@ -1454,16 +1568,22 @@ mod tests {
     /// 「这个键不连发」的勾要真管住系统的长按重复：总开关关着时也不能让它往下推。
     #[test]
     fn repeat_is_swallowed_for_actions_without_the_tick() {
-        let previous_ignore = ignore_system_repeat();
+        let previous_ignore = (
+            ignore_system_repeat_for(Some(Action::VolumeUp)),
+            ignore_system_repeat_for(Some(Action::BrightnessUp)),
+        );
         let previous_list = repeat_actions()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         *repeat_actions()
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = vec![Action::VolumeUp as u32];
+            .unwrap_or_else(|error| error.into_inner()) = vec![
+            Action::VolumeUp as u32,
+            Action::BrightnessUp as u32,
+        ];
 
-        set_ignore_system_repeat(false);
+        set_ignore_system_repeat(false, false);
         assert!(
             !swallow_system_repeat(false, Some(Action::VolumeUp)),
             "第一发按下要放行"
@@ -1478,13 +1598,17 @@ mod tests {
         );
         assert!(!swallow_system_repeat(true, None), "认不出的不额外吞");
 
-        set_ignore_system_repeat(true);
+        set_ignore_system_repeat(true, false);
         assert!(
             swallow_system_repeat(true, Some(Action::VolumeUp)),
-            "总开关开着就一律吞"
+            "音频页那一项开着就一律吞"
+        );
+        assert!(
+            !swallow_system_repeat(true, Some(Action::BrightnessUp)),
+            "屏幕页那份还是关的 —— 两个页签互不影响"
         );
 
-        set_ignore_system_repeat(previous_ignore);
+        set_ignore_system_repeat(previous_ignore.0, previous_ignore.1);
         *repeat_actions()
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = previous_list;
@@ -1538,16 +1662,29 @@ mod tests {
         let before = config.hotkey_repeat_actions.clone();
         assert!(!before.is_empty(), "默认就该勾着音量 / 亮度");
 
+        // 两个页签各有一个总闸：关掉音频页的，屏幕页照旧连发。
         config.hotkey_hold_repeat = false;
         assert_eq!(config.hotkey_repeat_actions, before, "关总闸抹掉了名单");
         assert!(
+            !repeats_on_hold(&config, Action::VolumeUp),
+            "音频页总闸关着，音量不该连发"
+        );
+        assert!(
+            repeats_on_hold(&config, Action::BrightnessUp),
+            "屏幕页那一份还开着 —— 两个页签互不影响"
+        );
+
+        config.hotkey_screen_hold_repeat = false;
+        assert!(
             Action::all().into_iter().all(|a| !repeats_on_hold(&config, a)),
-            "总闸关着时不该有任何动作连发"
+            "两份总闸都关掉才一个都不连发"
         );
 
         config.hotkey_hold_repeat = true;
+        config.hotkey_screen_hold_repeat = true;
         assert_eq!(config.hotkey_repeat_actions, before, "开总闸动了名单");
         assert!(repeats_on_hold(&config, Action::VolumeUp));
+        assert!(repeats_on_hold(&config, Action::BrightnessUp));
     }
 
     /// 被钩子吞掉的键在系统那边当没按过，连发循环只能看自己的按下表。
@@ -1729,15 +1866,30 @@ mod tests {
     /// 而且正好是配过的组合时才被吞掉 —— 范围由 `hook_covers` 决定。
     #[test]
     fn swallow_raw_extends_the_hook_to_plain_keys() {
-        set_swallow_raw(false);
+        set_swallow_raw(false, false);
         assert!(!hook_covers(0x41), "默认不管字母键");
         assert!(hook_covers(VK_LEFT), "方向键本来就走钩子");
         assert!(hook_covers(VK_VOLUME_UP));
-        set_swallow_raw(true);
+        set_swallow_raw(true, false);
         assert!(hook_covers(0x41), "开着时字母键也要进钩子");
         assert!(hook_covers(0x70), "F1 同理");
-        set_swallow_raw(false);
+        assert!(
+            swallow_raw_for(Some(Action::VolumeUp)),
+            "音频页那份开着"
+        );
+        assert!(
+            !swallow_raw_for(Some(Action::BrightnessUp)),
+            "屏幕页那份还是关的"
+        );
+        set_swallow_raw(false, false);
         assert!(!hook_covers(0x41), "关掉之后恢复原状");
+        // 只有屏幕页开着：普通键一样要进钩子（`hook_covers` 分不出页签），
+        // 进钩子之后按命中的动作决定吞不吞。
+        set_swallow_raw(false, true);
+        assert!(hook_covers(0x41));
+        assert!(swallow_raw_for(Some(Action::BrightnessUp)));
+        assert!(!swallow_raw_for(Some(Action::VolumeUp)));
+        set_swallow_raw(false, false);
     }
 
     /// 接管的只有四个播放键；音量键留给系统自己的提示条。
@@ -1753,5 +1905,23 @@ mod tests {
         assert_eq!(media_action(VK_VOLUME_MUTE), None);
         assert_eq!(media_action(0xAE), None);
         assert_eq!(media_action(0xAF), None);
+    }
+
+    /// 「不发送原始按键」关着时，方向键 / 小键盘这些走钩子的键必须原样还给系统，
+    /// 只有被接管的音量 / 媒体键例外（放出去会多动一次）。
+    #[test]
+    fn taken_over_is_only_the_media_and_volume_keys() {
+        for key in [VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_DELETE, VK_HOME, 0x64, 0x41] {
+            assert!(!taken_over(key), "0x{key:02X} 关着开关时要放出去");
+        }
+        for key in [
+            VK_VOLUME_UP,
+            VK_VOLUME_DOWN,
+            VK_VOLUME_MUTE,
+            VK_MEDIA_PLAY_PAUSE,
+            VK_MEDIA_NEXT_TRACK,
+        ] {
+            assert!(taken_over(key), "0x{key:02X} 是接管的系统键，不能放");
+        }
     }
 }

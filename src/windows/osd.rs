@@ -52,8 +52,8 @@ fn animates_in(cfg: &OsdConfig) -> bool {
     cfg.animate && (cfg.anim_style.is_system() || cfg.fade_in_ms > 0)
 }
 
-/// 这块屏的整屏底部（逻辑像素，含任务栏占的那一条）。
-fn screen_bottom(monitor: u32) -> f32 {
+/// 这块屏的四条边（逻辑像素）：`(左, 上, 右, 下)`。
+fn screen_edges(monitor: u32) -> (f32, f32, f32, f32) {
     let list = crate::platform::monitors::monitors();
     let chosen = if monitor == 0 {
         list.iter()
@@ -64,21 +64,62 @@ fn screen_bottom(monitor: u32) -> f32 {
             .or_else(|| list.iter().find(|info| info.is_primary))
     };
     match chosen {
-        Some(info) => (info.bounds.1 + info.bounds.3).max(info.work.1 + info.work.3),
-        None => 1080.0,
+        Some(info) => {
+            let (left, top) = (info.bounds.0, info.bounds.1);
+            // 底边 / 右边按「整屏」算（含任务栏那条）：卡片停在工作区底边上，
+            // 起点要让整块贴到屏幕底下，才是「从任务栏后面升起来」。
+            let bottom = (info.bounds.1 + info.bounds.3).max(info.work.1 + info.work.3);
+            let right = (info.bounds.0 + info.bounds.2).max(info.work.0 + info.work.2);
+            (left, top, right, bottom)
+        }
+        None => (0.0, 0.0, 1920.0, 1080.0),
     }
 }
 
-/// 系统风格下这一轮要从屏幕底往上滑多远（不是系统风格就是 0）。
+/// 这一轮入场从哪个方向来、要滑多远：`((方向, 距离))`。
 ///
-/// 起点让**窗口顶边贴到屏幕底**：整块卡片完全在屏幕外，往上滑的路上被任务栏
-/// 挡住（配合 `behind_taskbar`），才是系统那种「从任务栏后面出来」的样子。
-/// 以前按「卡片高度 + 10」算，卡片矮的时候起点还留在屏幕内，看起来就是从半空冒出来。
-fn system_slide(cfg: &OsdConfig, monitor: u32, window_top: f32) -> f32 {
-    if cfg.anim_style.is_system() {
-        (screen_bottom(monitor) - window_top).max(0.0)
-    } else {
-        0.0
+/// 方向是单位向量，`距离` 是沿它偏移的像素数（正 = 卡片在目标位置的这一侧）。
+///
+/// - 「跟随最近边」：看卡片离哪条屏边最近，就从那条边进来。**系统风格**按整段
+///   距离滑（起点整块在屏外，和加来源之前一模一样）；**淡入淡出**风格不滑，
+///   距离 0 —— 也就是老配置的手感一点没变。
+/// - 上下左右：钉死从那条边来，恒按「整块出屏」的距离滑。
+/// - 自定义：直接拿 `(x, y)` 当位移，正 x 向右、正 y 向下，长度就是滑多远。
+fn slide_from(cfg: &OsdConfig, monitor: u32, base: (f32, f32, f32, f32)) -> ((f32, f32), f32) {
+    use crate::config::OsdAnimFrom;
+
+    let (x, y, width, height) = base;
+    let (left, top, right, bottom) = screen_edges(monitor);
+    let anim = cfg.anim();
+    match anim.from {
+        OsdAnimFrom::Nearest => {
+            if !cfg.anim_style.is_system() {
+                return ((0.0, 1.0), 0.0);
+            }
+            // 四条边各差多少（卡片完全出屏要走多远）。
+            let gaps = [
+                ((0.0, -1.0), (y + height - top).max(0.0)),
+                ((0.0, 1.0), (bottom - y).max(0.0)),
+                ((-1.0, 0.0), (x + width - left).max(0.0)),
+                ((1.0, 0.0), (right - x).max(0.0)),
+            ];
+            gaps.into_iter()
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap_or(((0.0, 1.0), 0.0))
+        }
+        OsdAnimFrom::Top => ((0.0, -1.0), (y + height - top).max(0.0)),
+        OsdAnimFrom::Bottom => ((0.0, 1.0), (bottom - y).max(0.0)),
+        OsdAnimFrom::Left => ((-1.0, 0.0), (x + width - left).max(0.0)),
+        OsdAnimFrom::Right => ((1.0, 0.0), (right - x).max(0.0)),
+        OsdAnimFrom::Custom => {
+            let (dx, dy) = (anim.custom_x as f32, anim.custom_y as f32);
+            let length = (dx * dx + dy * dy).sqrt();
+            if length < 0.5 {
+                ((0.0, 1.0), 0.0)
+            } else {
+                ((dx / length, dy / length), length)
+            }
+        }
     }
 }
 
@@ -601,6 +642,24 @@ pub fn shadow_margin(cfg: &OsdConfig) -> f32 {
     (blur * 3.0 + offset + 4.0).ceil()
 }
 
+/// 要不要把整扇窗设成「不接鼠标」：只有光标落在**影子那一圈**（窗口内、卡片外）
+/// 的时候才穿透 —— 那块屏幕上是透明的，本该让点击穿过去。
+///
+/// 不在窗口附近时保持「接鼠标」：穿透是按整窗切的（`WS_EX_TRANSPARENT` 没有
+/// 局部版本），光标离得远也穿透的话，用户快速移进卡片点一下就会漏掉，
+/// 因为 tick 还没来得及把穿透摘掉。
+///
+/// 整条看不见（alpha = 0）或者本来就不许交互时，整扇窗都不接鼠标。
+fn hollow_window(cfg: &OsdConfig, in_window: bool, on_card: bool, alpha: f32) -> bool {
+    if alpha <= 0.01 {
+        return true;
+    }
+    if !cfg.interactive {
+        return true;
+    }
+    in_window && !on_card
+}
+
 /// 卡片下面那层影子。关着就返回 `None`（不多一个空元素）。
 fn shadow_layer(cfg: &OsdConfig, scale: f32) -> Option<gpui::AnyElement> {
     let shadow = &cfg.shadow;
@@ -1121,6 +1180,8 @@ pub struct Osd {
     last_offset: f32,
     /// 系统风格下这一轮的起始位移（窗口顶边贴到屏幕底，整块卡片在屏幕外）。
     slide: f32,
+    /// 这一轮的位移方向（单位向量）。`offset` 沿它加减 —— 上下左右都能滑。
+    slide_dir: (f32, f32),
     /// 正在跑的那段滑动（独立线程按合成帧推进）；None = 没有动画在跑。
     slide_run: Option<crate::windows::platform::SlideHandle>,
     /// 这一轮淡入从哪个不透明度开始。
@@ -1228,6 +1289,7 @@ impl Osd {
             base: (0.0, 0.0, 0.0, 0.0),
             last_offset: f32::NAN,
             slide: 0.0,
+            slide_dir: (0.0, 1.0),
             slide_run: None,
             fade_from: 0.0,
             wheel_last_at: None,
@@ -1394,10 +1456,13 @@ impl Osd {
             // 接力：`place` 按「目标位置 + 刚停下的位移」摆，一次 SetWindowPos
             // 就落在当前的画面上（尺寸不变时等于没挪），不会闪回原位。
             self.place(window, cx, &cfg);
-            // 上一轮没记过「到屏幕底多远」（比如刚切到系统风格）就现算一个：
-            // 这一段接力和它之后的出场都要按这个距离走。
+            // 上一轮没记过「这一轮要滑多远」（比如刚切到系统风格 / 刚改了来源）
+            // 就现算一个：这一段接力和它之后的出场都要按这个距离走。
+            let (direction, slide) =
+                slide_from(&cfg, self.monitor.unwrap_or(cfg.monitor), self.base);
+            self.slide_dir = direction;
             if self.slide <= 0.5 {
-                self.slide = system_slide(&cfg, self.monitor.unwrap_or(cfg.monitor), self.base.1);
+                self.slide = slide;
             }
             let slide = self.slide.max(offset);
             if enters && slide > 0.5 {
@@ -1424,16 +1489,14 @@ impl Osd {
             // 位置和透明度这一轮归滑动线程管，`place` 先按目标位置摆好。
             self.offset = 0.0;
             self.place(window, cx, &cfg);
-            // **摆好之后**才知道「从屏幕底到这里有多远」—— 提前算会拿到上一次的位置。
-            let slide = system_slide(&cfg, self.monitor.unwrap_or(cfg.monitor), self.base.1);
-            // 「这一轮从多远起步」：系统风格下恒按「卡片到屏幕底」算。
+            // **摆好之后**才知道「这次要从多远的地方起步」—— 提前算会拿到上一次的位置。
+            let (direction, slide) =
+                slide_from(&cfg, self.monitor.unwrap_or(cfg.monitor), self.base);
+            // 方向每轮都记（出场按同一条路滑回去）；距离只在真要入场时才算数。
             // **出场也用同一个量**滑出去 —— 以前连着按第二下时把它清成 0，
             // 出场就退化成纯淡出（用户：「触发完再按一次，消失动画变成淡出了」）。
-            self.slide = if enters && cfg.anim_style.is_system() {
-                slide
-            } else {
-                0.0
-            };
+            self.slide = if enters && slide > 0.5 { slide } else { 0.0 };
+            self.slide_dir = direction;
             if guarded {
                 // 显示之前先把窗口压成全透明：DWM 在 Show 的一瞬间就会把旧 surface
                 // 摆出来，哪怕只有一帧，也会在淡入开头看出上一次的内容。
@@ -1464,6 +1527,9 @@ impl Osd {
             self.apply_alpha(window, &cfg);
         }
         self.visible = true;
+        // 显示期间盯住 z 序：别的置顶窗口（桌面右键菜单、悬浮条）一插到前面，
+        // 钩子会在 1ms 量级把它顶回去，轮询兜底。
+        crate::windows::platform::watch_osd_top(window);
         cx.notify();
         // 立刻要一帧：OSD 窗口是 NOACTIVATE 的，不给它一条 WM_PAINT，
         // 新内容可能要等下一次输入才提交，旧 surface 就一直顶着。
@@ -1633,6 +1699,16 @@ impl Osd {
             OsdAnchor::TopLeft => (ax + margin, ay + margin),
             OsdAnchor::TopCenter => (ax + (aw - card_w) / 2.0, ay + margin),
             OsdAnchor::TopRight => (ax + aw - card_w - margin, ay + margin),
+            // 中间那三档：竖直方向两边留一样多。
+            OsdAnchor::MiddleLeft => (ax + margin, ay + (ah - card_h) / 2.0),
+            OsdAnchor::MiddleCenter => (
+                ax + (aw - card_w) / 2.0,
+                ay + (ah - card_h) / 2.0,
+            ),
+            OsdAnchor::MiddleRight => (
+                ax + aw - card_w - margin,
+                ay + (ah - card_h) / 2.0,
+            ),
             OsdAnchor::BottomLeft => (ax + margin, ay + ah - card_h - margin),
             OsdAnchor::BottomCenter => (ax + (aw - card_w) / 2.0, ay + ah - card_h - margin),
             OsdAnchor::BottomRight => (ax + aw - card_w - margin, ay + ah - card_h - margin),
@@ -1684,7 +1760,13 @@ impl Osd {
         self.last_offset = self.offset;
         crate::windows::platform::set_frame(
             window,
-            gpui::Bounds::new(point(px(x), px(y + self.offset)), size(px(width), px(height))),
+            gpui::Bounds::new(
+                point(
+                    px(x + self.slide_dir.0 * self.offset),
+                    px(y + self.slide_dir.1 * self.offset),
+                ),
+                size(px(width), px(height)),
+            ),
             window.scale_factor(),
         );
     }
@@ -1746,7 +1828,7 @@ impl Osd {
         let run = SlideRun {
             mode,
             to: (self.base.0, self.base.1),
-            direction: (0.0, 1.0),
+            direction: self.slide_dir,
             from: match mode {
                 SlideMode::Enter => from,
                 SlideMode::Exit => 0.0,
@@ -1777,6 +1859,7 @@ impl Osd {
         self.offset = if self.slide > 0.5 { self.slide } else { 0.0 };
         crate::windows::platform::set_opacity(window, 0.0);
         self.last_alpha = 0.0;
+        crate::windows::platform::unwatch_osd_top();
         self.sync_position(window);
         self.ticker = false;
         cx.notify();
@@ -1852,6 +1935,17 @@ impl Osd {
         let cfg = self.cfg();
         let now = Instant::now();
 
+        // 影子那一圈不该吃鼠标：窗口为了画投影比卡片大一圈，而 Windows 的命中
+        // 测试只看矩形（`HTTRANSPARENT` 又只在同线程窗口之间转发，跨进程照样被
+        // 吃掉），只能整窗 `WS_EX_TRANSPARENT` 按光标位置来回切。
+        // 4ms 一次，够跟上人手的移动。
+        let on_card = crate::windows::platform::cursor_in_window_inset(window, shadow_margin(&cfg));
+        let in_window = on_card || crate::windows::platform::cursor_in_window(window);
+        crate::windows::platform::set_click_through(
+            window,
+            hollow_window(&cfg, in_window, on_card, self.alpha),
+        );
+
         // 滑动线程在跑：位置和整窗不透明度都归它管，这里只等它跑完再收尾。
         // （自己那套淡入淡出走下面的状态机，不经过这里。）
         if let Some(flag) = self.slide_run.clone() {
@@ -1912,7 +2006,7 @@ impl Osd {
         // 悬停状态自己轮询：gpui 的 `on_hover` 收不到「直接划出窗口」那一下，
         // 只靠它的话指针一离开提示条就再也不淡出了。
         // 只认卡片本体：窗口为了画投影比卡片大一圈，手指停在影子上不算「指着它」。
-        let inside = crate::windows::platform::cursor_in_window_inset(window, shadow_margin(&cfg));
+        let inside = on_card;
         if inside != self.hovered {
             self.hovered = inside;
             // 指针刚移开：从这一刻重新计时，然后照常淡出。
@@ -1982,8 +2076,19 @@ impl Osd {
             Phase::Hold { until } => {
                 self.offset = 0.0;
                 self.alpha = 1.0;
-                // 停留期间守住组首：会有置顶软件周期性把自己抢回最前，
-                // 被抢走的话提示条就整块埋在它下面（用户：「置顶的软件就抢不过了」）。
+                // 停留期间守住组首：新冒出来的窗口会插到 z 序最前面（桌面右键菜单、
+                // 置顶软件都会插到 TOPMOST 组首），被抢走的那一会儿提示条就整块
+                // 埋在它下面 —— 用户看到的是「OSD 出来以后又弹个窗口，它瞬间压上来了」。
+                // 每帧问一句「组首还是不是我」（一次 `GetTopWindow`，便宜）；被抢就
+                // 立刻确认是不是真盖住了、盖住就马上提回来，不等 250ms 的兜底。
+                if !crate::windows::platform::osd_is_top(window)
+                    && crate::windows::platform::osd_is_covered(window)
+                {
+                    crate::windows::platform::raise_osd(window);
+                    self.last_raise = now;
+                }
+                // 兜底：有些置顶软件周期性抢组首，组首每次被抢都会走上面那条；
+                // 这条 250ms 的无条件重申留着兜「不重叠但排在前面」的边角。
                 if self.last_raise.elapsed() >= RAISE_INTERVAL {
                     crate::windows::platform::raise_osd(window);
                     self.last_raise = now;
@@ -2283,14 +2388,22 @@ impl Osd {
     ///
     /// 钉住时提示条一直显示（设置页里对着调外观用）；再点一下**立刻**淡出收起 ——
     /// 不等停留时间，点完就该走。还没显示过就先按当前音量弹一条。
-    pub fn set_pinned(&mut self, pinned: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_pinned(
+        &mut self,
+        pinned: bool,
+        function: OsdFunction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.pinned = pinned;
         // 重新钉住说明用户又要长期看着它，把「收预览」的强制淡出撤掉。
         self.dismissing = false;
-        let cfg = self.cfg();
+        // 按「要预览的那一套」取配置：钉住时若窗口还没露过面，得照那套的样子
+        // 现场摆一份出来（以前固定按音量模板建，预览媒体键 / 亮度就成了音量卡片）。
+        let cfg = self.cfg_for(function);
         if pinned {
             if !self.visible {
-                self.state = self.build_state(&OsdRequest::device(OsdFunction::Volume), &cfg);
+                self.state = self.build_state(&OsdRequest::device(function), &cfg);
                 self.place(window, cx, &cfg);
                 crate::windows::platform::set_visible(window, true);
                 // 预览也一样要压在设置窗上面（设置窗自己也是置顶的）。
@@ -2568,6 +2681,42 @@ pub fn display_options() -> Vec<(u32, String)> {
 mod tests {
     use super::*;
 
+    /// 自定义来源：位移直接换成「单位方向 + 长度」，负值就是往左 / 往上。
+    #[test]
+    fn custom_slide_becomes_a_unit_direction() {
+        let mut cfg = OsdConfig::default();
+        cfg.edit_anim(|anim| {
+            anim.from = crate::config::OsdAnimFrom::Custom;
+            anim.custom_x = 0;
+            anim.custom_y = -120;
+        });
+        let ((dx, dy), distance) = slide_from(&cfg, 0, (100.0, 100.0, 200.0, 80.0));
+        assert!(dx.abs() < 1e-3, "纯竖直的位移不该有水平分量：{dx}");
+        assert!((dy + 1.0).abs() < 1e-3, "负 y 是往下，方向该是 -1：{dy}");
+        assert!((distance - 120.0).abs() < 0.5, "距离就是位移长度：{distance}");
+
+        // 斜着来一段：两个分量都归一化到同一段长度上。
+        cfg.edit_anim(|anim| {
+            anim.custom_x = 30;
+            anim.custom_y = 40;
+        });
+        let ((dx, dy), distance) = slide_from(&cfg, 0, (0.0, 0.0, 100.0, 40.0));
+        assert!((distance - 50.0).abs() < 0.5);
+        assert!((dx - 0.6).abs() < 1e-3 && (dy - 0.8).abs() < 1e-3);
+    }
+
+    /// 「跟随最近边」+ 淡入淡出：老配置的手感一点不变（原地淡，不滑）。
+    #[test]
+    fn nearest_edge_with_fade_does_not_slide() {
+        let mut cfg = OsdConfig::default();
+        cfg.edit_anim(|anim| {
+            anim.from = crate::config::OsdAnimFrom::Nearest;
+            anim.style = crate::config::OsdAnimStyle::Fade;
+        });
+        let (_, distance) = slide_from(&cfg, 0, (100.0, 100.0, 200.0, 80.0));
+        assert_eq!(distance, 0.0);
+    }
+
     /// 投影的留白要够渲染器铺满的那块四边形（3×模糊半径）。
     ///
     /// 以前这里只留 1.5 倍、还把 blur 夹在 60，扩散一大影子就被窗口边缘切掉。
@@ -2582,6 +2731,24 @@ mod tests {
         // 关着就不留白。
         cfg.shadow.enabled = false;
         assert_eq!(shadow_margin(&cfg), 0.0);
+    }
+
+    /// 只有「光标在影子那一圈 + 看得见 + 允许交互」才整窗穿透。
+    ///
+    /// 影子在屏幕上是透明的；不穿透的话它会安静地把点击吃掉。
+    /// 光标不在窗口附近时**不能**穿透 —— 否则快速移进卡片点一下会漏，
+    /// tick 还没来得及把穿透摘掉。
+    #[test]
+    fn only_the_shadow_lets_clicks_through() {
+        let mut cfg = OsdConfig::default();
+        cfg.interactive = true;
+        assert!(!hollow_window(&cfg, true, true, 1.0), "光标在卡片上得能点");
+        assert!(hollow_window(&cfg, true, false, 1.0), "影子那一圈要穿透");
+        assert!(!hollow_window(&cfg, false, false, 1.0), "光标不在窗口上时别穿透");
+        assert!(hollow_window(&cfg, true, true, 0.0), "整条透明时不该吃点击");
+
+        cfg.interactive = false;
+        assert!(hollow_window(&cfg, true, true, 1.0), "不交互的提示条整条穿透");
     }
 
     /// 动态图标样式：同一套里按档位换图，静音档四套共用一张。
