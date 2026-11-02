@@ -22,6 +22,9 @@
 <p align="center">
   <img src="docs/shots/editor-element.png" width="88%" alt="布局编辑器：选中单个元素后可以改对齐、角度、颜色">
 </p>
+<p align="center">
+  <img src="docs/shots/editor-brightness.png" width="88%" alt="布局编辑器：亮度模板，三套模板各存一份">
+</p>
 
 **提示条本身** —— 音量、媒体键、亮度各有自己的卡片，背景、尺寸、动画来源都能单独换
 
