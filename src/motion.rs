@@ -107,6 +107,23 @@ impl Motion {
         self.paint(effect, side)
     }
 
+    /// 设置页预览用的一帧：把状态摆到「正放着一首有鼓点的歌」的典型位置再画。
+    ///
+    /// 空场（`default`）画出来只有 13% 的短桩，看不出这一档是什么效果，
+    /// 所以这里不推进时间轴，直接把包络 / 节拍填成有代表性的值。
+    pub fn preview(effect: TrayMotion, side: u32) -> Vec<f32> {
+        let motion = Self {
+            level: 0.66,
+            bars: [0.88, 0.52, 0.74, 0.38],
+            beat: 0.8,
+            beat_age: 0.22,
+            time: 0.9,
+            prev_target: 0.66,
+            last: None,
+        };
+        motion.paint(effect, side)
+    }
+
     /// 当前包络（0..1，快起慢落之后的值）。
     ///
     /// 「彩色律动」拿它当色温：颜色跟着这个值走，才不会每一帧都跳色。

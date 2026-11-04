@@ -2,25 +2,18 @@
 //!
 //! 只做一次：之后用户在面板里怎么拖、怎么切，都不会被这里再拉回去。
 //! 设备侧（默认设备 / 开关名单 / 主音量）在第一份快照到手时就办完；
-//! 应用音量要等那些应用自己开声（WASAPI 里才有会话），所以在启动后的
-//! `APP_WINDOW` 之内，谁出现就给谁套一次。
+//! 应用音量要等那些应用自己开声（WASAPI 里才有会话）——**不设时限**，
+//! 谁出现就给谁套一次，只有当次运行里第一次出现时才动它。
 
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
 
 use crate::{
     audio::{AudioCommand, AudioEngine, Snapshot},
     config::StartupProfile,
 };
 
-/// 应用音量的匹配窗口：启动后这么久之内冒出来的应用都会被套用一次。
-const APP_WINDOW: Duration = Duration::from_secs(120);
-
 pub struct Startup {
     profile: StartupProfile,
-    started: Instant,
     /// 设备侧只做一次。
     devices_done: bool,
     /// 还没套用的应用音量：会话 key → 百分比。
@@ -40,7 +33,6 @@ impl Startup {
         };
         Self {
             profile,
-            started: Instant::now(),
             devices_done: false,
             pending_apps,
         }
@@ -58,7 +50,7 @@ impl Startup {
     }
 
     fn apply_apps(&mut self, snapshot: &Snapshot, engine: &AudioEngine) {
-        for command in app_commands(&mut self.pending_apps, snapshot, self.started.elapsed()) {
+        for command in app_commands(&mut self.pending_apps, snapshot) {
             engine.send(command);
         }
     }
@@ -68,17 +60,13 @@ impl Startup {
 ///
 /// 匹配到就记进 `done` 并删掉，所以同一个应用只会被套用一次；
 /// 差值小于 0.5% 的直接跳过，免得每次快照都白打一次 WASAPI。
-fn app_commands(
-    pending: &mut HashMap<String, u32>,
-    snapshot: &Snapshot,
-    elapsed: Duration,
-) -> Vec<AudioCommand> {
+///
+/// **不设「启动后多久之内」的时限**：以前卡 120 秒，结果开机两分钟后才打开的
+/// 应用永远等不到，用户看到的却是「有时候记得住、有时候记不住」。名单里的人
+/// 明确记过这个应用的音量，什么时候打开都该套上；套过一次就从待办里删掉，
+/// 之后用户自己怎么调都不会再被拉回去。
+fn app_commands(pending: &mut HashMap<String, u32>, snapshot: &Snapshot) -> Vec<AudioCommand> {
     if pending.is_empty() {
-        return Vec::new();
-    }
-    if elapsed > APP_WINDOW {
-        // 窗口过了就不再等：免得半夜插进来一个从没启动过的应用被莫名其妙改了音量。
-        pending.clear();
         return Vec::new();
     }
     let mut commands = Vec::new();
@@ -492,7 +480,7 @@ mod tests {
             session_devices: Vec::new(),
         });
         let mut pending = HashMap::from([("exe:c:\\music.exe".to_string(), 25u32)]);
-        let commands = app_commands(&mut pending, &snap, Duration::from_secs(1));
+        let commands = app_commands(&mut pending, &snap);
         assert_eq!(commands.len(), 1, "{commands:?}");
         match &commands[0] {
             AudioCommand::SetAppVolume { key, volume, .. } => {
@@ -504,7 +492,7 @@ mod tests {
         assert!(pending.is_empty(), "套用过的应用要从待办里删掉");
 
         // 下一次同一份快照：什么都不该再发。
-        assert!(app_commands(&mut pending, &snap, Duration::from_secs(2)).is_empty());
+        assert!(app_commands(&mut pending, &snap).is_empty());
     }
 
     /// 已经就在目标值上的应用不要重复写。
@@ -526,20 +514,16 @@ mod tests {
             session_devices: Vec::new(),
         });
         let mut pending = HashMap::from([("exe:c:\\music.exe".to_string(), 25u32)]);
-        assert!(app_commands(&mut pending, &snap, Duration::from_secs(1)).is_empty());
+        assert!(app_commands(&mut pending, &snap).is_empty());
         assert!(pending.is_empty());
     }
 
-    /// 窗口过了就不再等，免得启动很久以后才打开的应用被改音量。
+    /// 没出现的应用要一直等着：不设时限，开机后多久才打开都能套上。
     #[test]
-    fn app_window_expires() {
+    fn apps_that_are_not_running_stay_pending() {
         let mut pending = HashMap::from([("exe:c:\\music.exe".to_string(), 25u32)]);
-        let commands = app_commands(
-            &mut pending,
-            &snapshot(),
-            APP_WINDOW + Duration::from_secs(1),
-        );
-        assert!(commands.is_empty());
-        assert!(pending.is_empty());
+        // 快照里没有 music.exe。
+        assert!(app_commands(&mut pending, &snapshot()).is_empty());
+        assert_eq!(pending.len(), 1, "没出现的应用不能被时间清掉");
     }
 }

@@ -35,12 +35,16 @@
 //! 不用另做补偿）。压到 2% 时原声残留在 -34dB，相对接管后的输出约 -41dB，
 //! 听不出来；而 2% 的信号在 float32 通路里乘 50 倍回来不会有量化损失。
 //!
-//! **但上表不是所有进程都成立**：实测 Dopus 播放视频时，会话被压到 2%（回读
-//! 确认过），抓到的峰值仍是 0.985 满幅 —— 它的捕获点在会话音量**之前**。
-//! 那种进程按上表乘 50 倍就是「满幅原声 × 50」→ 削顶失真。不过这不是靠猜能解决的：
-//! 用「压前 / 压后的能量比」去判，会被内容自己的起伏带偏（后段常常虚高），
-//! 实测直接导致「声音只剩一成」。所以增益固定按 `1 / ATTEN` 走，能量比只记进
-//! 诊断行（`ratio`）留着以后分析。
+//! **但上表不是所有进程都成立**：实测 Dopus 播放视频、飞书开会时，会话被压到 2%
+//! （回读确认过），抓到的峰值仍是满幅 —— 这些进程的捕获点在会话音量**之前**。
+//! 那种进程按上表乘 50 倍就是「满幅原声 × 50」：0.25 峰值的内容直接推出满幅方波，
+//! 三五阶谐波到 17%，听感就是「一开均衡又响又炸」。
+//!
+//! 所以这一版**不再假设捕获点在音量哪一侧**。引擎只告诉流「这一路最多能输出多响」
+//! （`BoostTarget::cap` = 内容峰值 × 增益，已经钳在目标以下），流自己每块量一次
+//! **捕获信号的真实峰值**，按它反算该乘多少（`next_gain`）：捕获在音量之后就自动
+//! 乘 50，之前就自动乘 1，两种进程都精确落在同一个输出峰值上。`1 / ATTEN` 那条
+//! 「先压到 2% 再补 50 倍」的放大链从信号通路上彻底拿掉了；`ratio` 只留作诊断。
 //!
 //! # 已知代价（都是这条路绕不过去的）
 //!
@@ -108,44 +112,60 @@ const GUARD_TIGHT_EVERY: Duration = Duration::from_millis(60);
 /// 压不下去；给几轮重试，比立刻关流（听感就是「开了均衡没反应」）强。
 const ATTEN_TRIES: u8 = 12;
 const ATTEN_RETRY_EVERY: Duration = Duration::from_millis(30);
-/// 增益下降的平滑系数（每次 `pump` ≈ 8ms，0.25 约 30ms 走完）。
-const GAIN_FALL: f32 = 0.25;
-/// 增益上升的平滑系数（慢一些，避免「刚压下去又抬上来」的抽吸）。
-const GAIN_RISE: f32 = 0.07;
-/// 输出端限幅器的天花板。留 2% 余量给 `soften` 之后的取整/上混。
-const LIMIT_CEIL: f32 = 0.98;
-/// 限幅器的释放速度（每个样本向 1.0 逼近的比例）。
+/// 接管流输出的峰值上限。
 ///
-/// 48k 下约 120ms。太快会「一喘一喘」（每来一个音效就被按下去又抬起来，
-/// 像 pumping）；太慢则整段都闷。120ms 听不出抽吸，也不会闷住下一句。
-const LIMIT_RELEASE: f32 = 0.00017;
-/// 限幅器压到这个比例以下算「异常」。
-const LIMIT_FLOOR: f32 = 0.25;
-/// 连续多少拍都异常才关流（一拍约 8ms，125 拍 ≈ 1 秒）。
-const LIMIT_RUN: u32 = 125;
+/// 引擎给的目标最高到 `CLIP_LEVEL * 0.99 ≈ 0.9069`，而 `soften` 的拐点在 0.916
+/// —— 两者只差 1%。限幅只要有一丝误差就会进波形压缩（谐波失真，听感是「糊、
+/// 炸」），所以这里再留 2% 余量：输出峰值按在 0.89，`soften` 永远不参与。
+const OUT_CEIL: f32 = 0.89;
+/// 一块（≈24ms）里增益往「放开」方向走多远（向目标逼近的比例，约 200ms 走完）。
+///
+/// 只对「放」平滑：这一块的真实峰值变小了，增益慢慢抬，不然安静段一进来就是
+/// 一次「抽吸」。往「压」的方向必须**立即到位** —— 慢一块这一块的峰值就过线了，
+/// 而输出端不再有削波兜底（见 [`next_gain`]）。
+const GAIN_RISE_PER_BLOCK: f32 = 0.12;
+/// 判定「这一块有内容」的捕获峰值下限（-120dB，只挡纯静音）。
+///
+/// 捕获点在会话音量之后时，0.02 峰值的内容抓出来只有 `2e-4` —— 门槛必须足够低，
+/// 否则安静的内容会被当成静音、增益停在上一块的值上不动。
+const MIN_BLOCK_PEAK: f32 = 1e-6;
+/// 相对捕获信号的增益上限（+54dB）。
+///
+/// 捕获点可能在 2% 之后（要把 50 倍补回来），再乘 AGC 的 4 倍是 200 —— 给到 512
+/// 只是为了不误伤极安静的素材；真正限制输出的是 `cap`，不是这个数。
+const MAX_BLOCK_GAIN: f32 = 512.0;
 /// 开声之前先攒多少毫秒的数据（见 `Stream::out_started`）。
 const PREFILL_MS: u32 = 40;
 /// 建流失败后多久再试（应用可能只是暂时不出声 / 设备在切）。
 const RETRY_AFTER: Duration = Duration::from_secs(10);
 /// 接管期间把原会话压到多少（压 0 / 静音会让捕获变哑，见模块文档）。
 ///
-/// 2% = -34dB：原声残留相对接管后的输出约 -41dB，听不出来；
-/// 抓到的信号再乘 `1/ATTEN` = 50 倍补回来，float32 通路里没有量化损失。
+/// 2% = -34dB：原声残留相对接管后的输出约 -41dB，听不出来。乘多少补回来不由
+/// 这个数决定 —— 流按捕获信号的真实峰值反算（[`next_gain`]），2% 只是「原声
+/// 让位」的深度。
 pub(crate) const ATTEN: f32 = 0.02;
 /// 写过 [`ATTEN`] 之后静音多久再放声。
 ///
 /// 音量写下去到捕获流里反映出来有几十毫秒延迟，这段里抓到的还是压之前的满幅
-/// 数据（实测：接管刚开的那一下设备电平表直接顶到 1.0，就是这一包乘了
-/// `1/ATTEN` 放出去的）。固定等这么久，比「看见峰值变小才放行」可靠 ——
-/// 后者会被内容里的静音间隙骗过。
+/// 数据。现在按真实峰值算增益，这段不会炸了（增益会小 50 倍），但**电平会跳**：
+/// 压下去之后同一段内容突然需要 50 倍，控制环要从头追一遍。固定等这么久，
+/// 比「看见峰值变小才放行」可靠 —— 后者会被内容里的静音间隙骗过。
 const COMP_WINDOW: Duration = Duration::from_millis(150);
 
 /// 引擎发给接管线程的一条目标。
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoostTarget {
     pub pid: u32,
-    /// 输出增益（1.0 = 原样，2.0 = +6dB）。
-    pub gain: f32,
+    /// 这条流**允许输出的峰值**（线性幅度，0–1）。
+    ///
+    /// 引擎按 AGC 的估算给：内容峰值 × 增益，再钳到目标（≤ 0.9069）以下。
+    /// 流自己量捕获信号的真实峰值，反算出该乘多少让它正好落在这个高度
+    /// （见 [`next_gain`]）—— 所以这里不再是「乘几倍」。
+    ///
+    /// 以前传的是 `gain / ATTEN`（最高 200 倍），前提是捕获点在会话音量之后。
+    /// 捕获点在前面的进程（Dopus / 飞书）抓到的是满幅原声，乘 200 直接削成方波：
+    /// 音质和音量一起炸。传「该有多响」比传「乘几倍」稳，也绕开了那个假设。
+    pub cap: f32,
     /// 这个应用的声音现在在哪台端点上（`None` = 系统默认设备）。
     ///
     /// 引擎从会话扫描里拿到的是**会话实际挂着的设备**，也就是应用被指定到哪台
@@ -413,13 +433,11 @@ impl Hub {
             }
         }
 
-        // 增益随时在变（算法每 15ms 调一次）。
-        //
-        // 抓到的信号已经被会话音量压过 `ATTEN`，所以这里要除掉它，
-        // 才能得到「乘完正好是 content × 增益」。
+        // 目标峰值随时在变（算法每 15ms 调一次）。钳在 `OUT_CEIL` 以下：
+        // 超过它就会进 `soften` 的波形压缩，那是谐波失真。
         for target in &self.targets {
             if let Some(stream) = self.streams.get_mut(&target.pid) {
-                stream.gain_target = target.gain / ATTEN;
+                stream.cap = target.cap.clamp(0.0, OUT_CEIL);
             }
         }
 
@@ -500,17 +518,19 @@ impl Hub {
             let vol = session_volume(&self.enumerator, stream.device_id.as_deref(), stream.pid)
                 .unwrap_or(-1.0);
             crate::platform::hotkey::trace(&format!(
-                "boost level pid {} cap={:.4} heard={:.4} vol={vol:.3} ratio={:.3} gain={:.3} lim={:.3} zero={}",
+                "boost level pid {} cappeak={:.4} out={:.4} heard={:.4} vol={vol:.3} ratio={:.3} target={:.3} gain={:.3} zero={}",
                 stream.pid,
                 stream.cap_peak,
+                stream.out_peak,
                 stream.heard_peak,
                 stream.seen_ratio,
-                stream.gain,
+                stream.cap,
                 stream.lim,
                 stream.zero_pending
             ));
             stream.diag_at = Instant::now();
             stream.cap_peak = 0.0;
+            stream.out_peak = 0.0;
         }
 
         // 兜底：接管期间会话音量被**外部**改大（在播放器界面里拖音量、系统
@@ -588,14 +608,19 @@ struct Stream {
     pending_target: u32,
     ring: VecDeque<f32>,
     ring_cap: usize,
-    /// 这一块实际乘的增益（向 `gain_target` 平滑靠拢）。
-    gain: f32,
-    /// AGC 要求的目标增益。
+    /// 这一块要输出的峰值（由引擎按 AGC 估算给，恒 ≤ [`OUT_CEIL`]）。
+    cap: f32,
+    /// 这一块实际乘的增益（相对**捕获信号**，由 [`next_gain`] 按真实峰值算）。
     ///
-    /// 不能直接赋值给 `gain`：AGC 一次回退可能是 -3dB 以上（`OVER_FIT` 那条
-    /// 按比例回退），8ms 内掉 30% 的幅度听感就是「被按了一下」。这里降得快
-    /// （约 30ms 走完）、升得慢（约 150ms），两个方向都听不出台阶。
-    gain_target: f32,
+    /// 块与块之间可以差很多（内容一响一轻），但块内恒定 —— 块内变增益等于
+    /// 逐样本改包络，那是谐波失真。往「压」的方向立即到位，往「放」的方向
+    /// 走 `GAIN_RISE_PER_BLOCK`，所以输出峰值永远不超过 `cap`。
+    lim: f32,
+    /// `lim` 是否已经按第一块的真实峰值定过初值。
+    ///
+    /// 没定过的时候不能从 1.0 慢慢放开（第一声会爆），也不能从 0 慢慢爬
+    /// （第一声会轻半秒）—— 第一块直接取算出来的值。
+    lim_started: bool,
     /// 接管时把原会话压下去之前的音量（退出时按这个还原）。
     saved_volume: Option<f32>,
     /// 已经抓到过非静音数据（此时才敢把原会话压到 [`ATTEN`]）。
@@ -610,10 +635,9 @@ struct Stream {
     post_n: u64,
     /// 压完之后量到的「后段能量 / 前段能量」（**只做诊断**，不参与增益）。
     ///
-    /// 按设计应该是 1/[`ATTEN`]（≈0.02，说明捕获点在会话音量之后）；要是接近 1，
-    /// 说明捕获点在音量之前 —— 那种进程乘 50 倍会削顶。但这个比值只能当线索：
-    /// 内容自己在变（压下去那几十毫秒抓到的还是压前的数据，后段就虚高），
-    /// 拿它直接决定增益会算错，实测出现过的后果是「声音只剩一成」。
+    /// 按设计应该是 0.02（说明捕获点在会话音量之后）；接近 1 说明在音量之前 ——
+    /// 那种进程上一版会乘 50 倍削成方波，也就是「一开均衡就炸」的那个现场。
+    /// 现在两种都按真实峰值算，这个比值只用来确认现场属于哪一类。
     seen_ratio: f32,
     /// 已经往会话写过 [`ATTEN`] 的时刻（`None` = 还没写）。
     attened_at: Option<Instant>,
@@ -627,13 +651,10 @@ struct Stream {
     atten_retry_at: Option<Instant>,
     /// 还没把原会话压下去。这期间**只输出静音**。
     ///
-    /// 压下去之前抓到的数据是**没被压过**的（捕获点在会话音量之前，见
-    /// [`COMP_WINDOW`]），这一段要是被渲染出去就是「原声 × 补偿倍数」——
-    /// 一开口就是一声炸。所以压之前一个样本都不往外送（也不进 ring）。
+    /// 压下去之前抓到的数据是**没被压过**的，压下去之后同一段内容要乘的倍数差
+    /// 50 倍。按真实峰值算不会炸，但控制环会在这两种状态之间跳一次电平 ——
+    /// 一开口就是一次忽大忽小。所以压下去之前一个样本都不往外送（也不进 ring）。
     zero_pending: bool,
-    /// 连着多少拍输出顶到削顶。正常不该出现（AGC 的目标在 91.6% 以下），
-    /// 出现了说明要么原声没压住、要么在自激，立刻关流重来。
-    clip_run: u32,
     /// ring 攒够这么多样本才开始出声（见 `out_started`）。
     prefill: usize,
     /// 已经真的出过声了。
@@ -655,25 +676,47 @@ struct Stream {
     cap_peak: f32,
     /// 上一次记诊断行的时刻。
     diag_at: Instant,
-    /// 输出端限幅器当前的增益（1.0 = 没在压）。
+    /// 最近一秒真正写进渲染缓冲的峰值（诊断用）。
     ///
-    /// AGC 是「外部」的：它只能 15ms 读一次会话电平表，再用这个估计去决定
-    /// 增益；视频里比 15ms 还短的瞬态（枪声、鼓点、音效）它根本看不见，等
-    /// 看见时那一块已经放出去了。插件没有这个问题 —— 它在 DSP 里逐样本看。
-    ///
-    /// 所以这里补一道**逐样本**的限幅：按真实样本算，需要的增益比现在小就
-    /// 立刻压下去（攻击沿第一个样本就生效，永远不会削顶），之后慢慢放回。
-    /// 乘增益不会让波形变平，跟 `soften` 的波形压缩是两回事 —— 后者在
-    /// 输入 1.6 时把波形按成 0.99，谐波失真一大就正是「炸」的听感。
-    lim: f32,
+    /// 和 `cap` 一起看：两者应该贴合（差一个块内的瞬态）。要是明显超过
+    /// [`OUT_CEIL`]，说明算好的增益没落到实际输出上 —— 那就还有别的地方在乘。
+    out_peak: f32,
 }
 
-/// 输出端的软拐点限幅。
+/// 这一块该乘多少。
 ///
-/// AGC 一块（26ms）才走一步，接管流这一侧偶尔会比它更早涨上去（切换素材、
-/// 起音、ring 里还没换成新增益的样本）。硬 clamp 会在 1.0 上削出方波，
-/// 听感是刺耳的「嘶」；这里在拐点以下**一个样本都不动**，以上按双曲线压进
-/// 1.0 —— 曲线在拐点处一阶连续，没有台阶，过冲只剩 26ms 也不会炸耳朵。
+/// `cap` 是这条流允许输出的峰值，`block_peak` 是这一块**捕获信号**的峰值。
+/// 用它反算增益，就不需要事先知道捕获点在会话音量的哪一侧：
+///
+/// * 捕获在音量之后（抓到的已经是 2% 的那个）：`cap / (0.02c)` —— 自动把 50 倍补回来；
+/// * 捕获在音量之前（抓到满幅原声）：`cap / c` —— 自动不补。
+///
+/// 两种进程的输出峰值都正好是 `cap`。以前固定乘 `1 / ATTEN`（50 倍）再乘 AGC 的
+/// 增益，碰上后一种就是「满幅 × 200」：输出端逐样本硬压到 0.98 —— 波形被削成方波，
+/// 谐波失真 17%，音质和音量一起炸。这是那个 bug 的根。
+///
+/// 压（`want < current`）立即到位，因此输出永远不过 `cap`；放走得慢，避免抽吸。
+/// `started == false` 时直接取 `want`（第一块就落在正确电平，不从 1.0 爆也不从 0 爬）。
+fn next_gain(cap: f32, block_peak: f32, current: f32, started: bool) -> f32 {
+    if block_peak <= MIN_BLOCK_PEAK {
+        // 纯静音块：增益不动（别在这里抬高，下一声就是爆音）。
+        return if started { current } else { 0.0 };
+    }
+    let want = (cap.max(0.0) / block_peak).clamp(0.0, MAX_BLOCK_GAIN);
+    if !started || want <= current {
+        want
+    } else {
+        current + (want - current) * GAIN_RISE_PER_BLOCK
+    }
+}
+
+/// 输出端的软拐点限幅（最后一道兜底，正常**永远不参与**）。
+///
+/// 它的作用是把拐点以上的波形压平，也就是**谐波失真** —— 那是「炸」的听感本身，
+/// 不能当限幅手段用。上一版靠它兜输出端，等于每块峰值都被压一次（输入 1.6 压成
+/// 0.99），音质就糊了。现在输出峰值由 [`next_gain`] 按真实样本算准，恒在
+/// [`OUT_CEIL`](0.89) 以下，比这里的拐点 0.916 还低 —— 这个函数只在
+/// 上混 / 驱动自己抬电平时才可能被碰到。
 fn soften(value: f32) -> f32 {
     /// 拐点取 AGC 的防削顶线：这以下的信号完全不动。
     const KNEE: f32 = 0.916;
@@ -792,10 +835,11 @@ impl Stream {
                 pending_target: (PENDING_MS * frames_per_ms).min(max_frames / 2).max(1),
                 ring: VecDeque::new(),
                 ring_cap: (RING_MS * frames_per_ms) as usize * channels,
-                // 抓到的信号已经被会话音量压过 `ATTEN`，所以乘的是「目标 / ATTEN」。
-                // 开流就按正确值起，别让平滑从 1.0 慢慢爬（那样头一秒会很轻）。
-                gain: target.gain / ATTEN,
-                gain_target: target.gain / ATTEN,
+                // 目标峰值按引擎给的起；`lim` 等第一块的真实峰值算出来再定
+                // （`lim_started`），既不从 1.0 爆一声，也不从 0 慢慢爬。
+                cap: target.cap.clamp(0.0, OUT_CEIL),
+                lim: 0.0,
+                lim_started: false,
                 saved_volume: None,
                 heard: false,
                 heard_peak: 0.0,
@@ -808,14 +852,13 @@ impl Stream {
                 atten_tries: 0,
                 atten_retry_at: None,
                 zero_pending: true,
-                clip_run: 0,
                 prefill: (PREFILL_MS * frames_per_ms) as usize * channels,
                 out_started: false,
                 released_at: None,
                 guard_at: Instant::now(),
                 cap_peak: 0.0,
                 diag_at: Instant::now(),
-                lim: 1.0,
+                out_peak: 0.0,
             };
             // 让原声让位：把会话音量压到 [`ATTEN`]（**不是静音**，静音会让捕获变哑，
             // 见模块文档）。这里还不压：先等抓到了真的非静音数据（见 `tick`），
@@ -845,9 +888,6 @@ impl Stream {
 
     /// 搬一次数据。返回 false 表示这条流该关了。
     fn pump(&mut self) -> bool {
-        // 增益平滑（见 `gain_target`）：一次掉太多会「被按一下」。
-        let step = if self.gain_target < self.gain { GAIN_FALL } else { GAIN_RISE };
-        self.gain += (self.gain_target - self.gain) * step;
         unsafe {
             // ---- 捕获 → ring ----
             loop {
@@ -945,74 +985,35 @@ impl Stream {
                 out.fill(0.0);
             } else {
                 self.out_started = true;
-                let gain = self.gain;
-                // 先看一眼**这一整块**要输出的样本，需要压就现在压。
+                // 先量**这一整块**捕获样本的真实峰值，再反算该乘多少（见 `next_gain`）。
                 //
-                // 逐样本压也来得及（第一个超线的样本就把增益拉下来），但那是
-                // 在块中间突然掉一截，听感是「咔」。这里提前一块把增益压到位，
-                // 块内就是平的 —— 相当于给限幅器做了 lookahead。
+                // 块内恒定是这套做法的关键：整块乘同一个数，波形只是缩放，一点谐波
+                // 都不添。以前是逐样本「超线就压到线上」—— 等于把所有超线样本削平成
+                // 0.98 的方波，碰上捕获点在音量之前的进程（抓到满幅原声，乘了 200 倍）
+                // 就是「音质和音量一起炸」。那正是这个 bug 的根。
                 let look = (fill as usize * self.channels).min(self.ring.len());
-                let ahead = self
+                let block_peak = self
                     .ring
                     .iter()
                     .take(look)
-                    .fold(0.0f32, |max, value| max.max(value.abs()))
-                    * gain;
-                if ahead > LIMIT_CEIL {
-                    let need = LIMIT_CEIL / ahead;
-                    if need < self.lim {
-                        self.lim = need;
-                    }
-                }
+                    .fold(0.0f32, |max, value| max.max(value.abs()));
+                self.lim = next_gain(self.cap, block_peak, self.lim, self.lim_started);
+                self.lim_started = true;
+                let gain = self.lim;
                 let mut peak = 0.0f32;
-                let mut lim_min = self.lim;
                 for sample in out.iter_mut() {
                     let raw = match self.ring.pop_front() {
                         Some(value) => value * gain,
                         // 欠载就补静音，别把上一轮的样本留着重复播。
                         None => 0.0,
                     };
-                    // 逐样本限幅（见 `lim` 的说明）：要压就立刻压，之后慢慢放。
-                    let magnitude = raw.abs();
-                    let need = if magnitude > LIMIT_CEIL {
-                        LIMIT_CEIL / magnitude
-                    } else {
-                        1.0
-                    };
-                    if need < self.lim {
-                        self.lim = need;
-                    } else {
-                        self.lim += (1.0 - self.lim) * LIMIT_RELEASE;
-                        if self.lim > 1.0 {
-                            self.lim = 1.0;
-                        }
-                    }
-                    lim_min = lim_min.min(self.lim);
-                    // `soften` 只当最后一道兜底（限幅之后几乎不会触发）。
-                    let value = soften(raw * self.lim);
+                    // 输出峰值已经压在 `cap`（≤ 0.89）以下，`soften` 只是最后兜底。
+                    let value = soften(raw);
                     peak = peak.max(value.abs());
                     *sample = value;
                 }
-                // 限幅器长期贴地 = AGC 给的增益远超实际内容（或者真在自激）。
-                // 输出一直被压十几 dB，继续放着只会越来越闷，关流重来。
-                if lim_min < LIMIT_FLOOR {
-                    self.clip_run += 1;
-                } else {
-                    self.clip_run = 0;
-                }
-                if self.clip_run > LIMIT_RUN {
-                    return false;
-                }
-                // 自激保护：AGC 的目标在 91.6% 以下，长期顶满说明有东西在回授
-                // （原声没压住 / 抓到了自己），继续放就是越放越响。
-                if peak > 0.999 {
-                    self.clip_run += 1;
-                } else {
-                    self.clip_run = 0;
-                }
-                if self.clip_run > 24 {
-                    return false;
-                }
+                // 诊断：这一段真正写进渲染缓冲的峰值（`Hub::tick` 每秒清一次）。
+                self.out_peak = self.out_peak.max(peak);
             }
             if self.render_client.ReleaseBuffer(fill, 0).is_err() {
                 return false;
@@ -1024,11 +1025,12 @@ impl Stream {
     /// 压完之后静音一段，够 [`COMP_WINDOW`] 就放行。
     ///
     /// 为什么要等：音量写下去到捕获流里反映出来有几十毫秒延迟，这段里抓到的还是
-    /// 压之前的满幅数据 —— 放出去就是「原声 × 50」，一开口一声炸。
+    /// 压之前的满幅数据。按真实峰值算增益之后这段不会炸了，但电平会跳一截
+    /// （同一段内容突然要多乘 50 倍），先静音过去比让人听见那次跳好。
     ///
     /// 顺手把「后段能量 / 前段能量」记进 `seen_ratio`，**只做诊断**：正常应该是
-    /// 0.02 上下（捕获在会话音量之后）。拿它决定增益是不行的 —— 内容自己在变，
-    /// 后段常常虚高，实测出现过「判成 1 倍 → 声音只剩一成」。
+    /// 0.02 上下（捕获在会话音量之后）、接近 1 是之前。增益不再依赖它 ——
+    /// 流自己量真实峰值就够了，这个比值只留着排查现场。
     fn settle(&mut self) -> bool {
         let Some(written) = self.attened_at else {
             return false;
@@ -1067,7 +1069,17 @@ impl Stream {
             let _ = self.capture.Stop();
         }
         if let Some(saved) = self.saved_volume.filter(|_| self.attened_at.is_some()) {
-            restore_session_volume(enumerator, self.device_id.as_deref(), self.pid, saved);
+            // 只还「还压着」的那份。
+            //
+            // 用户自己拖过滑条之后，会话上已经是他要的值了（`SetAppVolume` 会先
+            // 写再退出接管）；这时再还 `saved` 就是把刚拖好的那一格盖回去 ——
+            // 表现是「拖到 30%，手一松又跳回 100%」，而且他重启一次程序，
+            // 面板里那个应用永远显示满格。
+            let now = session_volume(enumerator, self.device_id.as_deref(), self.pid);
+            let still_ours = now.is_none_or(|value| value <= ATTEN * 2.0);
+            if still_ours {
+                restore_session_volume(enumerator, self.device_id.as_deref(), self.pid, saved);
+            }
             forget_zeroed(self.pid);
         }
     }
@@ -1140,6 +1152,17 @@ fn restore_stale_volumes(enumerator: &IMMDeviceEnumerator) {
             continue;
         }
         let device = parts.next().filter(|id| *id != LEDGER_ANY_DEVICE);
+        // 只还「还压着」的那份。
+        //
+        // 账本可能是上次崩溃留下的，那之后 pid 早被别的进程复用（Windows 的 pid
+        // 回收很快），或者用户自己已经把这个应用的音量调回去了。当前音量明显不是
+        // 我们压的 [`ATTEN`] 就别动它 —— 否则一次崩溃就会在下次启动时把别人正常的
+        // 音量改成账上记的旧值。
+        if let Some(now) = session_volume(enumerator, device, pid) {
+            if now > ATTEN * 2.0 {
+                continue;
+            }
+        }
         restore_session_volume(enumerator, device, pid, volume);
     }
     let _ = std::fs::remove_file(&path);
@@ -1422,5 +1445,95 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activation_Impl {
             condvar.notify_all();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 复刻 `pump` 的块级处理：整块乘同一个增益，再走 `soften`。
+    fn render_block(block_peak: f32, cap: f32, lim: f32, started: bool) -> (f32, f32) {
+        let gain = next_gain(cap, block_peak, lim, started);
+        // 一块正弦（峰值正好是 block_peak），逐样本乘同一个 gain。
+        let mut out_peak = 0.0f32;
+        for index in 0..256 {
+            let sample = (index as f32 / 256.0 * std::f32::consts::TAU).sin() * block_peak;
+            out_peak = out_peak.max(soften(sample * gain).abs());
+        }
+        (out_peak, gain)
+    }
+
+    /// 捕获点在会话音量之后（抓到的是 2% 那一份）：要把 50 倍补回来，
+    /// 但输出必须正好落在 cap 上，不能超。
+    #[test]
+    fn captured_after_the_volume_still_lands_on_the_cap() {
+        for content in [0.02f32, 0.05, 0.1, 0.25, 0.5] {
+            // 引擎给的 cap = 内容峰值 × 增益（AGC 最多 4 倍），再钳到目标以下。
+            let cap = (content * 4.0).min(0.89);
+            let captured = content * ATTEN;
+            let (out, gain) = render_block(captured, cap, 0.0, false);
+            assert!(
+                (out - cap).abs() < 0.002,
+                "内容 {content} 抓成 {captured} 之后输出 {out}（gain {gain}）应在 {cap}"
+            );
+        }
+    }
+
+    /// 捕获点在会话音量之前（Dopus / 飞书这类进程抓到满幅原声）：
+    /// 以前固定乘 `1 / ATTEN`，输出是 cap 之外再多 50 倍 —— 削成方波就是「炸」。
+    #[test]
+    fn captured_before_the_volume_is_not_boosted_fifty_times() {
+        let cap = 0.89;
+        for content in [0.05, 0.25, 1.0] {
+            let (out, gain) = render_block(content, cap, 0.0, false);
+            assert!(
+                (out - cap).abs() < 0.002,
+                "内容 {content} 原样抓到时输出 {out}（gain {gain}）应落在 {cap}"
+            );
+            assert!(out < 0.916, "输出不能进 soften 的拐点");
+        }
+    }
+
+    /// 目标只能是「该有多响」，绝不能超过 `OUT_CEIL`（超过就在 waveform 上削）。
+    #[test]
+    fn the_cap_is_kept_below_the_soften_knee() {
+        let (out, _) = render_block(0.3, OUT_CEIL, 0.0, false);
+        assert!(out <= OUT_CEIL + 1e-6);
+        // 一条满幅原声：以前乘 200 倍，输出被削平在 0.98（方波）。
+        let (out, gain) = render_block(1.0, OUT_CEIL, 0.0, false);
+        assert!(gain <= OUT_CEIL + 1e-6, "满幅内容也只能乘到 {OUT_CEIL}：{gain}");
+        assert!(out < 0.9, "满幅内容最多降到 {OUT_CEIL} 附近，不是削平：{out}");
+    }
+
+    /// 放开要一块一块地走（防抽吸），压回去必须立刻到位（防超线）。
+    #[test]
+    fn gain_falls_at_once_and_rises_slowly() {
+        // 从 0.9 的目标掉到 0.3 那一块：立刻压到 0.3/0.5。
+        let low = next_gain(0.3, 0.5, 0.9, true);
+        assert!((low - 0.6).abs() < 1e-6, "压要立即到位：{low}");
+        // 反向：0.5 涨到 0.9 那一块，只能走一部分。
+        let rising = next_gain(0.9, 0.5, 0.6, true);
+        assert!(rising > 0.6 && rising < 1.8, "升要平滑：{rising}");
+        // 连走很多块才会接近目标。
+        let mut gain = rising;
+        for _ in 0..40 {
+            gain = next_gain(0.9, 0.5, gain, true);
+        }
+        assert!((gain - 1.8).abs() < 0.01, "最终应到位：{gain}");
+    }
+
+    /// 纯静音块不动增益：跟着内容归零的话，下一声就是「从 0 猛爬到满」。
+    #[test]
+    fn a_silent_block_keeps_the_gain() {
+        assert!((next_gain(0.89, 0.0, 12.5, true) - 12.5).abs() < 1e-6);
+        assert_eq!(next_gain(0.89, 0.0, 12.5, false), 0.0);
+    }
+
+    /// 相对增益有上限，别把底噪（-80dB 的嘶声）放大到满幅。
+    #[test]
+    fn the_gain_has_a_ceiling() {
+        let gain = next_gain(0.89, 1e-6, 1.0, true);
+        assert!(gain <= MAX_BLOCK_GAIN, "增益被钳在 {MAX_BLOCK_GAIN}：{gain}");
     }
 }

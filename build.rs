@@ -2,8 +2,9 @@
 //!
 //! 直接调 Windows SDK 的 `rc.exe`，不引第三方 crate：
 //! 找不到 rc.exe 就静默跳过（只是没有 exe 图标，程序照常运行）。
-//! 图标资源 id 用的是 1 —— Windows 取「exe 的主图标」时取的就是编号最小的那组，
-//! 所以 `LoadImageW(hInstance, MAKEINTRESOURCE(1), ...)` 拿到的也是这一份。
+//! 图标资源 id 用的是 1 / 2 —— Windows 取「exe 的主图标」时取的是编号最小的那组，
+//! 所以资源管理器里永远显示 id 1（浅底那张）。id 2 是红底那张，只在运行时
+//! 被窗口图标用上（设置里选「红底」时 `LoadImageW` 换取 2 号）。
 
 use std::{
     path::{Path, PathBuf},
@@ -12,6 +13,7 @@ use std::{
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/Bolume.ico");
+    println!("cargo:rerun-if-changed=assets/Bolume-red.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
@@ -40,9 +42,21 @@ fn main() {
         .display()
         .to_string()
         .replace('\\', "\\\\");
+    // 红底那张是可选配色：文件不在就只嵌浅底，程序照常跑。
+    let red = Path::new("assets/Bolume-red.ico");
+    let red_line = if red.exists() {
+        std::fs::canonicalize(red)
+            .unwrap_or_else(|_| red.to_path_buf())
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+    } else {
+        String::new()
+    };
 
     let script = format!(
         r#"1 ICON "{ico_path}"
+{red_entry}
 
 1 VERSIONINFO
 FILEVERSION {major},{minor},{patch},{build}
@@ -67,7 +81,12 @@ BEGIN
     VALUE "Translation", 0x804, 1200
   END
 END
-"#
+"#,
+        red_entry = if red_line.is_empty() {
+            String::new()
+        } else {
+            format!("2 ICON \"{red_line}\"\n")
+        }
     );
     if std::fs::write(&rc_file, script).is_err() {
         return;

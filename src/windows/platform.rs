@@ -1083,8 +1083,8 @@ pub fn configure_settings_window(window: &Window) {
 
 /// 给窗口挂上编进 exe 的那张图标（任务栏按钮 / Alt+Tab / 标题栏左上角）。
 ///
-/// 资源 id 是 1，由 `build.rs` 写进 `bolume.rc`；从这里按窗口的 DPI 取
-/// 小图标和大图标两档，再通过 `WM_SETICON` 交给窗口。
+/// 资源 id 由 `build.rs` 写进 `bolume.rc`：1 = 浅底、2 = 红底，按配置里选的配色取；
+/// 从这里按窗口的 DPI 取小图标和大图标两档，再通过 `WM_SETICON` 交给窗口。
 /// 取不到就什么都不做——系统会退回 exe 的图标，依然是对的。
 fn apply_app_icon(hwnd: HWND) {
     use windows::Win32::Foundation::HINSTANCE;
@@ -1095,12 +1095,13 @@ fn apply_app_icon(hwnd: HWND) {
     use windows::core::PCWSTR;
 
     let module = unsafe { GetModuleHandleW(None) }.unwrap_or_default();
+    let id = crate::platform::app_icon::resource_id(crate::platform::app_icon::style());
     for (which, size) in [(ICON_SMALL, 16i32), (ICON_BIG, 32)] {
         let Ok(icon) = (unsafe {
             LoadImageW(
                 Some(HINSTANCE(module.0)),
-                // MAKEINTRESOURCE(1)：整数 id 直接当指针传。
-                PCWSTR(1 as *const u16),
+                // MAKEINTRESOURCE(id)：整数 id 直接当指针传。
+                PCWSTR(id as *const u16),
                 IMAGE_ICON,
                 size,
                 size,
@@ -1117,6 +1118,32 @@ fn apply_app_icon(hwnd: HWND) {
                 Some(windows::Win32::Foundation::LPARAM(icon.0 as isize)),
             );
         }
+    }
+}
+
+/// 把新配色套到已经开着的窗口上（设置页切换「软件图标配色」之后调）。
+///
+/// 只认本进程的顶层窗口：别的程序不能碰，系统窗口也没有意义。
+pub fn refresh_app_icons() {
+    use windows::Win32::Foundation::{LPARAM, TRUE};
+    use windows::core::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let pid = lparam.0 as u32;
+        let mut owner = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut owner as *mut u32));
+        }
+        if owner == pid {
+            apply_app_icon(hwnd);
+        }
+        TRUE
+    }
+
+    let pid = std::process::id();
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM(pid as isize));
     }
 }
 

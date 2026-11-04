@@ -330,6 +330,23 @@ pub fn run(
     let paths = AppPaths::discover();
     let config_path = paths.config_path().display().to_string();
     let config = Rc::new(RefCell::new(ConfigStore::load(paths.config_path())));
+    // 启动就把「现在用的是哪一份配置档」接上：`.active` 记着的名字还在，之后每次
+    // 保存都顺手写回那份档。不接的话重启后改动只落在 `config.json`，档文件悄悄
+    // 落后一步，下次「启用」它就把这段改动丢了。
+    {
+        let root = paths
+            .config_path()
+            .parent()
+            .map(|dir| dir.to_path_buf())
+            .unwrap_or_default();
+        let active = crate::profiles::read_active(&root).and_then(|name| {
+            crate::profiles::list(&root)
+                .into_iter()
+                .find(|profile| profile.name.eq_ignore_ascii_case(&name))
+                .map(|profile| profile.path)
+        });
+        config.borrow_mut().set_mirror(active);
+    }
     let icon_pixels = config.borrow().get().app_icon_size;
     let name_capitalize = config.borrow().get().app_name_capitalize;
     let engine = Rc::new(AudioEngine::spawn(
@@ -434,6 +451,8 @@ pub fn run(
     // 那条 MTA 线程和 manager 提前备好，否则第一次按键要等 WinRT 起服务。
     std::thread::spawn(crate::platform::media::prewarm);
 
+    // 窗口图标按配置的配色取（1 = 浅底、2 = 红底，都在 exe 资源里）。
+    crate::platform::app_icon::set_style(cfg0.app_icon_style);
     let startup_number = number_style(&cfg0);
     let tray = match Tray::new(
         crate::tray::IconSpec {
@@ -441,6 +460,7 @@ pub fn run(
             ink: crate::tray::parse_ink(&cfg0.tray_icon_color),
             color_by_level: cfg0.tray_color_by_level,
             custom: &cfg0.tray_icon_custom,
+            app_icon: cfg0.app_icon_style,
             number: &startup_number,
         },
         cfg0.language,
@@ -833,7 +853,8 @@ pub fn run(
 
             // 音频事件泵：刷新面板、托盘与设置页的设备列表
             let events = engine.events();
-            // 启动套用：只在这次启动的第一份快照之后跑一遍（之后用户怎么调都不再干预）。
+            // 启动套用：设备侧在第一份快照里一次办完；应用音量不设时限 ——
+            // 名单里的应用什么时候开声（会话出现）就什么时候套一次，之后不再干预。
             let mut startup = crate::startup::Startup::new(cfg0.startup.clone());
             cx.spawn(async move |cx| {
                 let mut last_device_key = String::new();
@@ -902,6 +923,7 @@ pub fn run(
                                 ink: crate::tray::parse_ink(&cfg.tray_icon_color),
                                 color_by_level: cfg.tray_color_by_level,
                                 custom: &cfg.tray_icon_custom,
+                                app_icon: cfg.app_icon_style,
                                 number: &number,
                             },
                             motion_gain: cfg.tray_motion_gain,
@@ -2959,6 +2981,7 @@ pub fn refresh_tray_icon(cx: &mut App) {
             ink: crate::tray::parse_ink(&cfg.tray_icon_color),
             color_by_level: cfg.tray_color_by_level,
             custom: &cfg.tray_icon_custom,
+            app_icon: cfg.app_icon_style,
             number: &number,
         },
         motion_gain: cfg.tray_motion_gain,
@@ -3047,8 +3070,9 @@ pub(crate) fn tooltip_facts(
     }
 }
 
-/// 从配置读托盘数字图标的外观（字体 / 抗锯齿 / 三档字号宽高字距）。
-fn number_style(cfg: &crate::config::Config) -> crate::tray::NumberStyle {
+/// 从配置读托盘数字图标的外观（字体 / 抗锯齿 / 三档字号宽高字距 / 底色块）。
+pub(crate) fn number_style(cfg: &crate::config::Config) -> crate::tray::NumberStyle {
+    let background = &cfg.tray_number_background;
     crate::tray::NumberStyle {
         font: cfg.tray_number_font.clone(),
         antialias: cfg.tray_number_antialias,
@@ -3057,6 +3081,16 @@ fn number_style(cfg: &crate::config::Config) -> crate::tray::NumberStyle {
             cfg.tray_digit_two,
             cfg.tray_digit_three,
         ],
+        // 底色只在开着的时候给：`None` 就是「没有底，只有数字」。
+        background: background.enabled.then(|| crate::tray::NumberBackground {
+            color: crate::tray::parse_ink(&background.color).unwrap_or_else(|| {
+                crate::tray::parse_ink(crate::config::DEFAULT_TRAY_NUMBER_BG)
+                    .unwrap_or([0xd6, 0x40, 0x2a])
+            }),
+            size: background.size,
+            round: background.round,
+        }),
+        offset: (cfg.tray_digit_offset_x, cfg.tray_digit_offset_y),
     }
 }
 

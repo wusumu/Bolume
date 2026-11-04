@@ -4,7 +4,7 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写 · 单文件 exe · 绿色免安装 · 配置就在 exe 旁边 · 中英双语界面**
 
-目前版本 **0.91** · [下载](../../releases) · [English](#english)
+目前版本 **0.92** · [下载](../../releases) · [English](#english)
 
 <p align="center">
   <img src="docs/shots/panel.png" width="440" alt="音量面板：设备一行，正在出声的应用各一行">

@@ -24,6 +24,19 @@ pub fn needs_frames(style: TrayIconStyle, color_by_level: bool) -> bool {
     matches!(style, TrayIconStyle::Dynamic) || (color_by_level && style.is_monochrome())
 }
 
+/// 数字图标的底色块（可选）。
+///
+/// 三个量都是「准备画的」值：颜色已经解析成 RGB、百分比只剩数字，
+/// 光栅化那一层不用再回头看配置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NumberBackground {
+    pub color: [u8; 3],
+    /// 色块边长占画布的百分比（50..=100）。
+    pub size: u32,
+    /// 圆角占「半边长」的百分比：0 = 方角，100 = 正圆。
+    pub round: u32,
+}
+
 /// 数字图标的外观：字体族 + 抗锯齿 + 按位数分档的字号 / 宽高 / 字距。
 ///
 /// 数字是**按目标尺寸直接光栅化**的，所以这些值一改就是那个字体自己的
@@ -34,10 +47,21 @@ pub struct NumberStyle {
     pub antialias: crate::config::TrayAntialias,
     /// 一位数（0–9）/ 两位数（10–99）/ 三位数（100）各一套。
     pub metrics: [crate::config::TrayDigitMetrics; 3],
+    /// 可选底色块：`None` = 只有数字，没有底。
+    pub background: Option<NumberBackground>,
+    /// 左右 / 上下微调（**16px 画布**上的像素，正 = 往右 / 往下）。
+    ///
+    /// 只挪数字：底色块永远居中，数字偏出去一点是用户自己在对齐。
+    pub offset: (i32, i32),
 }
 
 /// 数字的笔画粗细：托盘上 16px 用 600（半粗）比 400 清楚，旧版默认就是这个。
 const DIGIT_WEIGHT: i32 = 600;
+
+/// 位置微调的基准画布：配置里的 `+2` 指的是 16px 图标上的 2 像素。
+///
+/// 换个尺寸（高分屏的 24 / 32px、设置页预览）按 `side / 16` 等比放大。
+const DIGIT_OFFSET_BASE: f32 = 16.0;
 
 impl Default for NumberStyle {
     fn default() -> Self {
@@ -45,18 +69,34 @@ impl Default for NumberStyle {
             font: crate::config::DEFAULT_NUMBER_FONT.to_string(),
             antialias: Default::default(),
             metrics: Default::default(),
+            background: None,
+            offset: (0, 0),
         }
     }
 }
 
 impl NumberStyle {
-    /// 短哈希：托盘图标去重要用，换了字体必须重画。
+    /// 偏移换算到这张画布上：配置里填的是 16px 画布（96 DPI）上的像素。
+    ///
+    /// 高分屏的托盘图标本身更大（24 / 32px），偏移也按同一比例放大，看起来
+    /// 才是「挪了同样的距离」；设置页那张 16px 预览则原样使用。
+    fn offset_px(&self, side: u32) -> (i32, i32) {
+        let zoom = side as f32 / DIGIT_OFFSET_BASE;
+        (
+            (self.offset.0 as f32 * zoom).round() as i32,
+            (self.offset.1 as f32 * zoom).round() as i32,
+        )
+    }
+
+    /// 短哈希：托盘图标去重要用，换了字体 / 底色 / 位置必须重画。
     fn hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.font.to_lowercase().hash(&mut hasher);
         self.antialias.hash(&mut hasher);
         self.metrics.hash(&mut hasher);
+        self.background.hash(&mut hasher);
+        self.offset.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -111,6 +151,22 @@ fn resolve_ink(dark_taskbar: bool, ink: Option<[u8; 3]>) -> [u8; 3] {
     } else {
         [248, 248, 248]
     })
+}
+
+/// 压在底色块上的数字用深墨还是浅墨。
+///
+/// 按底色的感知亮度（0.299R + 0.587G + 0.114B）分档，不按 HSL 的 L：同样是 50%
+/// 的 L，黄色看着比蓝色亮得多，按 L 判断会在黄底上配出看不见的白字。
+/// 深浅值沿用系统图标那两档，纯黑纯白在托盘上比系统图标更扎眼。
+fn contrast_ink(background: [u8; 3]) -> [u8; 3] {
+    let luminance = 0.299 * background[0] as f32
+        + 0.587 * background[1] as f32
+        + 0.114 * background[2] as f32;
+    if luminance < 127.5 {
+        [248, 248, 248]
+    } else {
+        [20, 20, 20]
+    }
 }
 
 /// 彩色律动的色温：响度越高越红。
@@ -270,6 +326,8 @@ pub struct IconSpec<'a> {
     pub color_by_level: bool,
     /// 自定义 ico 的路径（`style == Custom` 时才读）。
     pub custom: &'a str,
+    /// 软件图标用哪套配色（只对 `style == App` 生效）。
+    pub app_icon: crate::config::AppIconStyle,
     pub number: &'a NumberStyle,
 }
 
@@ -454,7 +512,7 @@ impl Tray {
         } else {
             resolve_ink(light_taskbar(), self.ink.get())
         };
-        if let Ok(icon) = Icon::from_rgba(compose_motion(coverage, ink, muted), side, side) {
+        if let Ok(icon) = Icon::from_rgba(compose_motion(coverage, ink, muted, side), side, side) {
             let _ = self.icon.set_icon(Some(icon));
         }
     }
@@ -836,6 +894,40 @@ fn render(
     percent: u32,
     muted: bool,
 ) -> Vec<u8> {
+    render_at(spec, canvas() as u32, level, volume, display, percent, muted)
+}
+
+/// 设置页的样式预览：按指定边长（24 / 32 这种大档）直接画一张。
+///
+/// 16px 的小图放大上去会糊，所以预览不缩放，而是用同一个画法在更大的画布上重画一遍。
+/// 拿不到真实图标（DLL / ico 读失败）时各分支自己会退回数字图标，预览里也能看出来。
+///
+/// 「动态」这一档不能照空白状态画（静止时只有一排短桩），改用一个有代表性的帧。
+pub fn preview_rgba(
+    spec: &IconSpec<'_>,
+    side: u32,
+    volume: f32,
+    percent: u32,
+    motion: TrayMotion,
+) -> Vec<u8> {
+    if matches!(spec.style, TrayIconStyle::Dynamic) {
+        let ink = resolve_ink(light_taskbar(), spec.ink);
+        let coverage = crate::motion::Motion::preview(motion, side);
+        return compose_motion(&coverage, ink, false, side);
+    }
+    render_at(spec, side, 0.0, volume, volume, percent, false)
+}
+
+/// 按指定画布边长真正画图的那一层。
+fn render_at(
+    spec: &IconSpec<'_>,
+    side: u32,
+    level: f32,
+    volume: f32,
+    display: f32,
+    percent: u32,
+    muted: bool,
+) -> Vec<u8> {
     let style = spec.style;
     let light_taskbar = light_taskbar();
     // 彩色律动只染得动单色墨迹：软件图标 / 自定义 ico 是彩色原图，染色会毁掉原样。
@@ -845,7 +937,16 @@ fn render(
         resolve_ink(light_taskbar, spec.ink)
     };
     match style {
-        TrayIconStyle::Number => render_number_icon(percent, muted, rgb, spec.number),
+        TrayIconStyle::Number => {
+            // 有底色时数字要跟底色对比（深底配白字），不再跟任务栏走：
+            // 任务栏上的深色墨在红底上就是一团糊。用户自己挑了颜色 / 开了彩色律动
+            // 就听他的 —— 那两个是明确的手动选择。
+            let ink = match (spec.ink, spec.number.background) {
+                (None, Some(background)) if !spec.color_by_level => contrast_ink(background.color),
+                _ => rgb,
+            };
+            render_number_icon(percent, muted, ink, spec.number, side)
+        }
         TrayIconStyle::Arcs => {
             // 系统图标本体是白的：浅色任务栏要染成深墨；挑了颜色 / 开了彩色律动就染成那个色。
             let tint = if spec.ink.is_some() || spec.color_by_level || light_taskbar {
@@ -853,27 +954,31 @@ fn render(
             } else {
                 None
             };
-            render_system_icon(volume, display, muted, tint, percent, spec.number)
+            render_system_icon(volume, display, muted, tint, percent, spec.number, side)
         }
-        TrayIconStyle::App => render_app_icon(percent, muted, rgb, spec.number),
+        TrayIconStyle::App => render_app_icon(percent, muted, rgb, spec.number, spec.app_icon, side),
         TrayIconStyle::Custom => {
-            render_custom_icon(spec.custom, percent, muted, rgb, spec.number)
+            render_custom_icon(spec.custom, percent, muted, rgb, spec.number, side)
         }
         // 动态图案由 `Tray::animate` 驱动；这里只画一张静止的空场，供启动时先占位。
         TrayIconStyle::Dynamic => {
-            let side = canvas() as u32;
             let coverage = crate::motion::Motion::default().snapshot(TrayMotion::Bars, side);
-            compose_motion(&coverage, rgb, muted)
+            compose_motion(&coverage, rgb, muted, side)
         }
     }
+}
+
+/// 把一张律动覆盖率图直接画成 RGBA（设置页那四个会动的预览用）。
+pub fn motion_rgba(coverage: &[f32], ink: [u8; 3], side: u32) -> Vec<u8> {
+    compose_motion(coverage, ink, false, side)
 }
 
 /// 把律动的覆盖率图变成托盘要的 RGBA：统一一层墨色，透明度照覆盖率。
 ///
 /// 默认是黑 / 白一层单色 —— 任务栏上的小图标一旦上了色就在一堆黑白图标里出头，
 /// 律动的「雅」靠形状和节奏，不靠颜色。颜色只在用户自己去设置里挑了才变。
-fn compose_motion(coverage: &[f32], ink: [u8; 3], muted: bool) -> Vec<u8> {
-    let side = canvas() as usize;
+fn compose_motion(coverage: &[f32], ink: [u8; 3], muted: bool, side: u32) -> Vec<u8> {
+    let side = side as usize;
     let mut buffer = vec![0u8; side * side * 4];
     let scale = if muted { 0.45 } else { 1.0 };
     for (index, coverage) in coverage.iter().take(side * side).enumerate() {
@@ -890,13 +995,20 @@ fn compose_motion(coverage: &[f32], ink: [u8; 3], muted: bool) -> Vec<u8> {
     buffer
 }
 
-/// 软件图标：直接用编进 exe 的那张 `assets/Bolume.ico`（取托盘尺寸对应的那一档）。
+/// 软件图标：用编进 exe 的那张图（取目标尺寸对应的那一档）。
 ///
+/// 配色照配置走：浅底是 `assets/Bolume.ico`，红底是 `assets/Bolume-red.ico`。
 /// 取不到就退回数字图标——托盘上不能出现一个空白格子。
-fn render_app_icon(percent: u32, muted: bool, ink: [u8; 3], number: &NumberStyle) -> Vec<u8> {
-    let side = canvas() as u32;
-    let Some(mut rgba) = crate::platform::app_icon::rgba_at(side) else {
-        return render_number_icon(percent, muted, ink, number);
+fn render_app_icon(
+    percent: u32,
+    muted: bool,
+    ink: [u8; 3],
+    number: &NumberStyle,
+    style: crate::config::AppIconStyle,
+    side: u32,
+) -> Vec<u8> {
+    let Some(mut rgba) = crate::platform::app_icon::rgba_at_style(style, side) else {
+        return render_number_icon(percent, muted, ink, number, side);
     };
     if muted {
         // 静音时压一道透明度，和系统的喇叭静音图标观感一致。
@@ -916,10 +1028,10 @@ fn render_custom_icon(
     muted: bool,
     ink: [u8; 3],
     number: &NumberStyle,
+    side: u32,
 ) -> Vec<u8> {
-    let side = canvas() as u32;
     let Some(mut rgba) = custom_rgba(path, side) else {
-        return render_number_icon(percent, muted, ink, number);
+        return render_number_icon(percent, muted, ink, number, side);
     };
     if muted {
         for pixel in rgba.chunks_exact_mut(4) {
@@ -972,11 +1084,12 @@ fn render_system_icon(
     tint_to: Option<[u8; 3]>,
     percent: u32,
     number: &NumberStyle,
+    side: u32,
 ) -> Vec<u8> {
     let Some(mut rgba) =
-        crate::platform::sound_icons::icon_rgba(bar_icon_id(volume, muted), canvas() as u32)
+        crate::platform::sound_icons::icon_rgba(bar_icon_id(volume, muted), side)
     else {
-        return render_number_icon(percent, muted, tint_to.unwrap_or([248, 248, 248]), number);
+        return render_number_icon(percent, muted, tint_to.unwrap_or([248, 248, 248]), number, side);
     };
     if let Some(color) = tint_to {
         // 浅色任务栏（或用户自选了颜色）：系统图标是白色的，照 EarTrumpet
@@ -1074,7 +1187,50 @@ fn ink_ratio(family: &str, weight: i32, aa: crate::config::TrayAntialias) -> f32
 /// （「88」的墨迹宽高比约 1.4），以前只能靠收字号来适配宽度，于是
 /// 数字高度设到 10px 以上就没效果了。现在改为**横向压窄**字形 ——
 /// 高度照设，宽度压到盒子里；压得过头（会瘦成一条）才回头收字号。
-fn render_number_icon(percent: u32, muted: bool, ink: [u8; 3], style: &NumberStyle) -> Vec<u8> {
+///
+/// 开了底色时，色块只是铺在数字**背后**的一层装饰：数字的字号、位置、字形
+/// 一个像素都不跟着变（色块比数字小就是数字盖住它四周，色块比数字大就是数字
+/// 稳坐在中间）。所以底色怎么调都不会动到数字本身 —— 见 `number_mask`。
+fn render_number_icon(
+    percent: u32,
+    muted: bool,
+    ink: [u8; 3],
+    style: &NumberStyle,
+    side: u32,
+) -> Vec<u8> {
+    let mask = number_mask(percent, style, side);
+    let alpha_scale = if muted { 0.4 } else { 1.0 };
+    // 数字默认居中，加上用户设的左右 / 上下微调（换算到这张画布的像素）。
+    let (dx, dy) = style.offset_px(side);
+    let left = (side as i32 - mask.width as i32) / 2 + dx;
+    let top = (side as i32 - mask.height as i32) / 2 + dy;
+    let background = match style.background {
+        Some(background) => background,
+        None => return compose_native(&mask, ink, alpha_scale, side, dx, dy),
+    };
+    let ratio = background.size.clamp(1, 100) as f32 / 100.0;
+    let tile = ((side as f32 * ratio).round() as u32).clamp(4, side.max(4));
+    let mut rgba = background_tile(background, tile, side, muted);
+    // 底色铺好之后把数字压上去：`paint_mask` 只管按覆盖率混进去，
+    // 底色那一层已经在那儿了，两者之间不需要再挑谁先谁后。
+    paint_mask(
+        &mask,
+        ink,
+        alpha_scale,
+        &mut rgba,
+        side as usize,
+        side as usize,
+        left,
+        top,
+    );
+    rgba
+}
+
+/// 只算「数字墨迹」那一层，完全不看底色。
+///
+/// 底色的大小 / 圆角 / 颜色都不进这个函数，所以同一档字号在开不开底色、
+/// 色块调成多大时画出来的字形都是同一张 —— 有测试盯着这件事。
+fn number_mask(percent: u32, style: &NumberStyle, side: u32) -> Rc<TextMask> {
     let text = percent.min(100).to_string();
     let family = if style.font.trim().is_empty() {
         crate::config::DEFAULT_NUMBER_FONT
@@ -1083,11 +1239,9 @@ fn render_number_icon(percent: u32, muted: bool, ink: [u8; 3], style: &NumberSty
     };
     let weight = DIGIT_WEIGHT;
     let aa = style.antialias;
-    let alpha_scale = if muted { 0.4 } else { 1.0 };
-
-    let canvas = canvas();
-    // 四周各留 1px：贴边的话任务栏会把边缘像素吃掉。
-    let box_side = (canvas - 2.0).max(4.0);
+    let canvas_px = side as f32;
+    // 数字能用的盒子：**只跟画布有关**，四周各留 1px（贴边的话任务栏会把边缘吃掉）。
+    let box_side = (canvas_px - 2.0).max(4.0);
 
     // 按位数挑这一档的参数：0–9 一位、10–99 两位、100 三位。
     let digits = text.chars().count().clamp(1, 3);
@@ -1109,8 +1263,10 @@ fn render_number_icon(percent: u32, muted: bool, ink: [u8; 3], style: &NumberSty
     } else {
         // 用户填的点数照用；只挡一下「填了个比画布大几十倍的数字」——
         // 那种字号光栅化出来几十兆，而画出来也就是整块图标全糊。
-        (metrics.size_pt.clamp(1, 200) as f32 * system_dpi() as f32 / 72.0)
-            .min(canvas * 4.0)
+        // 预览画布比托盘画布大时按同一倍率放大，否则预览里的数字会缩成一小撮。
+        let zoom = canvas_px / canvas();
+        (metrics.size_pt.clamp(1, 200) as f32 * system_dpi() as f32 / 72.0 * zoom)
+            .min(canvas_px * 4.0)
     };
 
     // 光栅化 → 按用户设的水平 / 垂直缩放重采样（100% 时原样返回）。
@@ -1133,7 +1289,45 @@ fn render_number_icon(percent: u32, muted: bool, ink: [u8; 3], style: &NumberSty
     if aa.threshold() {
         mask = Rc::new(harden(&mask));
     }
-    compose_native(&mask, ink, alpha_scale)
+    mask
+}
+
+/// 底色块：一张居中的圆角方块（角上有半像素过渡，16px 上不至于糊成一团）。
+///
+/// `round` 是「半边长的百分之几」：0 = 方角，100 = 正圆。用圆角矩形的距离场
+/// 算覆盖率，四个角自然就有了抗锯齿，不用给每种尺寸单独凑一套坐标。
+/// 色块边长 `tile` 与画布边长 `side` 可以不一样：色块居中，像素落点取整，
+/// 免得半像素偏移把直边糊成一条灰线。
+fn background_tile(background: NumberBackground, tile: u32, side: u32, muted: bool) -> Vec<u8> {
+    let size = side.max(1) as usize;
+    let mut buffer = vec![0u8; size * size * 4];
+    let tile = tile.clamp(1, side.max(1));
+    let offset = (side - tile) / 2;
+    let half = tile as f32 / 2.0;
+    let radius = half * (background.round.min(100) as f32 / 100.0);
+    // 静音时整块压暗，和「墨迹淡到 40%」是同一套观感。
+    let alpha_scale = if muted { 0.45 } else { 1.0 };
+    let inner = half - radius;
+    for y in 0..tile {
+        for x in 0..tile {
+            let px = x as f32 + 0.5 - half;
+            let py = y as f32 + 0.5 - half;
+            let dx = (px.abs() - inner).max(0.0);
+            let dy = (py.abs() - inner).max(0.0);
+            let distance = (dx * dx + dy * dy).sqrt() - radius;
+            // 半像素过渡宽度：够消锯齿，又不会让 16px 的边缘发虚。
+            let coverage = (0.5 - distance).clamp(0.0, 1.0);
+            if coverage <= 0.004 {
+                continue;
+            }
+            let at = ((y + offset) as usize * size + (x + offset) as usize) * 4;
+            buffer[at] = background.color[0];
+            buffer[at + 1] = background.color[1];
+            buffer[at + 2] = background.color[2];
+            buffer[at + 3] = (coverage * alpha_scale * 255.0).round() as u8;
+        }
+    }
+    buffer
 }
 
 /// 覆盖率二值化（0 或 1）：「无」抗锯齿那一档用。
@@ -1573,43 +1767,85 @@ fn downsample(mask: &TextMask, factor: u32) -> TextMask {
     }
 }
 
-/// 把蒙版 1:1 贴进画布（居中），不缩放。
+/// 把蒙版 1:1 贴进画布（居中 + 偏移），不缩放。
 ///
 /// 蒙版比画布大时**居中裁**（左右 / 上下各切掉一半）：用户把字号调得比画布还大
 /// 是他的自由，这里不偷偷缩小字形，只是画不下的部分自然落在图标外面。
-fn compose_native(mask: &TextMask, ink: [u8; 3], alpha_scale: f32) -> Vec<u8> {
-    let canvas = canvas();
-    let size = canvas as usize;
+fn compose_native(
+    mask: &TextMask,
+    ink: [u8; 3],
+    alpha_scale: f32,
+    side: u32,
+    dx: i32,
+    dy: i32,
+) -> Vec<u8> {
+    let size = side as usize;
     let mut buffer = vec![0u8; size * size * 4];
     if mask.width == 0 || mask.height == 0 {
         return buffer;
     }
+    paint_mask(
+        mask,
+        ink,
+        alpha_scale,
+        &mut buffer,
+        size,
+        size,
+        (size as i32 - mask.width as i32) / 2 + dx,
+        (size as i32 - mask.height as i32) / 2 + dy,
+    );
+    buffer
+}
 
-    let ox = (size as i32 - mask.width as i32) / 2;
-    let oy = (size as i32 - mask.height as i32) / 2;
-
+/// 把墨迹按覆盖率画进一张现成的 RGBA 画布（左上角对齐在 `left` / `top`）。
+///
+/// 画布尺寸单独给（`width` / `height` 是这张缓冲区的边长），这样同一段代码
+/// 既能画到整张托盘画布上，也能先画到「徽章」那一小块上再居中贴过去。
+fn paint_mask(
+    mask: &TextMask,
+    ink: [u8; 3],
+    alpha_scale: f32,
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    left: i32,
+    top: i32,
+) {
+    if mask.width == 0 || mask.height == 0 {
+        return;
+    }
     for y in 0..mask.height {
-        let ty = oy + y as i32;
-        if ty < 0 || ty >= size as i32 {
+        let ty = top + y as i32;
+        if ty < 0 || ty >= height as i32 {
             continue;
         }
         for x in 0..mask.width {
-            let tx = ox + x as i32;
-            if tx < 0 || tx >= size as i32 {
+            let tx = left + x as i32;
+            if tx < 0 || tx >= width as i32 {
                 continue;
             }
             let alpha = mask.coverage[y * mask.width + x] * alpha_scale;
             if alpha <= 0.004 {
                 continue;
             }
-            let offset = (ty as usize * size + tx as usize) * 4;
-            buffer[offset] = ink[0];
-            buffer[offset + 1] = ink[1];
-            buffer[offset + 2] = ink[2];
-            buffer[offset + 3] = (alpha * 255.0).round() as u8;
+            let offset = (ty as usize * width + tx as usize) * 4;
+            // 按 source-over 混，不能直接覆盖：下面可能已经铺了底色块，
+            // 数字的抗锯齿边缘（覆盖率 0.3、0.6 那几行）要把红色透出来，
+            // 否则边缘会变成「白 + 任务栏灰」，在红底上像被啃掉一圈。
+            let under = buffer[offset + 3] as f32 / 255.0;
+            let out_alpha = alpha + under * (1.0 - alpha);
+            if out_alpha <= 0.0 {
+                continue;
+            }
+            for channel in 0..3 {
+                let src = ink[channel] as f32;
+                let dst = buffer[offset + channel] as f32;
+                buffer[offset + channel] =
+                    ((src * alpha + dst * under * (1.0 - alpha)) / out_alpha).round() as u8;
+            }
+            buffer[offset + 3] = (out_alpha * 255.0).round() as u8;
         }
     }
-    buffer
 }
 
 /// 光栅化用的中间画布：比目标大一圈，保证 DT_CENTER 画的字形完整落在里面。
@@ -2098,7 +2334,7 @@ mod tests {
         let icons: Vec<Vec<u8>> = {
             let mut list = Vec::new();
             for percent in [0u32, 1, 5, 9, 10, 11, 12, 25, 42, 50, 68, 75, 88, 99, 100] {
-                list.push(super::render_number_icon(percent, false, [248, 248, 248], &number));
+                list.push(super::render_number_icon(percent, false, [248, 248, 248], &number, super::canvas() as u32));
             }
             for volume in [0.0f32, 0.15, 0.4, 0.7, 1.0] {
                 let spec = super::IconSpec {
@@ -2106,6 +2342,7 @@ mod tests {
                     ink: None,
                     color_by_level: false,
                     custom: "",
+                    app_icon: crate::config::AppIconStyle::Cream,
                     number: &number,
                 };
                 list.push(super::render(&spec, 0.0, volume, volume, 50, false));
@@ -2115,6 +2352,7 @@ mod tests {
                 ink: None,
                 color_by_level: false,
                 custom: "",
+                app_icon: crate::config::AppIconStyle::Cream,
                 number: &number,
             };
             list.push(super::render(&spec, 0.0, 0.7, 0.7, 50, true));
@@ -2177,7 +2415,7 @@ mod tests {
     fn number_icon_keeps_uniform_height() {
         let number = super::NumberStyle::default();
         let height = |percent: u32| {
-            let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number);
+            let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number, super::canvas() as u32);
             let size = super::canvas() as usize;
             let rows: Vec<usize> = (0..size)
                 .filter(|y| (0..size).any(|x| rgba[(y * size + x) * 4 + 3] > 40))
@@ -2209,7 +2447,7 @@ mod tests {
             for metrics in &mut style.metrics {
                 metrics.size_pt = size_pt;
             }
-            let rgba = super::render_number_icon(88, false, [248, 248, 248], &style);
+            let rgba = super::render_number_icon(88, false, [248, 248, 248], &style, super::canvas() as u32);
             let rows: Vec<usize> = (0..size)
                 .filter(|y| (0..size).any(|x| rgba[(y * size + x) * 4 + 3] > 40))
                 .collect();
@@ -2231,6 +2469,108 @@ mod tests {
         // 大字号顶到可画区，但四周仍留 1px，不会被任务栏切边。
         assert!(big_top >= 1, "14pt 贴到顶边了：{big_top}");
         assert!(big_bottom + 1 < size, "14pt 贴到底边了：{big_bottom}");
+    }
+
+    /// 底色块是**纯装饰**：大小 / 圆角 / 颜色怎么调，数字那一层一个像素都不动。
+    ///
+    /// 以前「开了底」会把数字收进色块的圆角安全框，于是把色块调小一圈，
+    /// 数字跟着缩一号、换个圆角数字又变一次 —— 用户看到的就是「调底色把字改了」。
+    #[test]
+    fn number_background_never_moves_the_digits() {
+        let side = super::canvas() as u32;
+        let base = super::NumberStyle::default();
+        for percent in [7u32, 42, 100] {
+            let plain = super::number_mask(percent, &base, side);
+            for (size, round, color) in [
+                (100u32, 0u32, [214u8, 64, 42]),
+                (100, 100, [214, 64, 42]),
+                (80, 42, [20, 20, 20]),
+                (50, 50, [255, 255, 255]),
+            ] {
+                let mut style = base.clone();
+                style.background = Some(super::NumberBackground { color, size, round });
+                let mask = super::number_mask(percent, &style, side);
+                assert_eq!(
+                    (mask.width, mask.height),
+                    (plain.width, plain.height),
+                    "percent {percent} / size {size} / round {round} 改了墨迹尺寸"
+                );
+                assert_eq!(
+                    mask.coverage, plain.coverage,
+                    "percent {percent} / size {size} / round {round} 改了墨迹形状"
+                );
+            }
+        }
+    }
+
+    /// 位置微调只挪数字：墨迹整体平移，底色块原地不动。
+    #[test]
+    fn digit_offset_moves_only_the_digits() {
+        let side = super::canvas() as u32;
+        let size = side as usize;
+        let mut style = super::NumberStyle::default();
+        style.background = Some(super::NumberBackground {
+            color: [214, 64, 42],
+            size: 100,
+            round: 42,
+        });
+        // 墨是浅色（248）、底色是朱红（g=64）：看 g 通道就能把两层分开。
+        let ink = [248u8, 248, 248];
+        let center = |rgba: &[u8]| {
+            let (mut sx, mut sy, mut count) = (0f32, 0f32, 0f32);
+            for y in 0..size {
+                for x in 0..size {
+                    let offset = (y * size + x) * 4;
+                    if rgba[offset + 1] > 150 && rgba[offset + 3] > 128 {
+                        sx += x as f32;
+                        sy += y as f32;
+                        count += 1.0;
+                    }
+                }
+            }
+            assert!(count > 0.0, "整张图里没找到墨迹");
+            (sx / count, sy / count)
+        };
+        let plain = super::render_number_icon(42, false, ink, &style, side);
+        let (x0, y0) = center(&plain);
+        for (dx, dy) in [(2, 0), (-2, 0), (0, 2)] {
+            let mut moved = style.clone();
+            moved.offset = (dx, dy);
+            // 期望的位移按这张画布换算（高分屏会等比放大）。
+            let (ex, ey) = moved.offset_px(side);
+            let shifted = super::render_number_icon(42, false, ink, &moved, side);
+            let (x1, y1) = center(&shifted);
+            assert!(
+                (x1 - x0 - ex as f32).abs() < 0.7,
+                "dx {dx}: 质心 {x0} → {x1}（期望 {ex}）"
+            );
+            assert!(
+                (y1 - y0 - ey as f32).abs() < 0.7,
+                "dy {dy}: 质心 {y0} → {y1}（期望 {ey}）"
+            );
+            // 底色块：四角那几格数字够不着，两图必须一模一样。
+            for (cx, cy) in [(1usize, 1usize), (size - 2, 1), (1, size - 2)] {
+                let offset = (cy * size + cx) * 4;
+                assert_eq!(
+                    &shifted[offset..offset + 4],
+                    &plain[offset..offset + 4],
+                    "底色块被位移带走了"
+                );
+            }
+        }
+    }
+
+    /// 偏移存的是 16px 画布的像素，换到更大的画布（高分屏 / 预览）要等比放大。
+    #[test]
+    fn offset_scales_with_the_canvas() {
+        let mut style = super::NumberStyle::default();
+        style.offset = (2, -1);
+        // 基准画布（96 DPI 的托盘 / 设置页预览）就是填多少算多少。
+        assert_eq!(style.offset_px(16), (2, -1));
+        // 高分屏的 32px 图标按一倍放大，视觉上挪的距离一样。
+        assert_eq!(style.offset_px(32), (4, -2));
+        // 默认 0 就是不动：跟加这个功能之前逐像素一致。
+        assert_eq!(super::NumberStyle::default().offset_px(32), (0, 0));
     }
 
     /// 数字是整数倍降采样出来的，不该留下孤立的毛刺像素。
@@ -2255,7 +2595,7 @@ mod tests {
             for percent in [
                 0u32, 3, 7, 9, 10, 11, 17, 21, 33, 47, 58, 66, 74, 88, 99, 100,
             ] {
-                let rgba = super::render_number_icon(percent, false, [248, 248, 248], number);
+                let rgba = super::render_number_icon(percent, false, [248, 248, 248], number, super::canvas() as u32);
                 let inked = |x: usize, y: usize| rgba[(y * size + x) * 4 + 3] > 40;
 
                 // 1) 不许有孤立像素。
@@ -2334,7 +2674,7 @@ mod tests {
     fn number_icon_covers_digits() {
         let number = super::NumberStyle::default();
         for percent in [0u32, 1, 9, 10, 42, 99, 100] {
-            let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number);
+            let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number, super::canvas() as u32);
             let side = super::canvas() as usize;
             assert_eq!(rgba.len(), side * side * 4);
             let inked = rgba.chunks_exact(4).filter(|px| px[3] > 40).count();
@@ -2425,7 +2765,7 @@ mod tests {
                 *slot = metrics;
             }
             for percent in [1u32, 10, 11, 20, 44, 88, 91, 99, 100] {
-                let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number);
+                let rgba = super::render_number_icon(percent, false, [248, 248, 248], &number, super::canvas() as u32);
                 println!("=== {label} / {percent} ===");
                 for y in 0..size {
                     let mut line = String::new();

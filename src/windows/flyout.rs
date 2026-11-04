@@ -1855,6 +1855,10 @@ impl Flyout {
             volume: raw,
             unmute,
         });
+        // 音量真的变了才响：到顶 / 到底那几下不该出声（和滑条那边同一个口径）。
+        if (next - display).abs() > 0.0001 {
+            crate::platform::sound::step(&cfg, crate::config::VolumeGesture::AppHoverScroll);
+        }
         // 命中某一行就别让列表跟着滚。
         cx.stop_propagation();
         cx.notify();
@@ -1922,10 +1926,6 @@ impl Flyout {
         let release_hold_release = self.release_hold.clone();
         let drag_key_change = drag_key.clone();
         let drag_key_release = drag_key.clone();
-        // 滚轮那一路没有松手事件：靠同一张预览表把这一格当场画出来。
-        let wheel_hold = self.release_hold.clone();
-        let wheel_muted = self.muted_override.clone();
-        let drag_key_scroll = drag_key.clone();
         // 拖动要按「增 / 减」决定解不解除静音，所以单独克隆一份配置。
         let drag_cfg = self.cfg();
 
@@ -2444,7 +2444,6 @@ impl Flyout {
         let engine_for_scroll = engine.clone();
         let id_for_slider = device.id.clone();
         let id_for_mute = device.id.clone();
-        let id_for_scroll = device.id.clone();
         let drag_values = self.drag_values.clone();
         let drag_values_release = self.drag_values.clone();
         let release_hold_release = self.release_hold.clone();
@@ -2666,7 +2665,6 @@ impl Flyout {
         let engine_for_scroll = engine.clone();
         let key_for_slider = key.clone();
         let key_for_mute = key.clone();
-        let key_for_scroll = key.clone();
         let drag_values = self.drag_values.clone();
         let drag_values_release = self.drag_values.clone();
         let release_hold_release = self.release_hold.clone();
@@ -2850,7 +2848,7 @@ impl Flyout {
                 };
                 let unmute = scroll_cfg
                     .unmute
-                    .allows(crate::config::VolumeGesture::HoverScroll, steps > 0.0);
+                    .allows(crate::config::VolumeGesture::AppHoverScroll, steps > 0.0);
                 // 滚轮也「先声夺人」：声音和画面对齐，别让这一格等快照回读。
                 note_scroll(&wheel_hold, &wheel_muted, &drag_key_scroll, next, unmute);
                 window.refresh();

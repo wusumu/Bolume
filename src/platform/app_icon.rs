@@ -8,8 +8,54 @@
 //! ICO 里并存两种图：小尺寸是 32 位 BMP（含 AND 掩码），256 那一档是 PNG。
 //! 这里两种都认——托盘要的就是 16/20/24 这几档 BMP，直接 1:1 贴，缩放一步都不做。
 
-/// 图标文件本身（`assets/Bolume.ico`）。
+/// 图标文件本身（`assets/Bolume.ico`）—— 浅底那一套，编进 exe 当程序图标。
 pub const ICO_BYTES: &[u8] = include_bytes!("../../assets/Bolume.ico");
+
+/// 红底那一套（`assets/Bolume-red.ico`）：只在运行时选「红底」时用。
+///
+/// 几何和浅底那张逐点相同，只是底色 / 墨色对调。exe 图标换不了，
+/// 所以它只服务托盘和窗口。
+pub const RED_ICO_BYTES: &[u8] = include_bytes!("../../assets/Bolume-red.ico");
+
+/// 按配置里选的配色取图。
+pub fn rgba_at_style(style: crate::config::AppIconStyle, size: u32) -> Option<Vec<u8>> {
+    let bytes = match style {
+        crate::config::AppIconStyle::Cream => ICO_BYTES,
+        crate::config::AppIconStyle::Red => RED_ICO_BYTES,
+    };
+    rgba_from(bytes, size)
+}
+
+/// exe 里两套图标的资源 id（`build.rs` 写的 1 = 浅底、2 = 红底）。
+///
+/// Windows 取「exe 的主图标」时取编号最小的那组，所以资源管理器里永远是浅底；
+/// 运行时切红底只换窗口图标用的这一张。
+pub fn resource_id(style: crate::config::AppIconStyle) -> usize {
+    match style {
+        crate::config::AppIconStyle::Cream => 1,
+        crate::config::AppIconStyle::Red => 2,
+    }
+}
+
+/// 当前生效的配色（窗口创建时 `apply_app_icon` 要读它，拿不到 config）。
+///
+/// 设置页切换配色时写这里，然后把已经开着的窗口图标重设一遍。
+static CURRENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_style(style: crate::config::AppIconStyle) {
+    let value = match style {
+        crate::config::AppIconStyle::Cream => 0,
+        crate::config::AppIconStyle::Red => 1,
+    };
+    CURRENT.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn style() -> crate::config::AppIconStyle {
+    match CURRENT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => crate::config::AppIconStyle::Red,
+        _ => crate::config::AppIconStyle::Cream,
+    }
+}
 
 struct Entry {
     width: u32,

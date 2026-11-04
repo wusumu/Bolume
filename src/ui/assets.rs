@@ -225,3 +225,22 @@ pub fn donate_image() -> Option<std::sync::Arc<gpui::RenderImage>> {
         image::Frame::new(buffer),
     ])))
 }
+
+/// 把一张现成的 RGBA（straight alpha）位图交给 gpui 画。
+///
+/// 用途是设置页里的托盘图标预览：那张图是 `tray::preview_rgba` 按目标尺寸
+/// **原生画出来**的，这里只换通道（gpui 按 BGRA 读），一个像素都不缩放 ——
+/// 缩放会给出灰边，用户放大看就会发现「不锐利」。
+pub fn rgba_image(rgba: Vec<u8>, width: u32, height: u32) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    let mut rgba = rgba;
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
+    Some(std::sync::Arc::new(gpui::RenderImage::new(vec![
+        image::Frame::new(buffer),
+    ])))
+}

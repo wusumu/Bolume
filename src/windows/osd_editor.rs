@@ -61,6 +61,13 @@ const TITLEBAR_H: f32 = 42.0;
 /// 取色器轮询间隔。
 const PICK_TICK: Duration = Duration::from_millis(20);
 
+/// 「保存」真正写进文件的字段。
+///
+/// 就是设置页「屏幕提示」那一页管的那一组（`page_fields(Page::Osd)`）：提示条
+/// 自己的 `osd`，加上编辑器独有的画布底色与右栏宽度。加字段时两边一起改 ——
+/// 漏了哪个，编辑器里存下来、关掉窗口就没了。
+const SAVED_FIELDS: &[&str] = &["osd", "editor_bg", "editor_panel_w"];
+
 const CARD_COLORS: &[&str] = &[
     "", "#000000", "#151519", "#2b2b2f", "#1f2937", "#3b1d2b", "#0f2e2e", "#ffffff",
 ];
@@ -706,10 +713,22 @@ fn same_look(a: &crate::config::OsdConfig, b: &crate::config::OsdConfig) -> bool
     a == b
 }
 
+impl Drop for OsdEditor {
+    fn drop(&mut self) {
+        // 编辑器关掉了：它管的那几个字段重新参与设置窗的「未保存」判定。
+        // 保存过的话值已经对齐，不会因此亮起来；没保存就关的，设置窗的
+        // 「取消 / ×」会连同整份草稿一起丢掉。
+        self.config.borrow_mut().release_fields(SAVED_FIELDS);
+    }
+}
+
 impl OsdEditor {
     pub fn new(config: Rc<RefCell<ConfigStore>>, cx: &mut Context<Self>) -> Self {
         let baseline = config.borrow().get().osd.clone();
         let panel_w = config.borrow().get().editor_panel_w;
+        // 编辑器开着的时候，它管的这几个字段不参与设置窗的「未保存」判定：
+        // 两边各有自己的「保存」，混在一起会出现「什么也没改，应用却亮着」。
+        config.borrow_mut().hold_fields(SAVED_FIELDS);
         Self {
             config,
             baseline,
@@ -897,8 +916,22 @@ impl OsdEditor {
         !same_look(&self.raw_cfg(), &self.baseline)
     }
 
-    /// 保存：把当前样子记成新的基准（值其实早就写进配置了，这一步只是「确认」）。
+    /// 保存：把当前样子记成新的基准，并且**真的写进文件**。
+    ///
+    /// 以前这一步只是「确认」—— 值在更早的时候进了设置页的草稿，得回去按一次
+    /// 「确定 / 应用」才落盘。编辑器是独立窗口，用户在这里按下保存就是终点了，
+    /// 不该再欠一层；关掉设置窗（或直接关编辑器）都不该把刚存的布局带走。
+    ///
+    /// 写盘只覆盖编辑器能改的那几个字段（跟设置页「屏幕提示」那一页的清单一致），
+    /// 设置窗里还没按「确定」的其它改动既不跟着落盘，也不会让那边的「应用」亮起来。
     fn accept_changes(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.borrow_mut().commit_fields(SAVED_FIELDS) {
+            crate::platform::logfile::append("crash.log", &format!("OSD 布局保存失败：{error}"));
+            // 存不进去就别把基准往前挪：标题栏上「未保存的更改」留着，还能再试一次。
+            self.confirm_close = false;
+            cx.notify();
+            return;
+        }
         self.baseline = self.raw_cfg();
         cx.notify();
     }

@@ -3,7 +3,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
 };
@@ -18,7 +18,8 @@ use gpui::{
 use crate::{
     audio::{AudioCommand, AudioEngine, DeviceInfo, Snapshot},
     config::{
-        ActivityEffect, AppBlockEntry, AppBlockKind, BrightnessMergeSide, BrightnessPlacement,
+        ActivityEffect, AppBlockEntry, AppBlockKind, AppIconStyle, BrightnessMergeSide,
+        BrightnessPlacement,
         Config, ConfigStore,
         DisplayNameMode, FooterSide, Hotkey, HotkeySlots, MAX_TOOLTIP_LINE_CHARS, MAX_TOOLTIP_LINES,
         OsdConfig, OsdFilterMode, OsdFunction, OsdPart, PanelLayout,
@@ -57,6 +58,24 @@ const COLOR_PICK_TICK: std::time::Duration = std::time::Duration::from_millis(20
 /// 设备行是「点一下切成默认设备」，而落盘发生在按下阶段、`click` 在松开之后，
 /// 中间隔着几十毫秒。这段时间内的点击视作「只是来收尾改名的」。
 const RENAME_CLICK_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 关窗前的淡出时长。
+///
+/// 点「确定 / 取消」时窗口不能一帧就没了 —— 那样看着像闪退，用户会以为
+/// 程序崩了。150ms 够看清「窗口是在收起来」，又不至于让人等。
+const CLOSE_FADE_MS: u64 = 150;
+
+/// 实际用的关窗淡出时长。
+///
+/// 调试用：`BOLUME_CLOSE_MS=1200` 把它放慢，方便逐帧截图核对淡出曲线
+/// （跟 `ui::anim` 的 `BOLUME_ANIM_MS` 一个路数）；平时不设这个变量。
+fn close_fade_ms() -> u64 {
+    std::env::var("BOLUME_CLOSE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(CLOSE_FADE_MS)
+        .max(1)
+}
 
 /// 左侧导航的宽度与按钮尺寸（照 QcClip 的设置页侧栏）。
 const SIDEBAR_WIDTH: f32 = 168.0;
@@ -264,6 +283,7 @@ fn page_fields(page: Page) -> &'static [&'static str] {
         ],
         Page::Tray => &[
             "tray_icon_style",
+            "app_icon_style",
             "tray_icon_color",
             "tray_icon_custom",
             "tray_color_by_level",
@@ -276,6 +296,9 @@ fn page_fields(page: Page) -> &'static [&'static str] {
             "tray_digit_one",
             "tray_digit_two",
             "tray_digit_three",
+            "tray_number_background",
+            "tray_digit_offset_x",
+            "tray_digit_offset_y",
             "tray_menu",
             "tray_menu_style",
             "tray_menu_max_width",
@@ -431,6 +454,12 @@ pub struct Settings {
     font_filter: String,
     /// 弹层刚打开时要滚到第几行（当前选中的那个字体），滚过一次就清掉。
     font_pending_scroll: Option<usize>,
+    /// 键盘选中了字体列表的第几行（含「默认」那一行）。
+    ///
+    /// `None` = 还没用方向键挑过：第一次按 ↑ / ↓ 先落在当前字体所在行，
+    /// 再移一格 —— 这样「从当前用的那个开始往旁边试」才是连贯的。
+    /// 搜索词一变（列表整批换掉）就清空，行号不能再沿用。
+    font_cursor: Option<usize>,
     /// 设备下拉：`Some((哪一行, x, y))`，坐标同样是点击处的窗口坐标。
     picker: Option<(DevicePicker, f32, f32)>,
     /// 设备图标选择器：`Some((设备 id, x, y))` = 打开着，坐标是点击处的窗口坐标。
@@ -455,6 +484,22 @@ pub struct Settings {
     tray_menu_open: bool,
     /// 弹层自己的滚动位置。
     tray_menu_scroll: gpui::ScrollHandle,
+    /// 预览列的滚动位置。
+    ///
+    /// 预览按真实像素画，数值比这一列宽时会横向溢出 —— 给它一根横条，
+    /// 想看右半边（勾选点 / 箭头）能横向拖过去。
+    tray_preview_scroll: gpui::ScrollHandle,
+    /// 数值框（目前在用：弹层里的菜单宽度）的矩形，由 canvas 每帧写回。
+    ///
+    /// 弹层面板为了「点面板不算点空白」把按下事件 `stop_propagation` 收了，
+    /// 冒泡相位那个「点别处提交」根本轮不到，只能在捕获相位判断「这一下是不是
+    /// 还落在框里」—— 所以要它的矩形。
+    number_edit_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// 弹层里「菜单最大宽度」那根滑条的拖拽状态。
+    ///
+    /// 拖拽期间要记住是这一根在被拖（`VolumeSlider` 按元素令牌区分），
+    /// 不然鼠标移出条外就不跟手了。
+    menu_width_drag: crate::ui::SliderDragState,
     /// 正在拖的条目：`(所在子菜单, 下标)`，`None` 的那一半表示在右键根菜单里。
     tray_drag: Option<(Option<usize>, usize)>,
     /// 拖的是不是子菜单本身（子菜单只有一层，不能再塞进别的子菜单）。
@@ -567,6 +612,23 @@ pub struct Settings {
     /// 互换会改写两个文件（主配置 + 那一份），不是随手能撤回来的动作，
     /// 所以点「设为主配置」先弹一句问，确认了才动。
     profile_swap: Option<PathBuf>,
+    /// 「副本」弹窗：(来源文件，`None` = 当前主配置) + 新名字的输入缓冲。
+    ///
+    /// 复制会在 `Configs/` 里新增一个文件，弹窗里顺手把名字改掉比先复制再改名
+    /// 少一步；名字默认是「X 副本」。
+    profile_copy: Option<(Option<PathBuf>, String)>,
+    /// 配置档名字输入框的光标、选区另一头、以及「这一下左键是按在框里」。
+    ///
+    /// 三处输入框（新建 / 改名 / 副本弹窗）**同时只有一处在编辑**，所以共用一份：
+    /// 进编辑时按当前文字重设，切到别的框时自然失效。下标按 UTF-16（和输入法同一套单位）。
+    profile_caret: usize,
+    profile_anchor: Option<usize>,
+    profile_caret_drag: bool,
+    /// 正在拖的副配置（列表下标）与落点（0..=行数）。
+    ///
+    /// 只有副配置能拖：主配置永远钉在列表最上面，它的位置没有意义。
+    profile_drag: Option<usize>,
+    profile_drop: Option<usize>,
     /// 配置页的临时提示（成功 / 失败），2.6 秒后自己消失。
     profile_notice: Option<(String, u64)>,
     /// 提示的序号：连着操作几次时，只有最后那条到点才把自己清掉。
@@ -576,6 +638,23 @@ pub struct Settings {
     /// 设置页是草稿模式：改了只在内存里，按「应用 / 保存」才落盘。
     /// 所以点 × 时得先问一句，不然用户以为改好了、关掉才发现全丢了。
     confirm_close: bool,
+    /// 正在播「关窗淡出」：起点时刻，`None` = 没在关。
+    ///
+    /// 点确定 / 取消 / × 之后要先把整扇窗淡到全透明再摘掉，否则窗口一帧内
+    /// 消失，看着像闪退。淡出期间再点按钮一律早退，别把保存 / 丢弃走第二遍。
+    closing_at: Option<std::time::Instant>,
+    /// 托盘图标样式的预览图：key 是「样式 + 颜色 + 数字外观」，命中就复用同一张位图。
+    ///
+    /// 预览是每帧都要交给 gpui 画的，重建一次就是一次光栅化（数字图标还要量字形），
+    /// 不缓存的话拖动这一页会明显掉帧。
+    tray_preview: RefCell<std::collections::HashMap<String, Option<Arc<RenderImage>>>>,
+    /// 律动预览的四个状态机（下标 = `TrayMotion::index`）。
+    ///
+    /// 每帧推进一次、画一张 16px 的图 —— 用户要的是「真的会动」，
+    /// 静态排一行只能看出形状，看不出节奏。
+    tray_motion_state: RefCell<Vec<crate::motion::Motion>>,
+    /// 律动预览的时间起点：鼓点节奏按它算（不给 `Instant::now() - Duration`）。
+    tray_motion_started: Cell<Option<std::time::Instant>>,
 }
 
 /// 往黑名单里加一条的结果。
@@ -1151,6 +1230,14 @@ enum NumberField {
     LogWheelStep,
     /// 托盘数字：第 `digits` 档（1 / 2 / 3 位）的某一项外观。
     TrayDigit(u8, TrayDigitMetric),
+    /// 数字底色块：色块边长占画布的百分比（不影响数字）。
+    TrayNumberBgSize,
+    /// 数字底色块：圆角占半边长的百分比。
+    TrayNumberBgRound,
+    /// 数字在图标里左右微调（16px 画布上的像素，负 = 左）。
+    TrayDigitOffsetX,
+    /// 数字在图标里上下微调（正 = 下）。
+    TrayDigitOffsetY,
     /// 启动时设置的主音量（百分比）。
     StartupVolume,
     /// 设备最大音量上限（百分比）。
@@ -1269,6 +1356,9 @@ impl NumberField {
                     TrayDigitMetric::Tracking => metrics.tracking,
                 }
             }
+            // 位移能填负数（往左 / 往上），同样走有符号这一层。
+            Self::TrayDigitOffsetX => config.tray_digit_offset_x,
+            Self::TrayDigitOffsetY => config.tray_digit_offset_y,
             _ => self.value_nonneg(config) as i32,
         }
     }
@@ -1284,6 +1374,10 @@ impl NumberField {
             Self::UiFontSize => unreachable!("界面字号走有符号的那一层"),
             // 托盘数字四件套也走有符号的那一层（字距能填负数）。
             Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
+            // 位移同理。
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => {
+                unreachable!("数字位移走有符号的那一层")
+            }
             Self::HotkeyStep => config.hotkey_volume_step,
             Self::WheelStep => config.scroll_wheel_step,
             // 十分之一 dB：0.1 dB 是读数（一位小数）能表达的最小变化。
@@ -1312,6 +1406,8 @@ impl NumberField {
             Self::UiContrast => config.ui_contrast,
             Self::TrayMenuWidth => config.tray_menu_max_width,
             Self::TrayMotionGain => config.tray_motion_gain,
+            Self::TrayNumberBgSize => config.tray_number_background.size,
+            Self::TrayNumberBgRound => config.tray_number_background.round,
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval,
             Self::HotkeyRepeatDelay => config.hotkey_repeat_delay,
             Self::ScreenRepeatInterval => config.hotkey_screen_repeat_interval,
@@ -1356,6 +1452,10 @@ impl NumberField {
                 ),
                 TrayDigitMetric::Tracking => crate::config::TrayDigitMetrics::TRACKING_RANGE,
             },
+            // 左右 / 上下微调：16px 画布上挪 8px 已经贴到边上，再大就不是「微调」了。
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => {
+                crate::config::TRAY_DIGIT_OFFSET_RANGE
+            }
             _ => {
                 let (low, high) = self.range_nonneg();
                 (low as i32, high as i32)
@@ -1371,6 +1471,9 @@ impl NumberField {
             }
             Self::UiFontSize => unreachable!("界面字号走有符号的那一层"),
             Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => {
+                unreachable!("数字位移走有符号的那一层")
+            }
             Self::HotkeyStep => (1, 100),
             Self::WheelStep => (1, 100),
             Self::LogWheelStep => (
@@ -1408,6 +1511,8 @@ impl NumberField {
             Self::UiContrast => crate::config::UI_CONTRAST_RANGE,
             Self::TrayMenuWidth => crate::config::TRAY_MENU_WIDTH_RANGE,
             Self::TrayMotionGain => crate::config::TRAY_MOTION_GAIN_RANGE,
+            Self::TrayNumberBgSize => crate::config::TrayNumberBackground::SIZE_RANGE,
+            Self::TrayNumberBgRound => crate::config::TrayNumberBackground::ROUND_RANGE,
             Self::HotkeyRepeatInterval | Self::ScreenRepeatInterval => {
                 crate::config::HOTKEY_REPEAT_RANGE
             }
@@ -1449,6 +1554,15 @@ impl NumberField {
                 }
             }
             // 一行都不给负数：夹一下再往下传，免得手改配置文件写出负数。
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => {
+                let (low, high) = crate::config::TRAY_DIGIT_OFFSET_RANGE;
+                let value = value.clamp(low, high);
+                if matches!(self, Self::TrayDigitOffsetX) {
+                    config.tray_digit_offset_x = value;
+                } else {
+                    config.tray_digit_offset_y = value;
+                }
+            }
             _ => self.apply_nonneg(config, value.max(0) as u32),
         }
     }
@@ -1464,6 +1578,9 @@ impl NumberField {
             Self::WheelStep => config.scroll_wheel_step = value,
             Self::LogWheelStep => config.log_scroll_wheel_step = value as f32 / 10.0,
             Self::TrayDigit(..) => unreachable!("托盘数字字段走有符号的那一层"),
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => {
+                unreachable!("数字位移走有符号的那一层")
+            }
             Self::StartupVolume => config.startup.master_volume = value,
             Self::VolumeCap => config.volume_cap.percent = value,
             Self::HotkeyStepDb => config.hotkey_volume_step = value,
@@ -1491,6 +1608,8 @@ impl NumberField {
             Self::UiContrast => config.ui_contrast = value,
             Self::TrayMenuWidth => config.tray_menu_max_width = value,
             Self::TrayMotionGain => config.tray_motion_gain = value,
+            Self::TrayNumberBgSize => config.tray_number_background.size = value,
+            Self::TrayNumberBgRound => config.tray_number_background.round = value,
             Self::HotkeyRepeatInterval => config.hotkey_repeat_interval = value,
             Self::HotkeyRepeatDelay => config.hotkey_repeat_delay = value,
             Self::ScreenRepeatInterval => config.hotkey_screen_repeat_interval = value,
@@ -1523,6 +1642,14 @@ impl NumberField {
                     format!("{value} px")
                 }
             }
+            // 位移带正负号：+2 是往右 / 往下，−2 是往左 / 往上，一眼分得清方向。
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => {
+                if value > 0 {
+                    format!("+{value} px")
+                } else {
+                    format!("{value} px")
+                }
+            }
             _ => self.display_nonneg(value.max(0) as u32, lang),
         }
     }
@@ -1534,6 +1661,10 @@ impl NumberField {
                 unreachable!("面板字体字段走有符号的那一层")
             }
             Self::UiFontSize => unreachable!("界面字号走有符号的那一层"),
+            // 数字位移同理（能填负数，显示带正负号）。
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => {
+                unreachable!("数字位移走有符号的那一层")
+            }
             Self::HotkeyStep
             | Self::WheelStep
             | Self::StartupVolume
@@ -1595,6 +1726,8 @@ impl NumberField {
             Self::UiOpacity | Self::UiContrast => format!("{value}%"),
             Self::TrayMenuWidth => format!("{value} px"),
             Self::TrayMotionGain => format!("{value}%"),
+            // 底色的大小 / 圆角都是百分比：100% 圆角就是正圆。
+            Self::TrayNumberBgSize | Self::TrayNumberBgRound => format!("{value}%"),
             Self::HotkeyRepeatInterval
             | Self::HotkeyRepeatDelay
             | Self::ScreenRepeatInterval
@@ -1620,9 +1753,12 @@ impl NumberField {
         )
     }
 
-    /// 这个字段能不能填负数（目前只有面板字间距：负 = 紧排）。
+    /// 这个字段能不能填负数（字间距：负 = 紧排；数字位移：负 = 往左 / 往上）。
     fn allows_negative(self) -> bool {
-        matches!(self, Self::PanelLetterSpacing)
+        matches!(
+            self,
+            Self::PanelLetterSpacing | Self::TrayDigitOffsetX | Self::TrayDigitOffsetY
+        )
     }
 
     /// 手动输入框最多几个字符。
@@ -1726,6 +1862,10 @@ impl NumberField {
             Self::TrayDigit(_, TrayDigitMetric::SizePt) => 1,
             Self::TrayDigit(_, TrayDigitMetric::Width | TrayDigitMetric::Height) => 5,
             Self::TrayDigit(_, TrayDigitMetric::Tracking) => 10,
+            // 底色的大小 / 圆角都是百分比，1% 一按在 16px 上看不出变化（不到 0.2px）。
+            Self::TrayNumberBgSize | Self::TrayNumberBgRound => 5,
+            // 位移就是图标像素，一格一像素正好（16px 画布上一步就能看出来）。
+            Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => 1,
             // 响度那两个都是小整数，一档一格。
             Self::LoudnessLevel | Self::LoudnessSmooth => 1,
             _ => 1,
@@ -1734,7 +1874,14 @@ impl NumberField {
 
     /// 改这个字段要不要重画托盘图标（数字相关的都要）。
     fn touches_tray(self) -> bool {
-        matches!(self, Self::TrayDigit(..))
+        matches!(
+            self,
+            Self::TrayDigit(..)
+                | Self::TrayNumberBgSize
+                | Self::TrayNumberBgRound
+                | Self::TrayDigitOffsetX
+                | Self::TrayDigitOffsetY
+        )
     }
 }
 
@@ -1869,6 +2016,8 @@ enum ColorTarget {
     ///
     /// 空 = 跟随任务栏深浅（深色任务栏画浅墨、浅色画深墨），和系统图标一致。
     Tray,
+    /// 数字图标那块底色的颜色。空 = 用默认的朱红（不是「跟随」）。
+    TrayNumberBackground,
 }
 
 impl ColorTarget {
@@ -1887,6 +2036,7 @@ impl ColorTarget {
             Self::DarkSurface => &config.theme_dark_surface,
             Self::DarkAccent => &config.theme_dark_accent,
             Self::Tray => &config.tray_icon_color,
+            Self::TrayNumberBackground => &config.tray_number_background.color,
         }
     }
 
@@ -1899,6 +2049,7 @@ impl ColorTarget {
             Self::DarkSurface => config.theme_dark_surface = value,
             Self::DarkAccent => config.theme_dark_accent = value,
             Self::Tray => config.tray_icon_color = value,
+            Self::TrayNumberBackground => config.tray_number_background.color = value,
         }
     }
 
@@ -1906,6 +2057,7 @@ impl ColorTarget {
     fn label(self, lang: Lang) -> &'static str {
         match self {
             Self::Tray => lang.pick("图标颜色", "Icon color"),
+            Self::TrayNumberBackground => lang.pick("底色", "Background colour"),
             _ if self.is_surface() => lang.pick("背景色", "Background"),
             _ => lang.pick("强调色", "Accent"),
         }
@@ -1923,6 +2075,12 @@ impl ColorTarget {
                 "#ffffff", "#c8c8c8", "#8a8a8a", "#101010", "#7c9cff", "#22d3ee", "#34d399",
                 "#fbbf24", "#fb923c", "#f87171", "#c084fc", "#f472b6",
             ],
+            // 数字的底色是一整块，浅色那几档和深色那几档都得给：
+            // 深色任务栏上浅底块最醒目，浅色任务栏上反过来。
+            Self::TrayNumberBackground => &[
+                "#d6402a", "#b3261e", "#1f2329", "#3a4048", "#5a6572", "#f4efe6", "#ffffff",
+                "#f0b429", "#2f9e6e", "#2f6fd0", "#7c5cd6", "#e0567f",
+            ],
             _ if self.is_surface() => &[
                 "#151519", "#1b1f24", "#20252c", "#262b33", "#2d2a36", "#22303f", "#2b3a2f",
                 "#3a2b2b", "#f6f6fa", "#ececf2", "#e8eef6", "#f4efe6",
@@ -1933,14 +2091,26 @@ impl ColorTarget {
             ],
         }
     }
+
+    /// 色块行最前面要不要摆那个「半深半浅」块。
+    ///
+    /// 它对托盘墨色是「跟随任务栏」、对强调色是「跟随 Windows 强调色」——
+    /// 都是「跟着别人」。数字底色没有可跟的：空串就是回默认朱红，
+    /// 摆一个跟谁都不像的块只会让人点下去看不出变化。
+    fn has_follow(self) -> bool {
+        !self.is_surface() && !matches!(self, Self::TrayNumberBackground)
+    }
 }
 
-/// 改完颜色后让托盘重画一张 —— 只对「图标颜色」那一项有必要。
+/// 改完颜色后让托盘重画一张 —— 只对任务栏上那张位图有必要。
 ///
 /// 主题那几项改完，窗口和面板跟着重画就完事；托盘图标是系统托盘里的一张位图，
 /// 不跟着任何窗口重绘，换了色号必须显式推一次新图，否则要等到下次调音量才变。
 fn refresh_tray_for(target: ColorTarget, cx: &mut gpui::App) {
-    if matches!(target, ColorTarget::Tray) {
+    if matches!(
+        target,
+        ColorTarget::Tray | ColorTarget::TrayNumberBackground
+    ) {
         crate::gui::refresh_tray_icon(cx);
     }
 }
@@ -1982,6 +2152,9 @@ impl ColorWheel {
     fn new(target: ColorTarget, x: f32, y: f32, value: &str) -> Self {
         let fallback = if target.is_surface() {
             (0x15, 0x15, 0x19)
+        } else if matches!(target, ColorTarget::TrayNumberBackground) {
+            // 数字底色空着画的是默认朱红，取值器就从那一档起步。
+            (0xd6, 0x40, 0x2a)
         } else {
             (0x7c, 0x9c, 0xff)
         };
@@ -2123,6 +2296,7 @@ impl Settings {
             font_scroll: gpui::ScrollHandle::new(),
             font_filter: String::new(),
             font_pending_scroll: None,
+            font_cursor: None,
             picker: None,
             icon_picker: None,
             picker_scroll: gpui::ScrollHandle::new(),
@@ -2132,6 +2306,9 @@ impl Settings {
             app_edit: None,
             tray_menu_open: false,
             tray_menu_scroll: gpui::ScrollHandle::new(),
+            tray_preview_scroll: gpui::ScrollHandle::new(),
+            number_edit_bounds: Rc::new(Cell::new(None)),
+            menu_width_drag: crate::ui::SliderDragState::new(),
             tray_drag: None,
             tray_drag_is_folder: false,
             tray_drop: None,
@@ -2162,6 +2339,12 @@ impl Settings {
             donate_image: RefCell::new(None),
             restore_menu_open: false,
             confirm_close: false,
+            closing_at: None,
+            tray_preview: RefCell::new(std::collections::HashMap::new()),
+            tray_motion_state: RefCell::new(
+                (0..4).map(|_| crate::motion::Motion::default()).collect(),
+            ),
+            tray_motion_started: Cell::new(None),
             profiles: RefCell::new(Vec::new()),
             profile_active: RefCell::new(None),
             profile_main_backup: RefCell::new(None),
@@ -2169,6 +2352,12 @@ impl Settings {
             profile_new: None,
             profile_pending_delete: None,
             profile_swap: None,
+            profile_copy: None,
+            profile_caret: 0,
+            profile_anchor: None,
+            profile_caret_drag: false,
+            profile_drag: None,
+            profile_drop: None,
             profile_notice: None,
             profile_notice_seq: 0,
         }
@@ -2636,6 +2825,308 @@ impl Settings {
             .into_any_element()
     }
 
+    /// 一张托盘图标预览（28px，原生画，命中缓存就复用）。
+    ///
+    /// key 里带上所有会影响画面的配置：样式、墨色、软件图标配色、数字字体 / 抗锯齿 /
+    /// 三档字号、律动效果。任何一项变了就换一张，没变就还画那一位图。
+    fn tray_preview_image(
+        &self,
+        style: TrayIconStyle,
+        app_icon: AppIconStyle,
+        config: &Config,
+    ) -> Option<Arc<RenderImage>> {
+        // 预览就是 16px —— 托盘上真实的尺寸，不经放大也不经缩小。
+        const SIDE: u32 = 16;
+        // 设置页是浅色还是深色：墨色要跟**这张卡片**的底色对比，而不是跟任务栏。
+        // 以前照任务栏算，深色任务栏的白色图标铺在浅色卡片上根本看不见，
+        // 只好垫一块黑底，看着像五个黑格子。
+        let surface = gpui::hsla_to_rgba(theme::surface());
+        let dark_ui = 0.299 * surface.red + 0.587 * surface.green + 0.114 * surface.blue < 0.5;
+        let key = format!(
+            "{style:?}|{}|{:?}|{}|{:?}|{:?}|{:?}|{SIDE}|{dark_ui}|{:?}|{}|{}",
+            config.tray_icon_color,
+            app_icon,
+            config.tray_number_font,
+            config.tray_number_antialias,
+            config.tray_motion,
+            [
+                config.tray_digit_one,
+                config.tray_digit_two,
+                config.tray_digit_three
+            ],
+            config.tray_number_background,
+            // 位置微调也进 key：不加的话挪完数字，卡片还显示旧图。
+            config.tray_digit_offset_x,
+            config.tray_digit_offset_y,
+        );
+        if let Some(hit) = self.tray_preview.borrow().get(&key) {
+            return hit.clone();
+        }
+        let number = crate::gui::number_style(config);
+        // 数字有底色时，墨色交给托盘那一层按底色取对比（拿 `None` 进去才对得上
+        // 任务栏上的真实效果）；其余情况照旧跟设置页深浅走。
+        let ink = match (style, number.background) {
+            (TrayIconStyle::Number, Some(_)) if config.tray_icon_color.trim().is_empty() => None,
+            _ => Some(Self::preview_ink(config)),
+        };
+        let spec = crate::tray::IconSpec {
+            style,
+            ink,
+            // 预览固定用静止的墨色：彩色律动是跟着声音走的，卡片上看不出所以然，
+            // 反而会让五张预览各是一个颜色，分不清是「样式」不一样还是「颜色」不一样。
+            color_by_level: false,
+            custom: &config.tray_icon_custom,
+            app_icon,
+            number: &number,
+        };
+        let rgba = crate::tray::preview_rgba(&spec, SIDE, 0.72, 72, config.tray_motion);
+        let image = crate::ui::assets::rgba_image(rgba, SIDE, SIDE);
+        self.tray_preview
+            .borrow_mut()
+            .insert(key, image.clone());
+        image
+    }
+
+    /// 托盘图标样式：五档全部摊开，每张卡一张「托盘上真实会画出来的那一张」+ 标题。
+    ///
+    /// 以前这一行是文字分段按钮 —— 看不出「喇叭 / 数字 / 软件图标 / 动态」长什么样，
+    /// 也不知道自己调过的数字字体用上去是什么效果。预览是按 28px **原生重画**的，
+    /// 不是把 16px 的小图放大（那会糊成一团灰边）。
+    fn tray_style_picker(
+        &self,
+        config: &Config,
+        lang: Lang,
+        on_pick: impl Fn(u32, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let on_pick = Rc::new(on_pick);
+        let current = match config.tray_icon_style {
+            TrayIconStyle::Arcs => 0u32,
+            TrayIconStyle::Number => 1,
+            TrayIconStyle::App => 2,
+            TrayIconStyle::Dynamic => 3,
+            TrayIconStyle::Custom => 4,
+        };
+        let options: [(u32, TrayIconStyle, &'static str); 5] = [
+            (0, TrayIconStyle::Arcs, lang.pick("喇叭", "Speaker")),
+            (1, TrayIconStyle::Number, lang.pick("数字", "Number")),
+            (2, TrayIconStyle::App, lang.pick("软件图标", "App icon")),
+            (3, TrayIconStyle::Dynamic, lang.pick("动态", "Dynamic")),
+            (4, TrayIconStyle::Custom, lang.pick("自定义图标", "Custom .ico")),
+        ];
+
+        let mut row = div().flex().flex_wrap().items_center().gap(px(8.));
+        for (value, style, title) in options {
+            let selected = value == current;
+            // 自定义那一档画的是铅笔，不必去解用户的 ico（可能根本还没选）。
+            let preview = (style != TrayIconStyle::Custom)
+                .then(|| self.tray_preview_image(style, config.app_icon_style, config))
+                .flatten();
+            let thumbnail: AnyElement = match (style, preview) {
+                // 「自定义」不显示用户此刻挑的那张图（那是他自己的文件，不说明这一档是什么），
+                // 一支笔表示「自己去挑」。
+                (TrayIconStyle::Custom, _) => {
+                    icon("pencil", 15., theme::text_secondary()).into_any_element()
+                }
+                (_, Some(image)) => img(image).w(px(16.)).h(px(16.)).into_any_element(),
+                (_, None) => icon("speaker", 15., theme::text_tertiary()).into_any_element(),
+            };
+            let on_pick = on_pick.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("tray-style-{value}")))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(5.))
+                    .w(px(74.))
+                    .h(px(56.))
+                    .rounded(px(theme::RADIUS_ROW))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::border()
+                    })
+                    .bg(if selected {
+                        theme::accent_soft()
+                    } else {
+                        theme::surface()
+                    })
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.72))
+                    .on_click(move |_, window, cx| on_pick(value, window, cx))
+                    // 图标就是 16px 实际像素，不垫底、不放大。
+                    .child(
+                        div()
+                            .h(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(thumbnail),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(if selected {
+                                theme::text_primary()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(title),
+                    ),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// 预览里用的墨色：用户自选了就用他的，否则按设置页深浅给一个能看清的。
+    ///
+    /// 不跟任务栏 —— 托盘上墨色是照任务栏选的，但预览是画在设置页的卡片上，
+    /// 跟着任务栏走会出现「白图标铺在浅色卡片上」，只能靠垫黑底补救，那样更丑。
+    fn preview_ink(config: &Config) -> [u8; 3] {
+        let surface = gpui::hsla_to_rgba(theme::surface());
+        let dark = 0.299 * surface.red + 0.587 * surface.green + 0.114 * surface.blue < 0.5;
+        crate::tray::parse_ink(&config.tray_icon_color).unwrap_or(if dark {
+            [238, 238, 238]
+        } else {
+            [32, 32, 32]
+        })
+    }
+
+    /// 四个律动效果各推一帧（16px），返回可以直接交给 `img()` 的位图。
+    ///
+    /// 每帧都推：状态机里存着包络 / 节拍 / 相位，推进的 dt 是真实的帧间隔，
+    /// 所以看起来和托盘上那块一模一样，而不是四张静态形状图。
+    fn motion_preview_frames(&self, config: &Config) -> Vec<Option<Arc<RenderImage>>> {
+        const SIDE: u32 = 16;
+        let start = match self.tray_motion_started.get() {
+            Some(start) => start,
+            None => {
+                let now = std::time::Instant::now();
+                self.tray_motion_started.set(Some(now));
+                now
+            }
+        };
+        // 一个 1.3Hz 的鼓点：安静时贴 0.22，砸下去抬到 1.0 再落回来。
+        let seconds = start.elapsed().as_secs_f32();
+        let beat = (seconds * 1.3 * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+        let peak = 0.22 + 0.78 * beat.powf(1.7);
+        let gain = (config.tray_motion_gain as f32 / 100.0).clamp(0.5, 3.0);
+        let ink = Self::preview_ink(config);
+        let mut states = self.tray_motion_state.borrow_mut();
+        let mut frames = Vec::with_capacity(states.len());
+        for index in 0..states.len() {
+            let effect = TrayMotion::from_index(index as u32);
+            let coverage = states[index].step(peak, gain, effect, SIDE);
+            let rgba = crate::tray::motion_rgba(&coverage, ink, SIDE);
+            frames.push(crate::ui::assets::rgba_image(rgba, SIDE, SIDE));
+        }
+        frames
+    }
+
+    /// 律动效果：四种同时摆出来，而且是**活的** —— 每帧推进、每帧重画。
+    fn motion_picker(
+        &self,
+        config: &Config,
+        lang: Lang,
+        on_pick: impl Fn(u32, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let on_pick = Rc::new(on_pick);
+        let frames = self.motion_preview_frames(config);
+        let labels: [&'static str; 4] = if lang.is_en() {
+            ["Bars", "Ripple", "Orbit", "Pulse"]
+        } else {
+            ["律动条", "涟漪", "光环", "呼吸"]
+        };
+        let current = config.tray_motion.index();
+
+        let mut row = div().flex().flex_wrap().items_center().gap(px(8.));
+        for (index, label) in labels.iter().enumerate() {
+            let selected = index as u32 == current;
+            let thumbnail: AnyElement = match frames.get(index).cloned().flatten() {
+                Some(image) => img(image).w(px(16.)).h(px(16.)).into_any_element(),
+                None => icon("levels", 15., theme::text_tertiary()).into_any_element(),
+            };
+            let on_pick = on_pick.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("tray-motion-{index}")))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(5.))
+                    .w(px(74.))
+                    .h(px(56.))
+                    .rounded(px(theme::RADIUS_ROW))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::border()
+                    })
+                    .bg(if selected {
+                        theme::accent_soft()
+                    } else {
+                        theme::surface()
+                    })
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.72))
+                    .on_click(move |_, window, cx| on_pick(index as u32, window, cx))
+                    .child(
+                        div()
+                            .h(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(thumbnail),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(if selected {
+                                theme::text_primary()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(*label),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(7.))
+            .px(px(9.))
+            .py(px(8.))
+            .rounded(px(theme::RADIUS_ROW))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(theme::fs(13.))
+                            .text_color(theme::text_primary())
+                            .child(lang.pick("律动效果", "Motion effect")),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_tertiary())
+                            .child(lang.pick(
+                                "四个都是活的，跟托盘上一样只吃峰值电平；点一下换那一种",
+                                "All four are live, reading the same peak level as the tray; click to switch",
+                            )),
+                    ),
+            )
+            .child(row)
+            .into_any_element()
+    }
+
     /// 动作行：标题 + 说明 + 右边一个按钮（用于「记录当前状态」这类一次性操作）。
     fn action_row(
         &self,
@@ -3035,6 +3526,68 @@ impl Settings {
             .into_any_element()
     }
 
+    /// 数字位置微调：一行两个格子（左右 / 上下），各自 − 值 +。
+    ///
+    /// 合成一行而不是两行：位移是一对相关的量，摆在一起才有「挪到哪儿了」的
+    /// 空间感；单位固定是图标像素，说明里写清楚就够，不用每格再挂一段注解。
+    fn digit_offset_row(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
+        let axis = |label: &'static str| {
+            div()
+                .flex_none()
+                .pr(px(4.))
+                .text_size(theme::fs(11.))
+                .text_color(theme::text_tertiary())
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(9.))
+            .py(px(5.))
+            .rounded(px(theme::RADIUS_ROW))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(theme::fs(13.))
+                            .text_color(theme::text_primary())
+                            .child(lang.pick("位置微调", "Position")),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_tertiary())
+                            .child(lang.pick(
+                                "只挪数字，底色块不动；单位是图标像素（16px 画布）",
+                                "Moves the digits only; in icon pixels on a 16px canvas",
+                            )),
+                    ),
+            )
+            .child(axis("X"))
+            .child(self.number_stepper(
+                "tray-digit-offset-x",
+                NumberField::TrayDigitOffsetX,
+                NumberField::TrayDigitOffsetX.value(config),
+                lang,
+                cx,
+            ))
+            .child(axis("Y"))
+            .child(self.number_stepper(
+                "tray-digit-offset-y",
+                NumberField::TrayDigitOffsetY,
+                NumberField::TrayDigitOffsetY.value(config),
+                lang,
+                cx,
+            ))
+            .into_any_element()
+    }
+
     /// 上面那一组里的一个小格子：`标签 + 数字框`（点数字进入输入）。
     fn digit_metric_cell(
         &self,
@@ -3173,6 +3726,10 @@ impl Settings {
 
     /// 点数字框：进入手动输入状态。
     fn begin_edit(&mut self, field: NumberField, window: &mut Window, cx: &mut Context<Self>) {
+        // 已经在改这一格了：再点一下只是把光标放回来，不能把敲了一半的数字清掉。
+        if matches!(&self.editing, Some((active, _)) if *active == field) {
+            return;
+        }
         if self.capturing.is_some() {
             self.cancel_capture(window, cx);
         }
@@ -3227,13 +3784,24 @@ impl Settings {
         };
         let decimal = field.allows_decimal();
         let max_len = field.edit_len();
+        // 字符键先看键名；有些输入路径（输入法、软键盘、自动化工具发
+        // `KEYEVENTF_UNICODE`）只给字符不给键名，那就退回 `key_char`，
+        // 不然这些来源的数字一个都进不来。
+        let typed = match key.chars().collect::<Vec<_>>().as_slice() {
+            [only] => Some(*only),
+            _ => event.keystroke.key_char.as_deref().and_then(|text| {
+                match text.chars().collect::<Vec<_>>().as_slice() {
+                    [only] => Some(*only),
+                    _ => None,
+                }
+            }),
+        };
         let handled = if key == "backspace" {
             buffer.pop();
             true
         } else {
-            let mut chars = key.chars();
-            match (chars.next(), chars.next()) {
-                (Some(digit), None) if digit.is_ascii_digit() => {
+            match typed {
+                Some(digit) if digit.is_ascii_digit() => {
                     // 百分比 / 像素三位数够用，dB 步进还要留出 "20.0" 四个字符。
                     if buffer.len() < max_len {
                         buffer.push(digit);
@@ -3241,12 +3809,12 @@ impl Settings {
                     true
                 }
                 // dB 步进允许一个小数点："0.5" → 5（十分之一 dB）。
-                (Some('.'), None) if decimal && !buffer.contains('.') && !buffer.is_empty() => {
+                Some('.') if decimal && !buffer.contains('.') && !buffer.is_empty() => {
                     buffer.push('.');
                     true
                 }
                 // 字间距可以收紧到负数：负号只能打在最前面，长度也算进额度。
-                (Some('-'), None) if field.allows_negative() && buffer.is_empty() => {
+                Some('-') if field.allows_negative() && buffer.is_empty() => {
                     buffer.push('-');
                     true
                 }
@@ -5047,11 +5615,13 @@ impl Settings {
                     this.profile_new = None;
                     this.profile_pending_delete = None;
                     this.profile_swap = None;
+                    this.profile_copy = None;
                 }
                 // 别的页也有「设为主配置」「删除」的确认框开着走过场的情况：换页就收掉。
                 if page != Page::Profiles {
                     this.profile_swap = None;
                     this.profile_pending_delete = None;
+                    this.profile_copy = None;
                 }
                 refresh_ui(window, cx);
             }))
@@ -5697,8 +6267,8 @@ impl Settings {
             "startup-app-volumes",
             lang.pick("启动时设置应用音量", "Set app volumes at startup"),
             lang.pick(
-                "启动后的两分钟里，记过的应用一出现就套上它的音量",
-                "Within two minutes after launch, recorded apps get their volume applied",
+                "记过的应用一出现就套上它的音量，什么时候打开都算",
+                "Recorded apps get their volume applied whenever they show up",
             ),
             profile.set_app_volumes,
             self.bind(|config| config.startup.set_app_volumes = !config.startup.set_app_volumes),
@@ -5883,9 +6453,129 @@ impl Settings {
     }
 
     /// 托盘菜单编辑器弹层（盖在设置页上，不改窗口尺寸）。
+    /// 菜单最大宽度：一根滑条 + 可点的数值。
+    ///
+    /// 这一项原来在托盘页上，和「菜单外观」摆一起；但它调的是菜单自己的排版，
+    /// 挪进编辑器里才顺手 —— 拖的时候能在同一屏里看条目怎么排。
+    /// 「− / +」两个格子去掉：要连续调就拖条，要精确值就点数字手填。
+    fn menu_width_row(
+        &self,
+        config: &Config,
+        devices: &[crate::audio::DeviceInfo],
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let field = NumberField::TrayMenuWidth;
+        let current = field.value(config);
+        let (low, high) = field.range();
+        let span = (high - low).max(1) as f32;
+        let ratio = ((current - low) as f32 / span).clamp(0.0, 1.0);
+        // 实际多宽是「最长那一项」说了算，上限只在内容更宽时才起作用 ——
+        // 不写清楚的话，拉上限看不出变化，就像开关没开。
+        let content = crate::windows::tray_menu::content_width(config, devices);
+        let actual = crate::windows::tray_menu::actual_width(config, devices);
+        let clipped = content > current as f32 + 0.5;
+        let hint = if clipped {
+            if lang.is_en() {
+                "Content is wider than the cap — cut with …".to_string()
+            } else {
+                "内容比上限宽，超出部分用 … 截断".to_string()
+            }
+        } else if lang.is_en() {
+            format!("Menu is {} px wide (set by the longest item)", actual.round() as i32)
+        } else {
+            format!("菜单实际 {} px（由最长的一项决定）", actual.round() as i32)
+        };
+
+        let editing = matches!(&self.editing, Some((active, _)) if *active == field);
+        let text = match &self.editing {
+            Some((active, buffer)) if *active == field => format!("{buffer}▏"),
+            _ => field.display(current, lang),
+        };
+
+        let store = self.config.clone();
+        // 原生菜单的宽度由系统按文字算，这一项对它不起作用：整行压淡、条拖不动，
+        // 免得用户以为调了没反应。
+        let native = config.tray_menu_style == crate::config::TrayMenuStyle::Native;
+        let slider = crate::ui::VolumeSlider::new(
+            "tray-menu-width-slider",
+            ratio,
+            self.menu_width_drag.clone(),
+        )
+        // 设置页的条不发声：关掉电平 / 流光那套，只留一根实心条。
+        .effect(ActivityEffect::Off)
+        .enabled(!native)
+        .thickness(6.0)
+        .height(20.0)
+        .on_change(move |ratio, window, cx| {
+            let value = (low as f32 + ratio.clamp(0.0, 1.0) * span).round() as i32;
+            let value = value.clamp(low, high);
+            // 同一格来回拖时不做无谓的写盘和重绘。
+            if NumberField::TrayMenuWidth.value(store.borrow().get()) == value {
+                return;
+            }
+            let _ = store
+                .borrow_mut()
+                .update(|config| config.tray_menu_max_width = value as u32);
+            refresh_ui(window, cx);
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .px(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_secondary())
+                            .child(lang.pick("最大宽度", "Max width")),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).child(slider))
+                    .child(
+                        div()
+                            .id("tray-menu-width-value")
+                            .relative()
+                            .w(px(58.))
+                            .flex_none()
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .when(editing, |style| style.bg(theme::accent()))
+                            .text_size(theme::fs(10.5))
+                            .text_color(theme::text_primary())
+                            .text_center()
+                            .truncate()
+                            .hover(|style| style.opacity(0.8))
+                            // 手填还在：点数字走设置页那套（数字键 / 退格 / 回车确认）。
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.begin_edit(field, window, cx)
+                            }))
+                            .child(text)
+                            // 量下这一格：点别处要能落值（面板把冒泡截了，只能靠捕获相位）。
+                            .child(Self::measure_only_canvas(self.number_edit_bounds.clone())),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(theme::fs(9.5))
+                    .text_color(theme::text_tertiary())
+                    .child(hint),
+            )
+            .when(native, |row| row.opacity(0.5))
+            .into_any_element()
+    }
+
     fn tray_menu_overlay(
         &self,
         config: &Config,
+        devices: &[crate::audio::DeviceInfo],
         lang: Lang,
         viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
@@ -5894,7 +6584,8 @@ impl Settings {
             return None;
         }
 
-        let width = 420.0_f32;
+        // 右边多一列真实预览：窗口窄的时候先保证编辑列表，预览跟着缩。
+        let width = (viewport.width.as_f32() - 60.0).clamp(420.0, 640.0);
         let height = (viewport.height.as_f32() - 110.0).clamp(260.0, 560.0);
         let left = ((viewport.width.as_f32() - width) / 2.0).max(12.0);
         let top = ((viewport.height.as_f32() - height) / 2.0).max(44.0);
@@ -6006,12 +6697,14 @@ impl Settings {
                 .occlude()
                 .on_mouse_down(
                     gpui::MouseButton::Left,
-                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                    cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                         // 点弹层外面 = 关掉（顺便结束正在进行的重命名）。
                         this.tray_menu_open = false;
                         this.tray_drag = None;
                         this.tray_drop = None;
                         this.commit_tray_rename(window, cx);
+                        // 宽度框还开着的话先把值收下，再关弹层。
+                        this.commit_number_if_outside(event.position, window, cx);
                         cx.notify();
                     }),
                 )
@@ -6033,6 +6726,13 @@ impl Settings {
                         .bg(theme::surface_elevated())
                         .p(px(8.))
                         .gap(px(6.))
+                        // 这一层是遮挡层，根节点的捕获相位被它挡住 —— 宽度框的
+                        // 「点别处就落值」得在这里补一次（见 `commit_number_if_outside`）。
+                        .capture_any_mouse_down(cx.listener(
+                            |this, event: &gpui::MouseDownEvent, window, cx| {
+                                this.commit_number_if_outside(event.position, window, cx)
+                            },
+                        ))
                         // 点在面板上不算「点空白处」，否则一点就关。
                         .on_mouse_down(
                             gpui::MouseButton::Left,
@@ -6083,7 +6783,46 @@ impl Settings {
                                         .child(icon("close", 12.0, theme::text_secondary())),
                                 ),
                         )
-                        .child(list)
+                        // 宽度是这份菜单自己的排版参数，跟条目编辑摆在一起才好调。
+                        .child(self.menu_width_row(config, devices, lang, cx))
+                        .child(
+                            // 左：可编辑的条目列表；右：按当前配置真实渲染的菜单预览。
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(8.))
+                                .flex_1()
+                                .min_h_0()
+                                .child(list)
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(198.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .text_size(theme::fs(9.5))
+                                                .text_color(theme::text_tertiary())
+                                                .child(lang.pick("预览", "Preview")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("tray-menu-preview-scroll")
+                                                .flex_1()
+                                                .min_h_0()
+                                                .overflow_y_scroll()
+                                                // 预览按真实像素画：数值比这一列宽时会横向溢出，
+                                                // 给它一根横条，能拖到右半边看勾选点 / 箭头。
+                                                .overflow_x_scroll()
+                                                .track_scroll(&self.tray_preview_scroll)
+                                                .child(crate::windows::tray_menu::preview(
+                                                    config, devices,
+                                                )),
+                                        ),
+                                ),
+                        )
                         .child(
                             div()
                                 .px(px(6.))
@@ -6237,6 +6976,49 @@ impl Settings {
         .top_0()
         .size_full()
         .into_any_element()
+    }
+
+    /// 只量矩形、不接输入的画布：把这一格的窗口坐标每帧写回 `cell`。
+    ///
+    /// 用于判断「这一下点在框里还是点别处」——捕获相位跑在子控件之前，拿不到
+    /// 子控件自己设的标志，只能事先把矩形量好。
+    fn measure_only_canvas(cell: Rc<Cell<Option<Bounds<Pixels>>>>) -> AnyElement {
+        gpui::canvas(
+            |_bounds, _window, _cx| {},
+            move |bounds, _, _, _| cell.set(Some(bounds)),
+        )
+        .absolute()
+        .left_0()
+        .top_0()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// 点在数值框以外：把还在手填的数字收下（当作确认）。
+    ///
+    /// 根节点的捕获相位就够了 —— 除非点在托盘菜单弹层里：那一层挂了 `.occlude()`，
+    /// gpui 的捕获监听要求自己的 hitbox 处于 hover 状态，被遮住以后根节点收不到。
+    /// 所以弹层的卡片 / 背景各自也喊一次（它们自己是遮挡层，hover 在身上）。
+    fn commit_number_if_outside(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_none() {
+            return;
+        }
+        // 只对弹层里那个宽度框做「点在框里就不算失焦」；别的数字框的矩形没量过，
+        // 复用 `number_edit_bounds` 会拿到上一次的旧坐标，不能拿来判断。
+        let on_width = matches!(&self.editing, Some((NumberField::TrayMenuWidth, _)));
+        let inside = on_width
+            && self
+                .number_edit_bounds
+                .get()
+                .is_some_and(|bounds| bounds.contains(&position));
+        if !inside {
+            self.commit_edit(window, cx);
+        }
     }
 
     /// 插入位置的指示条：两像素高的一条亮线，插在哪两行之间就画在哪。
@@ -6421,6 +7203,46 @@ impl Settings {
             None
         };
 
+        // 行首图标：和弹出来的菜单用同一张图（分隔线画一条线、认不出的动作留空位）。
+        // 编辑器里能一眼看出「这一项弹出来长什么样」，不用去右边预览里找。
+        let glyph: AnyElement = if is_separator {
+            div()
+                .w(px(16.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(div().w(px(12.)).h(px(1.)).bg(theme::text_tertiary()))
+                .into_any_element()
+        } else {
+            let icon_name = if is_folder {
+                Some("folder")
+            } else if node.id == "devices" {
+                Some("speaker")
+            } else {
+                crate::windows::tray_menu::action_icon(&node.id)
+            };
+            match icon_name {
+                Some(icon_name) => div()
+                    .w(px(16.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(
+                        icon_name,
+                        12.,
+                        if visible {
+                            theme::text_secondary()
+                        } else {
+                            theme::text_tertiary()
+                        },
+                    ))
+                    .into_any_element(),
+                None => div().w(px(16.)).flex_none().into_any_element(),
+            }
+        };
+
         // 名字：子菜单点一下进重命名。
         let renaming = is_folder
             && self
@@ -6520,6 +7342,7 @@ impl Settings {
             .when(dragging, |row| row.bg(theme::surface_hover()))
             .child(handle)
             .child(eye)
+            .child(glyph)
             .child(name)
             .child(up)
             .child(down)
@@ -6672,7 +7495,10 @@ impl Settings {
         if self.font_menu.is_some() {
             return Some(self.font_filter.as_str());
         }
-        // 配置页：改名 / 新建，先给它们让路（同时只会有一处编辑）。
+        // 配置页：改名 / 新建 / 副本弹窗里的名字，先给它们让路（同时只会有一处编辑）。
+        if let Some((_, text)) = self.profile_copy.as_ref() {
+            return Some(text.as_str());
+        }
         if let Some((_, text)) = self.profile_rename.as_ref() {
             return Some(text.as_str());
         }
@@ -6709,6 +7535,9 @@ impl Settings {
     fn text_edit_mut(&mut self) -> Option<&mut String> {
         if self.font_menu.is_some() {
             return Some(&mut self.font_filter);
+        }
+        if self.profile_copy.is_some() {
+            return self.profile_copy.as_mut().map(|(_, text)| text);
         }
         if self.profile_rename.is_some() {
             return self.profile_rename.as_mut().map(|(_, text)| text);
@@ -6781,7 +7610,10 @@ impl Settings {
         } else if self.block_exempt_edit.is_some() {
             // 第二块名单单独一格：两框之间来回点不该互相回退。
             Some(6)
-        } else if self.profile_rename.is_some() || self.profile_new.is_some() {
+        } else if self.profile_rename.is_some()
+            || self.profile_new.is_some()
+            || self.profile_copy.is_some()
+        {
             Some(7)
         } else {
             None
@@ -10742,7 +11574,10 @@ impl Settings {
                                 // 强调色空着 = 跟随 Windows 的强调色：把真正生效的那个色号
                                 // 显示出来，用户能对上系统设置里的颜色（"—" 看不出跟到了什么）。
                                 // 图标颜色空着是「跟随任务栏深浅」，没有色号可给。
-                                if target.is_surface() || matches!(target, ColorTarget::Tray) {
+                                // 数字底色空着也不是「没有」，是回默认朱红。
+                                if matches!(target, ColorTarget::TrayNumberBackground) {
+                                    crate::config::DEFAULT_TRAY_NUMBER_BG.to_uppercase()
+                                } else if target.is_surface() || matches!(target, ColorTarget::Tray) {
                                     "—".to_string()
                                 } else {
                                     theme::accent_hex().to_uppercase()
@@ -10796,7 +11631,7 @@ impl Settings {
         // 「跟随系统」只留给强调色。底色的「跟随」就是打底模板自己那一档 ——
         // 点掉已选中的色块就能回去，再摆一个空心块只是多占一格。
         let mut swatches: Vec<AnyElement> = Vec::new();
-        if !target.is_surface() {
+        if target.has_follow() {
             swatches.push(follow);
         }
         for hex in target.presets() {
@@ -11632,59 +12467,225 @@ impl Settings {
             cx,
         );
 
-        // 托盘图标样式：喇叭 / 数字 / 软件图标，默认喇叭。
-        let icon_options: &'static [(u32, &'static str)] = if lang.is_en() {
-            &[
-                (0, "Speaker"),
-                (1, "Number"),
-                (2, "App icon"),
-                (3, "Dynamic"),
-                (4, "Custom .ico"),
-            ]
-        } else {
-            &[
-                (0, "喇叭"),
-                (1, "数字"),
-                (2, "软件图标"),
-                (3, "动态"),
-                (4, "自定义图标"),
-            ]
-        };
-        let icon_style = {
+        // 数字位置微调：左右 / 上下各一格，只挪数字（底色块始终居中）。
+        let digit_offset = self.digit_offset_row(config, lang, cx);
+
+        // 底色块：可选。关着时下面三项都不出现 —— 它们只在有底的时候有意义。
+        let mut background_rows: Vec<AnyElement> = Vec::new();
+        {
             let store = self.config.clone();
-            self.choice_row(
-                "tray-icon-style",
-                lang.pick("托盘图标", "Tray icon"),
+            let on = config.tray_number_background.enabled;
+            background_rows.push(self.toggle_row(
+                "tray-number-bg",
+                lang.pick("底色块", "Background tile"),
                 lang.pick(
-                    "选「数字」才会展开字体设置；「动态」是跟着声音律动的图标",
-                    "Number reveals font options; Dynamic animates with the sound",
+                    "数字压在一块圆角底色上，像自带的小徽章；数字的颜色会自动跟底色取对比",
+                    "Puts the digits on a rounded tile; the ink switches to contrast with it",
                 ),
-                icon_options,
-                match config.tray_icon_style {
-                    TrayIconStyle::Arcs => 0,
-                    TrayIconStyle::Number => 1,
-                    TrayIconStyle::App => 2,
-                    TrayIconStyle::Dynamic => 3,
-                    TrayIconStyle::Custom => 4,
-                },
-                move |value, window, cx| {
-                    let style = match value {
-                        1 => TrayIconStyle::Number,
-                        2 => TrayIconStyle::App,
-                        3 => TrayIconStyle::Dynamic,
-                        4 => TrayIconStyle::Custom,
-                        _ => TrayIconStyle::Arcs,
-                    };
-                    let _ = store
-                        .borrow_mut()
-                        .update(|config| config.tray_icon_style = style);
-                    // 动态模式要顺手把音频线程提频 / 降频。
-                    crate::gui::sync_tray_motion(cx);
+                on,
+                move |window, cx| {
+                    let _ = store.borrow_mut().update(|config| {
+                        config.tray_number_background.enabled = !config.tray_number_background.enabled
+                    });
                     crate::gui::refresh_tray_icon(cx);
                     refresh_ui(window, cx);
                 },
-            )
+            ));
+        }
+        if config.tray_number_background.enabled {
+            background_rows.push(self.color_row(
+                "tray-number-bg-color",
+                lang.pick("底色", "Tile colour"),
+                lang.pick(
+                    "数字的墨色跟着底色深浅自动换；自己挑了「图标颜色」就按自己的来",
+                    "The digits pick light or dark ink to match; a chosen icon colour wins",
+                ),
+                ColorTarget::TrayNumberBackground,
+                config,
+                cx,
+            ));
+            background_rows.push(self.number_row(
+                "tray-number-bg-size",
+                lang.pick("底色大小", "Tile size"),
+                lang.pick(
+                    "色块占图标的多大；只动色块，数字不变",
+                    "How much of the icon the tile takes; the digits stay put",
+                ),
+                NumberField::TrayNumberBgSize,
+                config,
+                lang,
+                cx,
+            ));
+            background_rows.push(self.number_row(
+                "tray-number-bg-round",
+                lang.pick("底色圆角", "Tile corners"),
+                lang.pick(
+                    "半边长度的百分比：0 是方角，100 是正圆",
+                    "Percent of half the tile: 0 is square, 100 is a circle",
+                ),
+                NumberField::TrayNumberBgRound,
+                config,
+                lang,
+                cx,
+            ));
+        }
+
+        // 托盘图标样式：五档全部摊开，每张卡一张真图 + 标题，默认喇叭。
+        let icon_style = {
+            let store = self.config.clone();
+            let picker = self.tray_style_picker(config, lang, move |value, window, cx| {
+                let style = match value {
+                    1 => TrayIconStyle::Number,
+                    2 => TrayIconStyle::App,
+                    3 => TrayIconStyle::Dynamic,
+                    4 => TrayIconStyle::Custom,
+                    _ => TrayIconStyle::Arcs,
+                };
+                let _ = store
+                    .borrow_mut()
+                    .update(|config| config.tray_icon_style = style);
+                // 动态模式要顺手把音频线程提频 / 降频。
+                crate::gui::sync_tray_motion(cx);
+                crate::gui::refresh_tray_icon(cx);
+                refresh_ui(window, cx);
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(9.))
+                .px(px(9.))
+                .py(px(8.))
+                .rounded(px(theme::RADIUS_ROW))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(theme::fs(13.))
+                                .text_color(theme::text_primary())
+                                .child(lang.pick("图标样式", "Icon style")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(10.5))
+                                .text_color(theme::text_tertiary())
+                                .child(lang.pick(
+                                    "缩略图就是托盘上会显示的样子；选「数字」才会展开字体设置",
+                                    "Each thumbnail is what the tray will show; Number reveals font options",
+                                )),
+                        ),
+                )
+                .child(picker)
+                .into_any_element()
         };
+
+        // 软件图标配色：只在选了「软件图标」时出现。
+        // exe 文件本身的图标是编译时定的浅底，这一项只管托盘和窗口。
+        let app_icon_tint = matches!(config.tray_icon_style, TrayIconStyle::App).then(|| {
+            let store = self.config.clone();
+            // 两套配色**同时**摆出来（各画一张真图），点哪个用哪个。
+            // 用分段按钮时只看得到文字，看不出红底到底红成什么样。
+            let options: [(AppIconStyle, &'static str); 2] = if lang.is_en() {
+                [(AppIconStyle::Cream, "Cream"), (AppIconStyle::Red, "Red")]
+            } else {
+                [(AppIconStyle::Cream, "浅底"), (AppIconStyle::Red, "红底")]
+            };
+            let mut row = div().flex().items_center().gap(px(8.));
+            for (candidate, label) in options {
+                let selected = config.app_icon_style == candidate;
+                let thumbnail: AnyElement =
+                    match self.tray_preview_image(TrayIconStyle::App, candidate, config) {
+                        Some(image) => img(image).w(px(16.)).h(px(16.)).into_any_element(),
+                        None => icon("pencil", 15., theme::text_tertiary()).into_any_element(),
+                    };
+                let store = store.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("app-icon-{label}")))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(5.))
+                        .w(px(74.))
+                        .h(px(56.))
+                        .rounded(px(theme::RADIUS_ROW))
+                        .border_1()
+                        .border_color(if selected {
+                            theme::accent()
+                        } else {
+                            theme::border()
+                        })
+                        .bg(if selected {
+                            theme::accent_soft()
+                        } else {
+                            theme::surface()
+                        })
+                        .cursor_pointer()
+                        .active(|style| style.opacity(0.72))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                            let _ = store
+                                .borrow_mut()
+                                .update(|config| config.app_icon_style = candidate);
+                            // 窗口 / 任务栏按钮上的图标也换：换了配色却只有托盘变，看着像没生效。
+                            crate::platform::app_icon::set_style(candidate);
+                            crate::windows::platform::refresh_app_icons();
+                            crate::gui::refresh_tray_icon(cx);
+                            refresh_ui(window, cx);
+                        }))
+                        .child(
+                            div()
+                                .h(px(16.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(thumbnail),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(10.5))
+                                .text_color(if selected {
+                                    theme::text_primary()
+                                } else {
+                                    theme::text_secondary()
+                                })
+                                .child(label),
+                        ),
+                );
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(7.))
+                .px(px(9.))
+                .py(px(8.))
+                .rounded(px(theme::RADIUS_ROW))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(theme::fs(13.))
+                                .text_color(theme::text_primary())
+                                .child(lang.pick("软件图标配色", "App icon colors")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(10.5))
+                                .text_color(theme::text_tertiary())
+                                .child(lang.pick(
+                                    "两套都在这儿，点一张就用它；exe 文件本身的图标始终是浅底",
+                                    "Both are right here — click one. The .exe icon itself stays cream",
+                                )),
+                        ),
+                )
+                .child(row)
+                .into_any_element()
+        });
 
         // 图标颜色：单色墨迹（喇叭 / 数字 / 动态图案）换个色就是换墨色。
         // 软件图标和自定义 ico 是彩色原图，染色会毁掉它 —— 选它们时这一行不出现。
@@ -11791,34 +12792,8 @@ impl Settings {
                 .into_any_element()
         });
 
-        // 律动效果 + 灵敏度：只在「动态」图标下才有意义。
-        let motion_effect = {
-            let store = self.config.clone();
-            let options: &'static [(u32, &'static str)] = if lang.is_en() {
-                &[(0, "Bars"), (1, "Ripple"), (2, "Orbit"), (3, "Pulse")]
-            } else {
-                &[(0, "律动条"), (1, "涟漪"), (2, "光环"), (3, "呼吸")]
-            };
-            self.choice_row(
-                "tray-motion-effect",
-                lang.pick("律动效果", "Motion effect"),
-                lang.pick(
-                    "四种都只吃峰值电平：律动条看电平表、涟漪随鼓点扩散、光环匀速转、呼吸跟着胀缩",
-                    "All four read the peak level: Bars is a level meter, Ripple spreads on beats, Orbit rotates, Pulse breathes",
-                ),
-                options,
-                config.tray_motion.index(),
-                move |value, window, cx| {
-                    let effect = TrayMotion::from_index(value);
-                    let _ = store
-                        .borrow_mut()
-                        .update(|config| config.tray_motion = effect);
-                    crate::gui::sync_tray_motion(cx);
-                    refresh_ui(window, cx);
-                },
-            )
-        };
-
+        // 律动灵敏度：跟律动效果是一回事 —— 效果决定「怎么动」，灵敏度决定
+        // 「动多大」，所以贴在四张律动卡下面，不另起一个区块。
         let motion_gain = self.number_row(
             "tray-motion-gain",
             lang.pick("律动灵敏度", "Motion sensitivity"),
@@ -11831,6 +12806,28 @@ impl Settings {
             lang,
             cx,
         );
+
+        // 律动效果 + 灵敏度：只在「动态」图标下才有意义。
+        // 律动四张卡紧跟着「动态」那张卡 —— 选了动态就在样式行下面直接展开，
+        // 不用滚到另一个区块里去找。
+        let motion_effect = matches!(config.tray_icon_style, TrayIconStyle::Dynamic).then(|| {
+            let store = self.config.clone();
+            let picker = self.motion_picker(config, lang, move |value, window, cx| {
+                let effect = TrayMotion::from_index(value);
+                let _ = store
+                    .borrow_mut()
+                    .update(|config| config.tray_motion = effect);
+                crate::gui::sync_tray_motion(cx);
+                refresh_ui(window, cx);
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(picker)
+                .child(motion_gain)
+                .into_any_element()
+        });
 
         // 彩色律动只在单色墨迹上画得出来：软件图标 / 自定义 ico 是彩色原图，
         // 染上去只会把原样毁掉，所以这两种样式下整行都不出现。
@@ -12271,6 +13268,12 @@ impl Settings {
         ];
         let panel_sections = vec![panel_section, footer_section];
         let mut tray_rows = vec![icon_style];
+        if let Some(row) = app_icon_tint {
+            tray_rows.push(row);
+        }
+        if let Some(row) = motion_effect {
+            tray_rows.push(row);
+        }
         if let Some(row) = custom_icon {
             tray_rows.push(row);
         }
@@ -12288,24 +13291,19 @@ impl Settings {
         // 字体 / 抗锯齿 / 三档字号宽高只对「数字」图标有意义：选喇叭时整段收起来，
         // 免得摆一堆改了也看不出变化的选项。
         if matches!(config.tray_icon_style, TrayIconStyle::Number) {
+            let mut rows = vec![
+                number_fonts,
+                antialias,
+                digit_one,
+                digit_two,
+                digit_three,
+                digit_offset,
+            ];
+            rows.extend(background_rows);
             sections.push(self.section(
                 lang.pick("托盘数字", "Tray digits"),
                 "speaker",
-                vec![
-                    number_fonts,
-                    antialias,
-                    digit_one,
-                    digit_two,
-                    digit_three,
-                ],
-            ));
-        }
-        // 律动效果 / 灵敏度只对「动态」图标有意义。
-        if matches!(config.tray_icon_style, TrayIconStyle::Dynamic) {
-            sections.push(self.section(
-                lang.pick("托盘律动", "Tray motion"),
-                "speaker",
-                vec![motion_effect, motion_gain],
+                rows,
             ));
         }
         // 菜单外观：跟随主题 = 自绘菜单，原生 = Windows 系统菜单。
@@ -12347,29 +13345,12 @@ impl Settings {
             )
         };
 
-        // 菜单最大宽度：超出的设备名用 … 收尾，免得一行横穿半个屏幕。
-        let tray_menu_width = self.number_row(
-            "tray-menu-width",
-            lang.pick("菜单最大宽度", "Menu max width"),
-            lang.pick(
-                "名字太长就用 … 截断；只对「跟随主题」的菜单有效",
-                "Long names get truncated with …; only for the themed menu",
-            ),
-            NumberField::TrayMenuWidth,
-            config,
-            lang,
-            cx,
-        );
-
         // 托盘右键菜单的布局：条目多，编辑器放进弹层，页面上只留一行入口。
+        // 「菜单最大宽度」也搬进弹层了（在那里拖条能立刻看出排版变化）。
         sections.push(self.section(
             lang.pick("托盘右键菜单", "Tray context menu"),
             "settings",
-            vec![
-                tray_menu_style,
-                self.tray_menu_entry_row(config, lang, cx),
-                tray_menu_width,
-            ],
+            vec![tray_menu_style, self.tray_menu_entry_row(config, lang, cx)],
         ));
 
         // 悬浮提示：内容完全由用户写，每行一个模板。
@@ -12492,6 +13473,81 @@ impl Settings {
             .unwrap_or(0)
     }
 
+    /// 当前字体在「这次列出来的行」里是第几行。
+    ///
+    /// 和 `font_index_of` 的区别是**按筛选后的列表算**：搜索词空着时第 0 行是
+    /// 「默认（系统字体）」，一有搜索词就只列匹配的字体，那一行不存在了。
+    fn font_row_of(fonts: &[String], filtering: bool, current: &str) -> Option<usize> {
+        if current.trim().is_empty() {
+            return (!filtering).then_some(0);
+        }
+        let index = fonts
+            .iter()
+            .position(|family| family.eq_ignore_ascii_case(current))?;
+        Some(if filtering { index } else { index + 1 })
+    }
+
+    /// 第 `row` 行是哪个字体（行号口径同 `font_row_of`；空串 = 默认字体）。
+    fn font_at_row(&self, row: usize) -> Option<String> {
+        let filtering = !self.font_filter.trim().is_empty();
+        let fonts = self.filtered_fonts();
+        if filtering {
+            fonts.get(row).cloned()
+        } else if row == 0 {
+            Some(String::new())
+        } else {
+            fonts.get(row - 1).cloned()
+        }
+    }
+
+    /// 方向键在字体列表里挪一格，**立刻**把那个字体应用上去。
+    ///
+    /// 不要求先回车：挑字体全靠看效果，按一下就在旁边试出来了。挪到的行会
+    /// 滚到视野中间，连按十几次也不会跑出框外（高亮 / 打勾跟着配置走）。
+    fn step_font_cursor(
+        &mut self,
+        direction: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((target, _, _)) = self.font_menu else {
+            return false;
+        };
+        let filtering = !self.font_filter.trim().is_empty();
+        let fonts = self.filtered_fonts();
+        // 空着搜索框时第一行是「默认（系统字体）」。
+        let rows = fonts.len() + usize::from(!filtering);
+        if rows == 0 {
+            // 一个都没筛出来：吃掉按键，别让它落到底下的页面上去滚动。
+            return true;
+        }
+        let current = target.current(&self.config.borrow().get());
+        let start = self
+            .font_cursor
+            .or_else(|| Self::font_row_of(&fonts, filtering, &current))
+            .unwrap_or(0)
+            .min(rows - 1);
+        let next = if direction < 0 {
+            start.saturating_sub(1)
+        } else {
+            (start + 1).min(rows - 1)
+        };
+        let family = if filtering {
+            fonts.get(next).cloned()
+        } else if next == 0 {
+            Some(String::new())
+        } else {
+            fonts.get(next - 1).cloned()
+        };
+        self.font_cursor = Some(next);
+        // 交给 overlay 下一帧把这一行滚到中间（这一帧还量不到行边界）。
+        self.font_pending_scroll = Some(next);
+        if let Some(family) = family {
+            self.apply_font(family, target, cx);
+        }
+        refresh_ui(window, cx);
+        true
+    }
     /// 搜索框筛出来的字体（不区分大小写，纯包含匹配）。
     fn filtered_fonts(&self) -> Vec<String> {
         let needle = self.font_filter.trim().to_lowercase();
@@ -12503,8 +13559,11 @@ impl Settings {
 
     /// 搜索词变了：列表内容整个换了，滚动位置回到顶部 ——
     /// 不重置的话会停在新列表的下半截（甚至一片空白），看着像「没结果」。
+    ///
+    /// 键盘游标一起清掉：行号是上一份列表的，套到新列表上会指到别的字体。
     fn reset_font_scroll(&mut self) {
         self.font_pending_scroll = None;
+        self.font_cursor = None;
         self.font_scroll.set_offset(gpui::point(px(0.), px(0.)));
     }
 
@@ -12512,9 +13571,34 @@ impl Settings {
     fn close_font_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.font_menu = None;
         self.font_pending_scroll = None;
+        self.font_cursor = None;
         self.font_filter.clear();
         self.text_marked = None;
         refresh_ui(window, cx);
+    }
+
+    /// 换一个字体（不关弹层）。方向键挑字体的路径也走这里，所以立刻生效。
+    fn apply_font(&mut self, family: String, target: FontTarget, cx: &mut Context<Self>) {
+        let store = self.config.clone();
+        let current = target.current(&store.borrow().get());
+        if current == family {
+            return;
+        }
+        let value = family.clone();
+        let _ = store
+            .borrow_mut()
+            .update(|config| target.set(config, value));
+        match target {
+            FontTarget::TrayNumber => crate::gui::refresh_tray_icon(cx),
+            // 界面字体是全局的：先把新字体装进主题层，再让整窗重画。
+            FontTarget::Ui => {
+                let cfg = store.borrow().get().clone();
+                crate::gui::apply_theme_extras(&cfg);
+                cx.refresh_windows();
+            }
+            // 面板自己读配置、挂在自己根节点上：重排一次尺寸 + 整窗重画就换过来了。
+            FontTarget::Panel => crate::gui::refresh_flyout_size(cx),
+        }
     }
 
     /// 选中一个字体：点列表行和搜索框里回车都走这里。
@@ -12525,25 +13609,7 @@ impl Settings {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = self.config.clone();
-        let current = target.current(&store.borrow().get());
-        if current != family {
-            let value = family.clone();
-            let _ = store
-                .borrow_mut()
-                .update(|config| target.set(config, value));
-            match target {
-                FontTarget::TrayNumber => crate::gui::refresh_tray_icon(cx),
-                // 界面字体是全局的：先把新字体装进主题层，再让整窗重画。
-                FontTarget::Ui => {
-                    let cfg = store.borrow().get().clone();
-                    crate::gui::apply_theme_extras(&cfg);
-                    cx.refresh_windows();
-                }
-                // 面板自己读配置、挂在自己根节点上：重排一次尺寸 + 整窗重画就换过来了。
-                FontTarget::Panel => crate::gui::refresh_flyout_size(cx),
-            }
-        }
+        self.apply_font(family, target, cx);
         self.close_font_menu(window, cx);
     }
 
@@ -12569,19 +13635,38 @@ impl Settings {
                 self.close_font_menu(window, cx);
                 return true;
             }
+            // ↑ / ↓：上下一行，挑到哪个就换哪个（挑字体全靠看效果，不必先回车）。
+            "up" => {
+                cx.stop_propagation();
+                self.step_font_cursor(-1, window, cx);
+                return true;
+            }
+            "down" => {
+                cx.stop_propagation();
+                self.step_font_cursor(1, window, cx);
+                return true;
+            }
             "enter" => {
                 cx.stop_propagation();
                 let target = self.font_menu.map(|(target, _, _)| target);
-                if let (Some(target), Some(family)) =
-                    (target, self.filtered_fonts().into_iter().next())
-                {
-                    // 搜索框空着时第一条就是「默认（系统字体）」那一行。
-                    let family = if self.font_filter.trim().is_empty() {
-                        String::new()
-                    } else {
-                        family
+                if let Some(target) = target {
+                    // 方向键挑过就用挑中的那个；没挑过才是列表第一条
+                    // （搜索框空着时第一条是「默认（系统字体）」）。
+                    let family = self.font_cursor.and_then(|row| self.font_at_row(row));
+                    let family = match family {
+                        Some(family) => Some(family),
+                        None => {
+                            let first = self.filtered_fonts().into_iter().next();
+                            if self.font_filter.trim().is_empty() {
+                                Some(String::new())
+                            } else {
+                                first
+                            }
+                        }
                     };
-                    self.pick_font(family, target, window, cx);
+                    if let Some(family) = family {
+                        self.pick_font(family, target, window, cx);
+                    }
                 }
                 return true;
             }
@@ -12716,12 +13801,16 @@ impl Settings {
                             if this.font_menu.is_some() {
                                 this.font_menu = None;
                                 this.font_pending_scroll = None;
+                                this.font_cursor = None;
                                 this.font_filter.clear();
                             } else {
                                 // 每次打开都是空白搜索 + 从顶部重新量一遍。
                                 this.font_scroll = gpui::ScrollHandle::new();
                                 this.font_filter.clear();
                                 this.text_marked = None;
+                                // 键盘游标从「当前用的那个字体」开始，第一次按 ↑ / ↓
+                                // 才是从旁边往两边试，而不是从列表顶上重头数。
+                                this.font_cursor = None;
                                 // 打开就滚到当前选中的那个字体。第一帧还量不到行边界，
                                 // 记个下标交给下一帧的 overlay 去滚。
                                 this.font_pending_scroll = Some(Self::font_index_of(
@@ -12761,12 +13850,19 @@ impl Settings {
     /// 字体列表里的一行：左边用这个字体自己画两个数字当预览。
     ///
     /// `family` 为空串表示「跟随系统」—— 那一行不指定字体，预览就是系统默认的样子。
+    ///
+    /// `own_face` 决定这一行用不用字体自己画字。**只有列表短的时候才开**：
+    /// 系统里有三百多个字体族，逐个 `font_family` 会让 DirectWrite 在第一帧里
+    /// 加载三百多个字体文件 —— 实测打开弹层要卡好几秒，个别字体（如阿里巴巴
+    /// 普惠体这种多 weight 的 OTF）还会在这一步把进程带崩。搜索后结果少
+    /// （几十行）才值得预览，那时候打开几乎是瞬间的。
     fn font_menu_row(
         &self,
         family: &str,
         config: &Config,
         lang: Lang,
         target: FontTarget,
+        own_face: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = family.eq_ignore_ascii_case(&target.current(config));
@@ -12806,7 +13902,7 @@ impl Settings {
                     .w(px(30.))
                     .flex_none()
                     .text_size(theme::fs(13.))
-                    .font_family(preview.clone())
+                    .when(own_face, |row| row.font_family(preview.clone()))
                     .text_color(if selected {
                         theme::accent()
                     } else {
@@ -12821,7 +13917,7 @@ impl Settings {
                     .truncate()
                     .text_size(theme::fs(11.5))
                     // 图标字体的名字用界面字体画，否则整行都是方框。
-                    .when(!Self::is_symbol_font(family), |row| {
+                    .when(own_face && !Self::is_symbol_font(family), |row| {
                         row.font_family(preview)
                     })
                     .text_color(if selected {
@@ -12951,12 +14047,15 @@ impl Settings {
             .overflow_y_scroll()
             .track_scroll(&self.font_scroll)
             .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()));
+        // 行数少（搜索结果）才逐行用字体自己画：全量列表有三百多行，
+        // 每行一个 `font_family` 等于一次性加载三百多个字体文件，打开就卡死。
+        let own_face = fonts.len() <= 40;
         if !filtering {
             // 第一行永远是「跟随系统」：不然选了别的字体就回不去了。
-            list = list.child(self.font_menu_row("", config, lang, target, cx));
+            list = list.child(self.font_menu_row("", config, lang, target, own_face, cx));
         }
         for family in &fonts {
-            list = list.child(self.font_menu_row(family, config, lang, target, cx));
+            list = list.child(self.font_menu_row(family, config, lang, target, own_face, cx));
         }
         if fonts.is_empty() {
             list = list.child(
@@ -12975,8 +14074,8 @@ impl Settings {
         // 所以先补一帧，等下一帧拿到 `bounds_for_item` 再算偏移量。
         if let Some(index) = self.font_pending_scroll {
             let row_count = fonts.len() + if filtering { 0 } else { 1 };
-            if filtering || index >= row_count {
-                // 搜索中不抢滚动位置（用户在挑结果）；下标越界也别硬滚。
+            if index >= row_count {
+                // 下标越界（列表比上次短了）就别硬滚，直接丢掉。
                 self.font_pending_scroll = None;
             } else if let Some(row) = self.font_scroll.bounds_for_item(index) {
                 let view = self.font_scroll.bounds();
@@ -14687,49 +15786,72 @@ impl Settings {
     /// 一帧一次纯属浪费；外面手动改文件的话，切走再切回来就能看到。
     fn reload_profiles(&self) {
         // 老版本把快照塞在 `Configs/主配置.json`，那里现在只该有用户自己的档。
-        crate::profiles::migrate_legacy_backup(&self.profiles_root());
-        let list = crate::profiles::list(&self.profiles_root());
-        let live = self.config.borrow().get().clone();
-        let backup = crate::profiles::main_backup(&self.profiles_root());
-        // 快照跟当前内容一样（或者压根没快照）= 现在用的就是主配置本身。
-        // 这时候**不去找**「内容相同的副配置」：内容一样本来就没法分辨是不是它，
-        // 硬标会标到某份副本上，看着像「启用了另一份配置」。
-        let on_main = crate::profiles::read(&backup)
-            .map(|config| Self::same_config(&config, &live))
-            .unwrap_or(true);
-        let active = if on_main {
-            None
-        } else {
+        let root = self.profiles_root();
+        crate::profiles::migrate_legacy_backup(&root);
+        let list = crate::profiles::list(&root);
+        // 「现在用的是哪一份」只认 `Configs/.active` 记下的名字。
+        //
+        // **不拿内容去比对**：被启用的那一份会跟着主配置一起写（镜像），内容永远
+        // 跟 `config.json` 一模一样，一比就会把列表里第一份同内容的副本标成
+        // 「正在使用」—— 主配置行于是变成「可以启用」，看着就像被副本夺舍了。
+        let stored = crate::profiles::read_active(&root);
+        let active = stored.as_deref().and_then(|name| {
             list.iter()
-                .find(|profile| {
-                    crate::profiles::read(&profile.path)
-                        .map(|config| Self::same_config(&config, &live))
-                        .unwrap_or(false)
-                })
+                .find(|profile| profile.name.eq_ignore_ascii_case(name))
                 .map(|profile| profile.path.clone())
-        };
+        });
+        // 记着的那份已经不在目录里了（手动删掉 / 改名没跟上）：当作回到主配置。
+        if active.is_none() && stored.is_some() {
+            let _ = crate::profiles::write_active(&root, None);
+        }
+        let backup = crate::profiles::main_backup(&root);
         *self.profiles.borrow_mut() = list;
         *self.profile_active.borrow_mut() = active.clone();
-        *self.profile_main_backup.borrow_mut() = (!on_main).then_some(backup);
+        // 主配置行的「启用」= 拿快照切回上一次的主配置：只有离开主配置之后才有意义。
+        *self.profile_main_backup.borrow_mut() =
+            (active.is_some() && backup.exists()).then_some(backup);
         // 草稿里有没保存的改动时别动镜像：这会儿内容跟谁都对不上，
         // 一改就会让「保存」写不到正确的那份档里去。
-        if !self.config.borrow().is_dirty() {
+        let dirty = self.config.borrow().is_dirty();
+        if !dirty {
             self.config.borrow_mut().set_mirror(active);
         }
     }
 
-    /// 两份配置是不是同一套（宽高、格式版本这种谁都不许动的字段不算）。
-    fn same_config(a: &Config, b: &Config) -> bool {
-        let (Ok(mut a), Ok(mut b)) = (serde_json::to_value(a), serde_json::to_value(b)) else {
-            return false;
-        };
-        if let (Some(a), Some(b)) = (a.as_object_mut(), b.as_object_mut()) {
-            for key in UNTOUCHED_FIELDS {
-                a.remove(key);
-                b.remove(key);
-            }
+    /// 更新拖动落点（没在拖就忽略），变了才重画。
+    fn set_profile_drop(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.profile_drag.is_none() || self.profile_drop == Some(index) {
+            return;
         }
-        a == b
+        self.profile_drop = Some(index);
+        cx.notify();
+    }
+
+    /// 松手：把拖着的那一份挪到落点，并把顺序记进 `Configs/.order`。
+    fn finish_profile_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(from), Some(to)) = (self.profile_drag, self.profile_drop) else {
+            self.profile_drag = None;
+            self.profile_drop = None;
+            return;
+        };
+        self.profile_drag = None;
+        self.profile_drop = None;
+        let mut list = self.profiles.borrow().clone();
+        // 原位放下（放在自己身上 / 自己后面）就不动，免得白写一次顺序文件。
+        if from >= list.len() || to == from || to == from + 1 {
+            refresh_ui(window, cx);
+            return;
+        }
+        let moved = list.remove(from);
+        // 落点是在「第 to 行之前」：移走一行之后，它后面的下标整体前移一格。
+        let target = if to > from { to - 1 } else { to };
+        list.insert(target.min(list.len()), moved);
+        let names: Vec<String> = list.iter().map(|profile| profile.name.clone()).collect();
+        if let Err(error) = crate::profiles::write_order(&self.profiles_root(), &names) {
+            log::warn!("配置档顺序写不进去：{error}");
+        }
+        *self.profiles.borrow_mut() = list;
+        refresh_ui(window, cx);
     }
 
     /// 配置页底部那句临时提示（2.6 秒后自己消失）。
@@ -14834,12 +15956,15 @@ impl Settings {
         // 内容跟现在一样就没意义（灰着）。
         let backup = self.profile_main_backup.borrow().clone();
         let has_backup = backup.is_some();
+        // 主配置正在用时这颗按钮也是死的：它切的是「上一次的主配置」快照，
+        // 而此刻并没有「上一层」可回。
+        let live_is_main = self.profile_active.borrow().is_none();
         let restore_path = backup.unwrap_or_default();
         let activate = self.profile_chip(
             "profile-main-activate".into(),
             lang.pick("启用", "Use"),
             true,
-            has_backup,
+            has_backup && !live_is_main,
             cx,
             move |this, window, cx| this.activate_profile(restore_path.clone(), window, cx),
         );
@@ -14849,7 +15974,7 @@ impl Settings {
             false,
             true,
             cx,
-            |this, window, cx| this.duplicate_profile(None, window, cx),
+            |this, window, cx| this.begin_duplicate_profile(None, window, cx),
         );
         let export = self.profile_chip(
             "profile-main-export".into(),
@@ -14911,9 +16036,10 @@ impl Settings {
             .into_any_element()
     }
 
-    /// 一份副配置：名字（点一下就地改名）+ 多久之前 + 五个动作。
+    /// 一份副配置：拖动手柄 + 铅笔 + 名字 + 多久之前 + 五个动作。
     fn profile_row(
         &self,
+        index: usize,
         profile: &crate::profiles::Profile,
         lang: Lang,
         cx: &mut Context<Self>,
@@ -14924,35 +16050,79 @@ impl Settings {
         let dirty = self.config.borrow().is_dirty();
         let key = path.display().to_string();
 
-        let title = match (&self.profile_rename, renaming) {
-            (Some((_, buffer)), true) => format!("{buffer}▏"),
-            _ => profile.name.clone(),
-        };
+        // 改名时整格换成输入框（光标 / 拖动选区 / 点哪站哪）；平时就是一行文字，
+        // 点一下进改名。
         let rename_path = path.clone();
-        let name = div()
-            .id(SharedString::from(format!("profile-name-{key}")))
-            // 改了名要挂输入法通道：画布是绝对定位的，父节点得是 relative。
-            .relative()
-            .truncate()
-            .text_size(theme::fs(12.))
-            .text_color(theme::text_primary())
-            .cursor_pointer()
-            .when(renaming, |style| {
-                style
-                    .px(px(4.))
-                    .rounded(px(theme::RADIUS_SMALL))
-                    .bg(theme::track())
-            })
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.begin_profile_rename(rename_path.clone(), window, cx)
-            }))
-            .child(title)
-            // 中文走输入法：这一格得挂上 `ElementInputHandler`，
-            // 不然平台只在 `WM_CHAR` 里给到英文，拼音打不出来。
-            .when(renaming, |style| style.child(self.text_edit_canvas(cx)));
+        let name = if renaming {
+            let buffer = self
+                .profile_rename
+                .as_ref()
+                .map(|(_, buffer)| buffer.clone())
+                .unwrap_or_default();
+            div()
+                .relative()
+                .flex_1()
+                .min_w(px(0.))
+                .px(px(4.))
+                .rounded(px(theme::RADIUS_SMALL))
+                .bg(theme::track())
+                .child(self.profile_name_field("rename", &buffer, "", 12., cx))
+                .into_any_element()
+        } else {
+            div()
+                .id(SharedString::from(format!("profile-name-{key}")))
+                .truncate()
+                .text_size(theme::fs(12.))
+                .text_color(theme::text_primary())
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.begin_profile_rename(rename_path.clone(), window, cx)
+                }))
+                .child(profile.name.clone())
+                .into_any_element()
+        };
 
         // 「正在使用」和主配置那行长得一模一样、位置也一样：紧挨着名字后头。
         let active = self.profile_active.borrow().as_deref() == Some(path.as_path());
+        // 拖动手柄：按住它开始拖，松手重排。放在最前面 —— 拖的是「这一行」，
+        // 手柄挨着行首，眼睛不用先找到名字再看左边。
+        let handle = div()
+            .id(SharedString::from(format!("profile-grip-{key}")))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(16.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.72))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.profile_drag = Some(index);
+                    this.profile_drop = None;
+                    cx.notify();
+                }),
+            )
+            .child(icon("menu", 11., theme::text_tertiary()));
+        // 名字前面那支铅笔就是「改名」。以前它在行尾，挤在「导出」「删除」中间，
+        // 看着像又一个文件操作；摆在名字前面读起来才是「改这个名字」。
+        let pencil_path = path.clone();
+        let pencil = div()
+            .id(SharedString::from(format!("profile-pencil-{key}")))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(16.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.72))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.begin_profile_rename(pencil_path.clone(), window, cx)
+            }))
+            .child(icon("pencil", 11., theme::text_tertiary()));
         let title_block = {
             let mut block = div()
                 .flex_1()
@@ -14960,6 +16130,8 @@ impl Settings {
                 .flex()
                 .items_center()
                 .gap(px(6.))
+                .child(handle)
+                .child(pencil)
                 .child(name);
             if active {
                 block = block.child(
@@ -14984,11 +16156,12 @@ impl Settings {
             .child(Self::profile_age(profile.age_secs(), lang));
 
         let activate_path = path.clone();
+        // 正在用的这一份没什么可「启用」的：灰着，别给一颗点了等于没点的按钮。
         let activate = self.profile_chip(
             format!("profile-activate-{key}"),
             lang.pick("启用", "Use"),
             true,
-            !dirty,
+            !dirty && !active,
             cx,
             move |this, window, cx| this.activate_profile(activate_path.clone(), window, cx),
         );
@@ -15011,18 +16184,8 @@ impl Settings {
             true,
             cx,
             move |this, window, cx| {
-                this.duplicate_profile(Some(copy_path.clone()), window, cx)
+                this.begin_duplicate_profile(Some(copy_path.clone()), window, cx)
             },
-        );
-
-        let rename_path = path.clone();
-        let rename = self.profile_chip(
-            format!("profile-rename-{key}"),
-            lang.pick("改名", "Rename"),
-            false,
-            true,
-            cx,
-            move |this, window, cx| this.begin_profile_rename(rename_path.clone(), window, cx),
         );
 
         let export_path = path.clone();
@@ -15048,7 +16211,13 @@ impl Settings {
             move |this, window, cx| this.delete_profile(delete_path.clone(), window, cx),
         );
 
-        div()
+        let dragging = self.profile_drag == Some(index);
+        let drop_above = self.profile_drop == Some(index);
+        let drag_active = self.profile_drag.is_some();
+
+        let mut row = div()
+            .id(SharedString::from(format!("profile-row-{key}")))
+            .relative()
             .flex()
             .items_center()
             .gap(px(8.))
@@ -15056,15 +16225,59 @@ impl Settings {
             .py(px(4.))
             .rounded(px(theme::RADIUS_ROW))
             .when(active, |style| style.bg(theme::track()))
+            .when(dragging, |style| style.bg(theme::surface_hover()))
             .child(title_block)
             .child(age)
             .child(activate)
             .child(swap)
             .child(copy)
-            .child(rename)
             .child(export)
-            .child(delete)
-            .into_any_element()
+            .child(delete);
+
+        // 落点标记：松开就会插到这一行上面。
+        if drop_above {
+            row = row.child(
+                div()
+                    .absolute()
+                    .left(px(1.))
+                    .right(px(1.))
+                    .top(px(0.))
+                    .h(px(2.))
+                    .rounded(px(1.))
+                    .bg(theme::accent()),
+            );
+        }
+
+        // 拖动中把行切成上下两半：上半格 = 插到这一行前面，下半格 = 插到它后面。
+        // 这一层盖在按钮上面是有意的 —— 拖着的时候不该还能点到「删除」。
+        if drag_active {
+            row = row
+                .child(
+                    div()
+                        .id(SharedString::from(format!("profile-drop-top-{key}")))
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .top(px(0.))
+                        .h(relative(0.5))
+                        .on_mouse_move(cx.listener(move |this, _: &gpui::MouseMoveEvent, _, cx| {
+                            this.set_profile_drop(index, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("profile-drop-bottom-{key}")))
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .h(relative(0.5))
+                        .on_mouse_move(cx.listener(move |this, _: &gpui::MouseMoveEvent, _, cx| {
+                            this.set_profile_drop(index + 1, cx);
+                        })),
+                );
+        }
+        row.into_any_element()
     }
 
     fn profiles_page(&self, lang: Lang, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -15110,13 +16323,25 @@ impl Settings {
                     .into_any_element(),
             );
         } else {
-            for profile in &profiles {
-                rows.push(self.profile_row(profile, lang, cx));
+            for (index, profile) in profiles.iter().enumerate() {
+                rows.push(self.profile_row(index, profile, lang, cx));
+            }
+            // 拖到最后一行下面（列表末尾）也要有落点标记。
+            if self.profile_drag.is_some() && self.profile_drop == Some(profiles.len()) {
+                rows.push(
+                    div()
+                        .mx(px(6.))
+                        .h(px(2.))
+                        .rounded(px(1.))
+                        .bg(theme::accent())
+                        .into_any_element(),
+                );
             }
         }
 
         // 新建时就在列表底下多一行输入框：敲名字、回车。
         if let Some(buffer) = self.profile_new.as_ref() {
+            let placeholder = lang.pick("配置名", "Profile name").to_string();
             rows.push(
                 div()
                     .flex()
@@ -15131,15 +16356,16 @@ impl Settings {
                             .relative()
                             .flex_1()
                             .min_w(px(0.))
-                            .truncate()
                             .px(px(4.))
                             .rounded(px(theme::RADIUS_SMALL))
                             .bg(theme::track())
-                            .text_size(theme::fs(12.))
-                            .text_color(theme::text_primary())
-                            .child(format!("{buffer}▏"))
-                            // 新建那一格同样要输入法通道（中文名）。
-                            .child(self.text_edit_canvas(cx)),
+                            .child(self.profile_name_field(
+                                "new",
+                                buffer.as_str(),
+                                &placeholder,
+                                12.,
+                                cx,
+                            )),
                     )
                     .child(
                         div()
@@ -15185,7 +16411,7 @@ impl Settings {
         }
         rows.push(actions.into_any_element());
 
-        let card = self.section(lang.pick("配置档", "Profiles"), "levels", rows);
+        let card = self.section(lang.pick("配置档", "Profiles"), "wrench", rows);
         // 拖拽整页都能接：系统把文件拖进来时只有「拖到窗口里」这一个事件，
         // 挂在卡片上更准，挂整页则不会因为正好落在说明文字上就丢掉。
         vec![
@@ -15199,6 +16425,14 @@ impl Settings {
                         this.import_files(files, window, cx);
                     },
                 ))
+                // 松手落点：在行外面松开（比如列表底下的空白处）也要收尾，
+                // 不然拖到一半松手会一直停在「拖动中」。
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseUpEvent, window, cx| {
+                        this.finish_profile_drag(window, cx);
+                    }),
+                )
                 .child(card)
                 .into_any_element(),
         ]
@@ -15208,6 +16442,7 @@ impl Settings {
     fn begin_profile_new(&mut self, lang: Lang, window: &mut Window, cx: &mut Context<Self>) {
         self.profile_rename = None;
         self.profile_pending_delete = None;
+        self.profile_copy = None;
         let stem = lang.pick("配置", "Config");
         let taken: Vec<String> = self
             .profiles
@@ -15223,6 +16458,10 @@ impl Settings {
         }
         self.profile_new = Some(candidate);
         self.text_marked = None;
+        // 默认名整段选中：直接打字就替掉，不用先按一堆退格。
+        self.profile_caret = self.profile_new.as_deref().map(utf16_len).unwrap_or(0);
+        self.profile_anchor = Some(0);
+        self.profile_caret_drag = false;
         // 同上：先拿焦点，输入法才会挂到这一格。
         self.focus.focus(window, cx);
         refresh_ui(window, cx);
@@ -15246,8 +16485,17 @@ impl Settings {
         };
         self.profile_new = None;
         self.profile_pending_delete = None;
+        self.profile_copy = None;
         self.profile_rename = Some((path, profile.name));
         self.text_marked = None;
+        // 改名从末尾接着打（和以前一样），不整段选中。
+        self.profile_caret = self
+            .profile_rename
+            .as_ref()
+            .map(|(_, text)| utf16_len(text))
+            .unwrap_or(0);
+        self.profile_anchor = None;
+        self.profile_caret_drag = false;
         // 拿到焦点：输入法通道（`window.handle_input`）只对着焦点的输入框注册。
         self.focus.focus(window, cx);
         refresh_ui(window, cx);
@@ -15256,6 +16504,8 @@ impl Settings {
     fn commit_profile_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.profile_new.is_some() {
             self.commit_profile_new(window, cx);
+        } else if self.profile_copy.is_some() {
+            self.confirm_duplicate_profile(window, cx);
         } else {
             self.commit_profile_rename(window, cx);
         }
@@ -15300,6 +16550,14 @@ impl Settings {
         refresh_ui(window, cx);
     }
 
+    /// 名字敲完跟原来一样吗（清洗之后比）。
+    ///
+    /// 一样就当没改过：不写盘、不刷列表、也不弹「已改名」——点进名字看一眼
+    /// 再点出来是最常见的操作，每次都给一句提示反而吵。
+    fn profile_name_unchanged(current: &str, buffer: &str) -> bool {
+        crate::profiles::clean_name(buffer) == current
+    }
+
     /// 真去改名（文件 + 列表），把要提示的那句话交回给调用方。
     ///
     /// 单独拆出来是因为「窗口失焦」那条回调只有 `App`、拿不到 `Context`，
@@ -15307,12 +16565,26 @@ impl Settings {
     fn rename_profile_file(&mut self, window: &mut Window, cx: &mut App) -> Option<String> {
         let (path, buffer) = self.profile_rename.take()?;
         let lang = self.config.borrow().get().language;
+        // 名字原样没动：当作什么都没发生，不写盘、不刷列表、也不弹「已改名」。
+        // 点进名字看一眼再点出来是最常见的操作，每次都给一句提示反而吵。
+        let current = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if Self::profile_name_unchanged(current, &buffer) {
+            refresh_ui(window, cx);
+            return None;
+        }
         let text = match crate::profiles::rename(&path, &buffer) {
             Ok(moved) => {
-                // 改的就是「正在用」的那份：镜像跟着换到新名字，不然下次保存
-                // 会把旧名字的文件又写出来（等于凭空多一份）。
-                if self.config.borrow().mirror() == Some(path.as_path()) {
-                    self.config.borrow_mut().set_mirror(Some(moved));
+                // 改的是「正在用」的那一份：`.active` 得跟着换成新名字，不然
+                // 下次刷新列表就按旧名字找不到它（会当成回了主配置），镜像也
+                // 还挂着旧路径 —— 再保存一次等于凭空又写出一份旧档。
+                if self.profile_active.borrow().as_deref() == Some(path.as_path()) {
+                    let root = self.profiles_root();
+                    if let Some(stem) = moved.file_stem().and_then(|name| name.to_str()) {
+                        let _ = crate::profiles::write_active(&root, Some(stem));
+                    }
                 }
                 self.reload_profiles();
                 lang.pick("已改名", "Renamed").to_string()
@@ -15371,27 +16643,17 @@ impl Settings {
             }
         };
         let before = self.config.borrow().get().clone();
-        // 启用是「整份盖掉主配置」，盖上就没了 —— 所以先给现在这套留一份快照。
+        let root = self.profiles_root();
+        let backup_path = crate::profiles::main_backup(&root);
+        // `path` 就是快照 = 主配置行的「启用」：这是「切回上一次的主配置」，不是切档。
+        let back_to_main = path == backup_path;
+        // 启用是「整份盖掉主配置」，盖上就没了 —— 所以**从主配置切走之前**先留一份快照。
         //
-        // 但快照只该装**真正的主配置**。现在这套本身要是某份副配置（说明主配置
-        // 早就被换走了），再切另一份副配置时绝不能把这份顶上去 —— 否则主配置行的
-        // 「启用」切回去的是上一份副配置，看着就像「启用了另一个副配置」。
-        //
-        // 另外两种情况也不写：内容跟要启用的那份一模一样（点了个寂寞，别把回退点
-        // 顶掉），以及目标本身就是这份快照（写了就是自己盖自己）。
-        let backup_path = crate::profiles::main_backup(&self.profiles_root());
-        let same = Self::same_config(&before, &source);
-        let live_is_profile = crate::profiles::list(&self.profiles_root())
-            .iter()
-            .any(|profile| {
-                crate::profiles::read(&profile.path)
-                    .map(|config| Self::same_config(&config, &before))
-                    .unwrap_or(false)
-            });
-        let snapshot_is_better = crate::profiles::read(&backup_path)
-            .map(|config| !Self::same_config(&config, &before))
-            .unwrap_or(false);
-        let kept = if same || path == backup_path || (live_is_profile && snapshot_is_better) {
+        // 只在当前确实还在主配置上时才写：从一份副配置切到另一份时，快照里得一直是
+        // 真正的主配置，不能拿上一份副配置把它顶掉 —— 否则主配置行的「启用」切回去
+        // 的是另一份副配置，看着就像又一次被夺舍。
+        let live_on_main = self.profile_active.borrow().is_none();
+        let kept = if back_to_main || !live_on_main {
             None
         } else {
             crate::profiles::write(&backup_path, &before)
@@ -15415,10 +16677,17 @@ impl Settings {
             self.set_profile_notice(error.to_string(), cx);
             return;
         }
-        // 这套现在属于那份档（切回主配置的快照除外）：之后每次落盘两边一起写。
+        // 显式记下「现在用的是哪一份」：之后每次落盘写回它，界面也照这个显示。
+        // 切回主配置就把记录删掉 —— 别再拿内容去猜了。
+        if back_to_main {
+            let _ = crate::profiles::write_active(&root, None);
+        } else if let Some(stem) = path.file_stem().and_then(|name| name.to_str()) {
+            let _ = crate::profiles::write_active(&root, Some(stem));
+        }
+        // 这套现在属于那份档（切回主配置除外）：之后每次落盘两边一起写。
         self.config
             .borrow_mut()
-            .set_mirror((path != backup_path).then(|| path.clone()));
+            .set_mirror((!back_to_main).then(|| path.clone()));
         let after = self.config.borrow().get().clone();
         // 切过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
         let autostart_changed = Self::fields_differ(
@@ -15430,6 +16699,7 @@ impl Settings {
         self.profile_new = None;
         self.profile_pending_delete = None;
         self.profile_swap = None;
+        self.profile_copy = None;
         self.close_transient_popups();
         self.apply_everything(&after, None, autostart_changed, window, cx);
         self.reload_profiles();
@@ -15515,11 +16785,14 @@ impl Settings {
         // 列表里那行随之消失（内容已经整份在 config.json 里，没有另存的必要）。
         // 原来的主配置不保留，连上一次留下的那份快照也一起清掉 —— 别留一份
         // 用户以为已经没了的配置，让主配置行的「启用」还能切回去。
-        let backup_path = crate::profiles::main_backup(&self.profiles_root());
+        let root = self.profiles_root();
+        let backup_path = crate::profiles::main_backup(&root);
         let removed = crate::profiles::remove(&path);
         if backup_path != path {
             let _ = crate::profiles::remove(&backup_path);
         }
+        // 这一份「变成」了主配置：现在用的就是主配置本身，记录一并清掉。
+        let _ = crate::profiles::write_active(&root, None);
         let after = self.config.borrow().get().clone();
         // 换过去的档可能换了自启方式：只在那三项真变过时才动系统登记。
         let autostart_changed = Self::fields_differ(
@@ -15550,44 +16823,92 @@ impl Settings {
         refresh_ui(window, cx);
     }
 
-    /// 「副本」：把某一档（`None` = 当前主配置）复制成新的一份，不动原件。
-    fn duplicate_profile(
+    /// 副本的默认名字：`X (1)`、`X (2)`…（挑第一个没被占用的编号）。
+    ///
+    /// 不叫「X 副本 / X copy」：编号一眼能看出是第几次复制，也不受界面语言影响，
+    /// 中英文切来切去文件名不会跟着变。
+    fn duplicate_name(from: Option<&Path>, taken: &[String], lang: Lang) -> String {
+        let base = match from {
+            Some(path) => path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            None => lang.pick("主配置", "Main config").to_string(),
+        };
+        let mut n = 1;
+        loop {
+            let candidate = format!("{base} ({n})");
+            if !taken.iter().any(|name| name.eq_ignore_ascii_case(&candidate)) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// 现在 `Configs/` 里已有的名字（算副本编号用）。
+    fn profile_names(&self) -> Vec<String> {
+        self.profiles
+            .borrow()
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect()
+    }
+
+    /// 「副本」：先弹框 —— 里面直接就能改名，确认了才真的复制。
+    ///
+    /// 复制会在 `Configs/` 里多出一个文件，是可以撤销前先看清楚的动作；
+    /// 顺手在框里改名，也比「复制完再去点铅笔改一次」少一步。
+    fn begin_duplicate_profile(
         &mut self,
         from: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.profile_rename = None;
+        self.profile_new = None;
+        self.profile_pending_delete = None;
+        self.profile_swap = None;
+        // 缓冲留空：打开就能直接打字命名，框里用灰字写着默认名（「X (1)」）。
+        // 预填默认名的话这里没有「全选」，用户得先退格删一遍才能改名。
+        self.profile_copy = Some((from, String::new()));
+        self.text_marked = None;
+        self.profile_caret = 0;
+        self.profile_anchor = None;
+        self.profile_caret_drag = false;
+        // 弹窗里的输入框和新建那一行一样要拿焦点：输入法通道只对着焦点的输入区注册。
+        self.focus.focus(window, cx);
+        refresh_ui(window, cx);
+    }
+
+    /// 弹窗确认：把来源整份写成新的一档（名字用弹窗里敲的那个）。
+    fn confirm_duplicate_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((from, buffer)) = self.profile_copy.take() else {
+            return;
+        };
         let lang = self.config.borrow().get().language;
-        let (source, base) = match from {
-            Some(path) => {
-                let stem = path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                match crate::profiles::read(&path) {
-                    Ok(config) => (config, stem),
-                    Err(error) => {
-                        let text = if lang.is_en() {
-                            format!("Cannot read this profile: {error}")
-                        } else {
-                            format!("这份配置读不进来：{error}")
-                        };
-                        self.set_profile_notice(text, cx);
-                        return;
-                    }
+        let source = match from.as_deref() {
+            Some(path) => match crate::profiles::read(path) {
+                Ok(config) => config,
+                Err(error) => {
+                    let text = if lang.is_en() {
+                        format!("Cannot read this profile: {error}")
+                    } else {
+                        format!("这份配置读不进来：{error}")
+                    };
+                    self.set_profile_notice(text, cx);
+                    refresh_ui(window, cx);
+                    return;
                 }
-            }
-            None => (
-                self.config.borrow().get().clone(),
-                lang.pick("主配置", "Main config").to_string(),
-            ),
+            },
+            // `None` = 当前主配置：用内存里这份，含还没落盘的草稿。
+            None => self.config.borrow().get().clone(),
         };
-        let name = if lang.is_en() {
-            format!("{base} copy")
-        } else {
-            format!("{base} 副本")
-        };
+        // 名字清空就用默认的「X (n)」：复制本身不该被一个空输入框拦住。
+        let mut name = crate::profiles::clean_name(&buffer);
+        if name.is_empty() {
+            name = Self::duplicate_name(from.as_deref(), &self.profile_names(), lang);
+        }
         match crate::profiles::create(&self.profiles_root(), &name, &source) {
             Ok(path) => {
                 self.reload_profiles();
@@ -15616,6 +16937,7 @@ impl Settings {
         self.profile_rename = None;
         self.profile_new = None;
         self.profile_swap = None;
+        self.profile_copy = None;
         self.profile_pending_delete = Some(path);
         refresh_ui(window, cx);
     }
@@ -15629,8 +16951,16 @@ impl Settings {
     ) {
         self.profile_pending_delete = None;
         let lang = self.config.borrow().get().language;
-        // 删掉的是「正在用」的那份：镜像一并摘掉，否则下次保存会把它又写回来。
-        if self.config.borrow().mirror() == Some(path.as_path()) {
+        // 删掉的是「正在用」的那份：内容就在 `config.json` 里，删了文件等于
+        // 回到主配置，记录一并清掉（镜像也必须摘，否则下次保存会把它写回来）。
+        // 先取出来再判断：`if self.config.borrow().mirror() == ..` 的临时 `Ref`
+        // 会活到整个 if 语句，块里再 `borrow_mut()` 就是 already borrowed。
+        let live_is_this = self.profile_active.borrow().as_deref() == Some(path.as_path());
+        if live_is_this {
+            let _ = crate::profiles::write_active(&self.profiles_root(), None);
+        }
+        let mirrored = self.config.borrow().mirror() == Some(path.as_path());
+        if mirrored {
             self.config.borrow_mut().set_mirror(None);
         }
         match crate::profiles::remove(&path) {
@@ -15741,6 +17071,375 @@ impl Settings {
         refresh_ui(window, cx);
     }
 
+    // ======================= 配置档名字输入框 =======================
+    //
+    // 新建 / 改名 / 副本弹窗三处共用一个输入框：光标、拖动选区、点哪站哪。
+    // 做法和屏幕提示那个多行编辑器一致（这套界面自绘、拿不到字形坐标）：
+    // 每个字切成左右两半的透明命中区，左半 = 光标落在字前、右半 = 字后，
+    // 按住拖过去就是选它。三处同时只会开一处，所以光标 / 选区共用一份状态。
+
+    /// 正在编辑的那份配置档名字。
+    fn profile_edit_text(&self) -> Option<&str> {
+        if let Some((_, text)) = self.profile_copy.as_ref() {
+            return Some(text.as_str());
+        }
+        if let Some((_, text)) = self.profile_rename.as_ref() {
+            return Some(text.as_str());
+        }
+        self.profile_new.as_deref()
+    }
+
+    fn profile_edit_text_mut(&mut self) -> Option<&mut String> {
+        if self.profile_copy.is_some() {
+            return self.profile_copy.as_mut().map(|(_, text)| text);
+        }
+        if self.profile_rename.is_some() {
+            return self.profile_rename.as_mut().map(|(_, text)| text);
+        }
+        self.profile_new.as_mut()
+    }
+
+    /// 规范化的选区（UTF-16 前 → 后）；没选中东西 = `None`。
+    fn profile_selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.profile_anchor?;
+        let len = self.profile_edit_text().map(utf16_len)?;
+        let caret = self.profile_caret.min(len);
+        let anchor = anchor.min(len);
+        let (start, end) = if anchor <= caret {
+            (anchor, caret)
+        } else {
+            (caret, anchor)
+        };
+        (start != end).then_some((start, end))
+    }
+
+    /// 移动光标；`extend` = Shift / 拖动，锚点不动，只拉另一头。
+    fn profile_set_caret(&mut self, at: usize, extend: bool) {
+        let len = self.profile_edit_text().map(utf16_len).unwrap_or(0);
+        let caret = at.min(len);
+        if extend {
+            if self.profile_anchor.is_none() {
+                self.profile_anchor = Some(self.profile_caret.min(len));
+            }
+        } else {
+            self.profile_anchor = None;
+        }
+        self.profile_caret = caret;
+    }
+
+    /// 按住左键拖过某一格：只挪光标，锚点保持按下时的位置。
+    fn profile_drag_to(
+        &mut self,
+        to: usize,
+        event: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event.pressed_button, Some(gpui::MouseButton::Left)) {
+            if self.profile_caret_drag {
+                self.profile_caret_drag = false;
+                cx.notify();
+            }
+            return;
+        }
+        if !self.profile_caret_drag {
+            return;
+        }
+        cx.stop_propagation();
+        if self.profile_caret == to {
+            return;
+        }
+        self.profile_set_caret(to, true);
+        cx.notify();
+    }
+
+    /// 删掉选区，光标落到选区起点；返回删没删东西。
+    fn profile_delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.profile_selection() else {
+            self.profile_anchor = None;
+            return false;
+        };
+        let Some(current) = self.profile_edit_text().map(|text| text.to_string()) else {
+            return false;
+        };
+        let len = utf16_len(&current);
+        let next = format!(
+            "{}{}",
+            utf16_slice(&current, 0..start),
+            utf16_slice(&current, end..len)
+        );
+        if let Some(buffer) = self.profile_edit_text_mut() {
+            *buffer = next;
+        }
+        self.profile_caret = start;
+        self.profile_anchor = None;
+        true
+    }
+
+    /// 在光标处插一段文字（有选区就先顶掉选中的内容）。
+    fn profile_insert(&mut self, input: &str) {
+        self.push_text_undo();
+        if self.profile_edit_text().is_none() {
+            return;
+        }
+        self.profile_delete_selection();
+        let current = self
+            .profile_edit_text()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        let (next, caret) = rename_insert_at(&current, self.profile_caret, input, MAX_NAME_CHARS);
+        if let Some(buffer) = self.profile_edit_text_mut() {
+            *buffer = next;
+        }
+        self.profile_caret = caret;
+        self.profile_anchor = None;
+    }
+
+    fn profile_backspace(&mut self) {
+        self.push_text_undo();
+        if self.profile_delete_selection() {
+            return;
+        }
+        let Some(current) = self.profile_edit_text().map(|text| text.to_string()) else {
+            return;
+        };
+        if let Some((next, caret)) = rename_delete_at(&current, self.profile_caret, false) {
+            if let Some(buffer) = self.profile_edit_text_mut() {
+                *buffer = next;
+            }
+            self.profile_caret = caret;
+            self.profile_anchor = None;
+        }
+    }
+
+    fn profile_delete_forward(&mut self) {
+        self.push_text_undo();
+        if self.profile_delete_selection() {
+            return;
+        }
+        let Some(current) = self.profile_edit_text().map(|text| text.to_string()) else {
+            return;
+        };
+        if let Some((next, caret)) = rename_delete_at(&current, self.profile_caret, true) {
+            if let Some(buffer) = self.profile_edit_text_mut() {
+                *buffer = next;
+            }
+            self.profile_caret = caret;
+            self.profile_anchor = None;
+        }
+    }
+
+    /// 左右方向键：没按 Shift 且本来有选区时，先收到靠那一侧的一端。
+    fn profile_move_caret(&mut self, delta: isize, extend: bool) {
+        let Some(current) = self.profile_edit_text().map(|text| text.to_string()) else {
+            return;
+        };
+        let len = utf16_len(&current);
+        if !extend {
+            if let Some((start, end)) = self.profile_selection() {
+                self.profile_caret = if delta < 0 { start } else { end };
+                self.profile_anchor = None;
+                return;
+            }
+        }
+        let caret = self.profile_caret.min(len);
+        let next = if delta < 0 {
+            caret.saturating_sub(prev_char_len(&current, caret))
+        } else {
+            (caret + next_char_len(&current, caret)).min(len)
+        };
+        if extend {
+            if self.profile_anchor.is_none() {
+                self.profile_anchor = Some(caret);
+            }
+        } else {
+            self.profile_anchor = None;
+        }
+        self.profile_caret = next;
+    }
+
+    /// Home / End。
+    fn profile_caret_edge(&mut self, end: bool, extend: bool) {
+        let len = self.profile_edit_text().map(utf16_len).unwrap_or(0);
+        let caret = self.profile_caret.min(len);
+        if extend {
+            if self.profile_anchor.is_none() {
+                self.profile_anchor = Some(caret);
+            }
+        } else {
+            self.profile_anchor = None;
+        }
+        self.profile_caret = if end { len } else { 0 };
+    }
+
+    fn profile_select_all(&mut self) {
+        let Some(len) = self.profile_edit_text().map(utf16_len) else {
+            return;
+        };
+        self.profile_anchor = Some(0);
+        self.profile_caret = len;
+    }
+
+    fn profile_selected_text(&self) -> String {
+        let Some((start, end)) = self.profile_selection() else {
+            return String::new();
+        };
+        let Some(text) = self.profile_edit_text() else {
+            return String::new();
+        };
+        utf16_slice(text, start..end)
+    }
+
+    /// Ctrl+Z：走和别处共用的撤销栈，撤完把光标放到末尾。
+    fn profile_undo(&mut self, cx: &mut Context<Self>) {
+        if self.undo_text_edit(cx) {
+            self.profile_caret = self.profile_edit_text().map(utf16_len).unwrap_or(0);
+            self.profile_anchor = None;
+        }
+    }
+
+    /// 配置档名字输入框本体：光标 + 选区 + 输入法落点。
+    ///
+    /// `tag` 只用来让同帧的 id 不撞车（新建 / 改名 / 副本各一）。
+    fn profile_name_field(
+        &self,
+        tag: &'static str,
+        text: &str,
+        placeholder: &str,
+        size: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let len = utf16_len(text);
+        let caret = self.profile_caret.min(len);
+        let selection = self.profile_selection();
+        let row_h = px(size + 5.);
+        let caret_bar = || {
+            div()
+                .flex_none()
+                .w(px(1.5))
+                .h(px(size + 1.))
+                .bg(theme::text_primary())
+        };
+        let mut row = div()
+            .id(SharedString::from(format!("profile-field-{tag}")))
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(1.))
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .h(row_h)
+            .text_size(theme::fs(size))
+            .text_color(theme::text_primary())
+            .cursor(gpui::CursorStyle::IBeam)
+            // 松手就结束这次拖动：之后鼠标再滑过也不该继续改选区。
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    if this.profile_caret_drag {
+                        this.profile_caret_drag = false;
+                        cx.notify();
+                    }
+                }),
+            );
+
+        if text.is_empty() {
+            row = row.child(caret_bar()).child(
+                div()
+                    .flex_none()
+                    .text_color(theme::text_tertiary())
+                    .child(placeholder.to_string()),
+            );
+        } else {
+            let mut offset = 0usize;
+            for ch in text.chars() {
+                let before = offset;
+                let after = offset + ch.len_utf16();
+                offset = after;
+                if caret == before {
+                    row = row.child(caret_bar());
+                }
+                let selected = selection.is_some_and(|(start, end)| before >= start && after <= end);
+                let mut glyph = div()
+                    .relative()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .h(row_h)
+                    .when(selected, |style| style.bg(theme::accent_glow()))
+                    .child(ch.to_string());
+                // 左半 / 右半两个透明命中区：拖过去就是「选到这一格」。
+                for right in [false, true] {
+                    let to = if right { after } else { before };
+                    glyph = glyph.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "profile-hit-{tag}-{before}-{}",
+                                u8::from(right)
+                            )))
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(relative(if right { 0.5 } else { 0.0 }))
+                            .w(relative(0.5))
+                            .cursor(gpui::CursorStyle::IBeam)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.profile_set_caret(to, event.modifiers.shift);
+                                        this.profile_caret_drag = true;
+                                        cx.notify();
+                                    },
+                                ),
+                            )
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                    this.profile_drag_to(to, event, cx);
+                                },
+                            )),
+                    );
+                }
+                row = row.child(glyph);
+            }
+            if caret == len {
+                row = row.child(caret_bar());
+            }
+        }
+
+        // 尾部空白：点它 = 光标放到末尾；拖到框外沿也一样跟着走。
+        let tail = len;
+        row = row
+            .child(
+                div()
+                    .id(SharedString::from(format!("profile-tail-{tag}")))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(row_h)
+                    .cursor(gpui::CursorStyle::IBeam)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(
+                            move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.profile_set_caret(tail, event.modifiers.shift);
+                                this.profile_caret_drag = true;
+                                cx.notify();
+                            },
+                        ),
+                    )
+                    .on_mouse_move(cx.listener(
+                        move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                            this.profile_drag_to(tail, event, cx);
+                        },
+                    )),
+            )
+            // 输入法通道 + 记下这一格的矩形（「点在框里不算失焦」要用）。
+            .child(self.text_edit_canvas_measured(self.rename_bounds.clone(), cx));
+        row.into_any_element()
+    }
+
     /// 配置页的键盘：改名 / 新建时按键都属于名字。
     fn handle_profile_key(
         &mut self,
@@ -15748,7 +17447,8 @@ impl Settings {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.profile_rename.is_none() && self.profile_new.is_none() {
+        if self.profile_rename.is_none() && self.profile_new.is_none() && self.profile_copy.is_none()
+        {
             return false;
         }
         // 输入法正在拼字：这些键交给输入法。
@@ -15756,41 +17456,106 @@ impl Settings {
             return false;
         }
         let key = event.keystroke.key.as_str();
-        if key == "enter" {
-            cx.stop_propagation();
-            self.commit_profile_edit(window, cx);
-            return true;
-        }
-        if key == "escape" {
-            cx.stop_propagation();
-            self.profile_rename = None;
-            self.profile_new = None;
-            self.text_marked = None;
-            refresh_ui(window, cx);
-            return true;
-        }
-        if key == "backspace" {
-            cx.stop_propagation();
-            self.backspace_text_edit(cx);
-            return true;
-        }
-        if key == "v" && event.keystroke.modifiers.control {
-            cx.stop_propagation();
-            let text = cx
-                .read_from_clipboard()
-                .and_then(|item| item.text().map(|text| text.to_string()));
-            if let Some(text) = text {
-                self.insert_rename_text(&text);
-                refresh_ui(window, cx);
+        let shift = event.keystroke.modifiers.shift;
+        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        // Ctrl 组合先来：全选 / 复制 / 剪切 / 粘贴 / 撤销。
+        if command {
+            match key {
+                "a" => {
+                    cx.stop_propagation();
+                    self.profile_select_all();
+                    refresh_ui(window, cx);
+                    return true;
+                }
+                "c" | "x" => {
+                    cx.stop_propagation();
+                    let selected = self.profile_selected_text();
+                    if !selected.is_empty() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
+                        if key == "x" {
+                            self.profile_delete_selection();
+                        }
+                        refresh_ui(window, cx);
+                    }
+                    return true;
+                }
+                "v" => {
+                    cx.stop_propagation();
+                    let text = cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text().map(|text| text.to_string()));
+                    if let Some(text) = text {
+                        self.profile_insert(&text);
+                        refresh_ui(window, cx);
+                    }
+                    return true;
+                }
+                "z" => {
+                    cx.stop_propagation();
+                    self.profile_undo(cx);
+                    refresh_ui(window, cx);
+                    return true;
+                }
+                _ => return false,
             }
-            return true;
         }
-        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
-            return false;
+        match key {
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_profile_edit(window, cx);
+                return true;
+            }
+            "escape" => {
+                cx.stop_propagation();
+                self.profile_rename = None;
+                self.profile_new = None;
+                self.profile_copy = None;
+                self.text_marked = None;
+                self.profile_anchor = None;
+                refresh_ui(window, cx);
+                return true;
+            }
+            "backspace" => {
+                cx.stop_propagation();
+                self.profile_backspace();
+                refresh_ui(window, cx);
+                return true;
+            }
+            "delete" => {
+                cx.stop_propagation();
+                self.profile_delete_forward();
+                refresh_ui(window, cx);
+                return true;
+            }
+            "left" => {
+                cx.stop_propagation();
+                self.profile_move_caret(-1, shift);
+                refresh_ui(window, cx);
+                return true;
+            }
+            "right" => {
+                cx.stop_propagation();
+                self.profile_move_caret(1, shift);
+                refresh_ui(window, cx);
+                return true;
+            }
+            "home" => {
+                cx.stop_propagation();
+                self.profile_caret_edge(false, shift);
+                refresh_ui(window, cx);
+                return true;
+            }
+            "end" => {
+                cx.stop_propagation();
+                self.profile_caret_edge(true, shift);
+                refresh_ui(window, cx);
+                return true;
+            }
+            _ => {}
         }
         if let Some(text) = event.keystroke.key_char.as_ref() {
             cx.stop_propagation();
-            self.insert_rename_text(text);
+            self.profile_insert(text);
             refresh_ui(window, cx);
             return true;
         }
@@ -16325,7 +18090,12 @@ impl Settings {
         .detach();
     }
 
-    /// 页面底部那条「应用 / 保存」：草稿模式的出口。
+    /// 页面底部那条「确定 / 取消 / 应用」：草稿模式的出口。
+    ///
+    /// - 确定：落盘并关窗（有改动时按钮用强调色）；
+    /// - 取消：草稿整个丢掉，界面推回磁盘上那一份，再关窗；
+    /// - 应用：只落盘、留在原页，**没有改动时是灰的、点不动** —— 亮起来就等于
+    ///   告诉用户「这里还有东西没存」。
     fn apply_bar(&self, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
         let dirty = self.config.borrow().is_dirty();
         // 临时提示（导入成功之类）借用底栏这块地方：任何一页都看得见，
@@ -16334,6 +18104,19 @@ impl Settings {
             Some((text, _)) => text.clone(),
             None if dirty => lang.pick("有未保存的更改", "Unsaved changes").to_string(),
             None => String::new(),
+        };
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(4.))
+                .rounded(px(theme::RADIUS_SMALL))
+                .text_size(theme::fs(11.5))
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.88))
+                // 按下去立刻压暗一档：手指落下就得有回应，不然点没点上全凭猜。
+                .active(|style| style.opacity(0.66))
+                .child(label)
         };
         div()
             .h(px(40.))
@@ -16351,54 +18134,57 @@ impl Settings {
                     .text_color(theme::text_tertiary())
                     .child(hint),
             )
+            // 确定：保存并关闭。主操作，一直用强调色；没有改动时它也是「关窗」。
             .child(
-                div()
-                    .id("settings-apply")
-                    .px(px(12.))
-                    .py(px(4.))
-                    .rounded(px(theme::RADIUS_SMALL))
+                button("settings-ok", lang.pick("确定", "OK"))
+                    .bg(theme::accent())
+                    .text_color(theme::text_primary())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.save_draft(true, window, cx)
+                    })),
+            )
+            .child(
+                button("settings-cancel", lang.pick("取消", "Cancel"))
                     .bg(theme::track())
-                    .text_size(theme::fs(11.5))
-                    .text_color(if dirty {
-                        theme::text_secondary()
+                    .text_color(theme::text_secondary())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.cancel_draft(window, cx)
+                    })),
+            )
+            .child(
+                button("settings-apply", lang.pick("应用", "Apply"))
+                    .bg(if dirty {
+                        theme::accent_soft()
                     } else {
-                        theme::text_tertiary()
+                        theme::track()
                     })
                     .when(dirty, |style| {
                         style
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme::surface_hover()))
+                            .border_1()
+                            .border_color(theme::accent())
+                            .text_color(theme::text_primary())
+                    })
+                    .when(!dirty, |style| {
+                        // 灰掉：颜色压到三级文字，鼠标也不显示手型 —— 「没东西可应用」。
+                        style
+                            .text_color(theme::text_tertiary())
+                            .cursor_default()
                     })
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         if this.config.borrow().is_dirty() {
                             this.save_draft(false, window, cx);
                         }
                     }))
-                    .child(lang.pick("应用", "Apply")),
-            )
-            .child(
-                div()
-                    .id("settings-save")
-                    .px(px(12.))
-                    .py(px(4.))
-                    .rounded(px(theme::RADIUS_SMALL))
-                    .bg(if dirty {
-                        theme::accent()
-                    } else {
-                        theme::track()
-                    })
-                    .text_size(theme::fs(11.5))
-                    .text_color(if dirty {
-                        theme::text_primary()
-                    } else {
-                        theme::text_tertiary()
-                    })
-                    .cursor_pointer()
-                    .hover(|style| style.opacity(0.88))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.save_draft(true, window, cx)
-                    }))
-                    .child(lang.pick("保存", "Save")),
+                    // 亮 → 灰（刚存完）本来就该看见，但直接换底色是「啪」一下切过去；
+                    // 换一个动画 id 让它淡进来，看得出是「状态变了」而不是闪了一下。
+                    .with_animation(
+                        ElementId::Name(
+                            format!("settings-apply-{}", u8::from(dirty)).into(),
+                        ),
+                        Animation::new(std::time::Duration::from_millis(180)),
+                        |element, delta| element.opacity(0.45 + 0.55 * delta),
+                    )
+                    .into_any_element(),
             )
             .into_any_element()
     }
@@ -16407,6 +18193,10 @@ impl Settings {
     ///
     /// `close` = 保存完顺手关窗（「保存」按钮）；否则留在原页（「应用」）。
     fn save_draft(&mut self, close: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // 已经在淡出了（刚点过确定 / 取消）：这一下是连点，别再存一遍。
+        if self.closing_at.is_some() {
+            return;
+        }
         // 先把还挂在输入框里的东西落进草稿：gpui 是「最上面的元素先收到事件」，
         // 点在「保存」上时根节点那个「点别处就提交」还没轮到，不补这一下，
         // 最后一次输入（数值 / 改名 / 提示文字）会漏掉。
@@ -16431,7 +18221,13 @@ impl Settings {
 
         // 写不进去就别装作保存好了：留着草稿、也别关窗，把原因记一笔 ——
         // 否则用户按了「保存」，窗口一关改动全没了，还查不出为什么。
-        if let Err(error) = self.config.borrow_mut().commit_draft() {
+        //
+        // 结果必须先落进变量再 match：写成 `if let Err(e) = self.config.borrow_mut().commit_draft()`
+        // 的话，那个 `RefMut` 是 if-let 的临时值，活到整个块结束；块里再
+        // `self.config.borrow()` 就是「already mutably borrowed」→ panic（release 是
+        // abort，用户看到的是点保存就闪退）。configure.json 只读时 100% 走到这条路。
+        let committed = self.config.borrow_mut().commit_draft();
+        if let Err(error) = committed {
             crate::platform::logfile::append(
                 "crash.log",
                 &format!("配置保存失败：{error}"),
@@ -16481,6 +18277,10 @@ impl Settings {
         crate::gui::refresh_tray_icon(cx);
         crate::gui::refresh_tray_menu(cx);
         crate::gui::sync_tray_motion(cx);
+        // 软件图标配色：草稿预览 / 点取消退回磁盘那份时，window 图标要跟着退回去，
+        // 否则只有托盘变了、任务栏按钮还停在红底上。
+        crate::platform::app_icon::set_style(config.app_icon_style);
+        crate::windows::platform::refresh_app_icons();
         crate::gui::refresh_volume_cap(cx);
         // 只在面板开着时重排：这里是一次换掉一整页（甚至整份），按「调宽度」那条走
         // 会把面板预览出来 —— 点一下恢复菜单就蹦一块面板，用户不知道哪来的。
@@ -16538,9 +18338,67 @@ impl Settings {
 
     /// 真关窗：草稿模式到此结束（没提交的改动丢掉），窗口自己会触发清理订阅。
     fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.config.borrow_mut().discard_draft();
-        window.remove_window();
-        let _ = cx;
+        self.play_close(window, cx, |this, _, _| {
+            this.config.borrow_mut().discard_draft();
+        });
+    }
+
+    /// 「取消」：草稿整个丢掉，界面推回磁盘上那一份，然后关窗。
+    ///
+    /// 跟点 × 之后选「不保存」是同一条路，只是不再多问一句 —— 按钮上写着
+    /// 「取消」，用户已经表达得很清楚了。
+    fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.play_close(window, cx, |this, window, cx| {
+            this.close_transient_popups();
+            if this.config.borrow_mut().discard_draft() {
+                // 草稿里的改动早就预览出去了（主题、透明度、面板尺寸……），推回去。
+                let config = this.config.borrow().get().clone();
+                this.apply_everything(&config, None, false, window, cx);
+            }
+        });
+    }
+
+    /// 关窗的统一出口：先播 150ms 淡出，再把窗口摘掉。
+    ///
+    /// 为什么不直接 `remove_window`：窗口一帧内消失，用户看到的是「点一下就
+    /// 没了」，跟闪退一模一样。整扇窗淡出去，才读得出「是正常关掉的」。
+    ///
+    /// `after` 是真正关窗前要做的事（丢草稿 / 把预览推回磁盘那份）。它必须
+    /// 等到淡出**结束之后**才跑：`apply_everything` 里有一句
+    /// `set_opacity(界面不透明度)`，在淡出中途执行会把刚暗下去的窗口又点亮一帧。
+    fn play_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        after: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if self.closing_at.is_some() {
+            return;
+        }
+        // 关掉界面动画（或系统要求减少动态效果）就一帧到位，别硬塞。
+        if !(self.config.borrow().get().ui_motion && !cx.reduce_motion()) {
+            after(self, window, cx);
+            crate::windows::platform::set_opacity(window, 0.0);
+            window.remove_window();
+            return;
+        }
+        self.closing_at = Some(std::time::Instant::now());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(close_fade_ms()))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.closing_at.is_none() {
+                    return;
+                }
+                after(this, window, cx);
+                // `after` 可能刚把窗口点回不透明度；同一帧里摘掉，不会再亮回一帧。
+                crate::windows::platform::set_opacity(window, 0.0);
+                window.remove_window();
+            });
+        })
+        .detach();
     }
 
     /// 「设为主配置」的确认框：这一步直接覆盖 config.json，问一句再动。
@@ -16769,6 +18627,152 @@ impl Settings {
         )
     }
 
+    /// 「副本」弹窗：复制之前先把名字定了，回车或点「复制」才真的写文件。
+    ///
+    /// 名字框默认填好「X 副本」，嫌长就直接改，不用复制完再去点铅笔改一遍。
+    fn profile_copy_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (from, buffer) = self.profile_copy.clone()?;
+        let source = match from.as_deref() {
+            Some(path) => path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            None => lang.pick("主配置", "Main config").to_string(),
+        };
+        // 空着就在框里用灰字写默认名：看着是个名字，敲字就直接替掉。
+        let placeholder = Self::duplicate_name(from.as_deref(), &self.profile_names(), lang);
+        let confirm = div()
+            .id("profile-copy-confirm")
+            .px(px(12.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::accent())
+            .text_color(theme::text_primary())
+            .text_size(theme::fs(11.5))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.88))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.confirm_duplicate_profile(window, cx);
+            }))
+            .child(lang.pick("复制", "Copy"));
+        let cancel = div()
+            .id("profile-copy-cancel")
+            .px(px(12.))
+            .py(px(4.))
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::track())
+            .text_color(theme::text_secondary())
+            .text_size(theme::fs(11.5))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.88))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.close_profile_copy(window, cx);
+            }))
+            .child(lang.pick("取消", "Cancel"));
+
+        Some(
+            div()
+                .id("profile-copy-backdrop")
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgb_to_hsla(rgba(0x00000059)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.close_profile_copy(window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(360.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .p(px(16.))
+                        .rounded(px(theme::RADIUS_WINDOW))
+                        .border_1()
+                        .border_color(theme::border_strong())
+                        .bg(theme::opaque(theme::surface_elevated()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation()
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(13.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::text_primary())
+                                .child(lang.pick("复制配置", "Duplicate profile")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::fs(11.))
+                                .text_color(theme::text_secondary())
+                                .child(if lang.is_en() {
+                                    format!(
+                                        "A copy of {source} goes into Configs. Type a name below; left empty it becomes “{placeholder}”."
+                                    )
+                                } else {
+                                    format!(
+                                        "从 {source} 复制一份放进 Configs，名字在下面直接改；留空就叫「{placeholder}」。"
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(8.))
+                                .py(px(5.))
+                                .rounded(px(theme::RADIUS_SMALL))
+                                .bg(theme::track())
+                                .child(self.profile_name_field(
+                                    "copy",
+                                    &buffer,
+                                    &placeholder,
+                                    12.,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(theme::fs(10.))
+                                        .text_color(theme::text_tertiary())
+                                        .child(lang.pick(
+                                            "回车确定 · Esc 取消",
+                                            "Enter to copy · Esc to cancel",
+                                        )),
+                                )
+                                .child(confirm)
+                                .child(cancel),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 收起副本弹窗，草稿一起丢掉（点背板 / 取消都走这里）。
+    fn close_profile_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_copy = None;
+        self.text_marked = None;
+        refresh_ui(window, cx);
+    }
+
     /// 「有未保存的更改」确认框：保存 / 不保存 / 取消。
     fn confirm_close_overlay(&self, lang: Lang, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.confirm_close {
@@ -16786,7 +18790,9 @@ impl Settings {
                 .rounded(px(theme::RADIUS_SMALL))
                 .text_size(theme::fs(11.5))
                 .cursor_pointer()
-                .hover(|style| style.opacity(0.88));
+                .hover(|style| style.opacity(0.88))
+                // 和底栏那三颗同一套按下反馈。
+                .active(|style| style.opacity(0.66));
             element = if primary {
                 element.bg(theme::accent()).text_color(theme::text_primary())
             } else {
@@ -16810,11 +18816,7 @@ impl Settings {
                         CloseAnswer::Discard => {
                             this.confirm_close = false;
                             // 不保存 = 把草稿丢掉，界面上预览出去的东西也跟着弹回去。
-                            if this.config.borrow_mut().discard_draft() {
-                                let config = this.config.borrow().get().clone();
-                                this.apply_everything(&config, None, false, window, cx);
-                            }
-                            window.remove_window();
+                            this.cancel_draft(window, cx);
                         }
                     }
                 }))
@@ -16994,6 +18996,25 @@ impl Settings {
 impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.remember_size(window, cx);
+
+        // 关窗淡出：按已经过去的毫秒数把整窗 alpha 压下去（界面不透明度是基准，
+        // 用户把它调低过也一样从「现在这么亮」淡到 0）。窗口本身是分层的
+        // （`apply_everything` 一直在用 `set_opacity`），所以这一步不用改布局、不用重画内容。
+        //
+        // alpha 是 Win32 直接设的，不会自己推进 —— 得靠每帧 notify 再跑一次 render。
+        if let Some(started) = self.closing_at {
+            let total = close_fade_ms() as f32 / 1000.0;
+            let progress = (started.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
+            crate::windows::platform::set_opacity(
+                window,
+                crate::ui::theme::ui_opacity() * (1.0 - progress),
+            );
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            });
+        }
+
         let config = self.config.borrow().get().clone();
         let lang = config.language;
         let snapshot = self.snapshot.borrow().clone();
@@ -17047,17 +19068,30 @@ impl Render for Settings {
             });
         }
 
+        // 律动预览是活的：只有停在托盘页、且当前用的是「动态」图标时才逐帧推进，
+        // 别的页面上不白白重绘这一整扇窗。
+        if matches!(self.page, Page::Tray)
+            && matches!(config.tray_icon_style, TrayIconStyle::Dynamic)
+            && self.tray_motion_state.borrow().len() == 4
+        {
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            });
+        }
+
         let sidebar = self.sidebar(lang, cx);
         let page = self.page_view(&config, lang, &snapshot, cx);
         let font_menu = self.font_menu_overlay(&config, lang, viewport, cx);
         let color_wheel = self.color_wheel_overlay(lang, viewport, cx);
         let device_menu = self.device_menu_overlay(&config, lang, &snapshot, viewport, cx);
         let icon_picker = self.icon_picker_overlay(&config, lang, viewport, cx);
-        let tray_menu = self.tray_menu_overlay(&config, lang, viewport, cx);
+        let tray_menu = self.tray_menu_overlay(&config, &snapshot.devices, lang, viewport, cx);
         let restore_menu = self.restore_menu_overlay(&config, lang, cx);
         let confirm_close = self.confirm_close_overlay(lang, cx);
         let profile_swap = self.profile_swap_overlay(lang, cx);
         let profile_delete = self.profile_delete_overlay(lang, cx);
+        let profile_copy = self.profile_copy_overlay(lang, cx);
         let apply_bar = self.apply_bar(lang, cx);
         let donate = self.donate_overlay(lang, cx);
 
@@ -17142,6 +19176,27 @@ impl Render for Settings {
             // 捕获相位从根往下走，谁都拦不住。点在输入框自己身上不算失焦。
             .capture_any_mouse_down(cx.listener(
                 |this, event: &gpui::MouseDownEvent, window, cx| {
+                    // 数值框：点别处就把填的数字收下（当作确认）。
+                    //
+                    // 放在捕获相位而不是冒泡相位 —— 托盘菜单弹层为了「点面板不算
+                    // 点空白」把按下事件 `stop_propagation` 收了，冒泡那条路根本走不到
+                    // 根节点，于是弹层里那个宽度框敲完点哪都退不出去、值也不落。
+                    // 点在框自己身上不算失焦（拖光标 / 再看一眼都还要接着编）。
+                    if this.editing.is_some() {
+                        this.commit_number_if_outside(event.position, window, cx);
+                    }
+                    // 配置档的三个名字输入框：点在框里是在放光标、拖选区，不能算「点别处」。
+                    // 以前这里无条件清 `profile_new`，点一下输入框自己编辑状态就没了。
+                    let editing_name = this.profile_rename.is_some()
+                        || this.profile_new.is_some()
+                        || this.profile_copy.is_some();
+                    if editing_name {
+                        if let Some(bounds) = this.rename_bounds.get() {
+                            if bounds.contains(&event.position) {
+                                return;
+                            }
+                        }
+                    }
                     // 配置页的改名：敲完名字随手点别处就该算数（回车只是另一条路）。
                     // 改名没有「占位」概念，缓冲里永远是当前名字，点别处提交不会误清。
                     if this.profile_rename.is_some() {
@@ -17151,6 +19206,7 @@ impl Render for Settings {
                     // `Configs/` 里多塞一份档；要建还是回车。
                     if this.profile_new.is_some() {
                         this.profile_new = None;
+                        this.profile_anchor = None;
                         refresh_ui(window, cx);
                     }
                     if this.device_rename.is_none() && this.display_rename.is_none() {
@@ -17324,6 +19380,8 @@ impl Render for Settings {
             .children(profile_swap)
             // 删除配置的确认框和它同一层（两个不会同时开）。
             .children(profile_delete)
+            // 复制配置的弹窗（带名字输入）也是同一层。
+            .children(profile_copy)
             // 「有未保存的更改」是关窗前的最后一问，压在最上面。
             .children(confirm_close)
     }
@@ -17520,10 +19578,21 @@ impl gpui::EntityInputHandler for Settings {
     ) -> Option<gpui::UTF16Selection> {
         let buffer = self.text_edit()?;
         let len = utf16_len(buffer);
+        // 配置档名字框有选区：告诉输入法整段替换（拼音上屏时直接顶掉选中的字）。
+        if let Some((start, end)) = self.profile_selection() {
+            return Some(gpui::UTF16Selection {
+                range: start..end,
+                reversed: self
+                    .profile_anchor
+                    .is_some_and(|anchor| anchor > self.profile_caret),
+            });
+        }
         // 设备改名有光标：告诉输入法「就在这一格插入」，中文候选才会落对地方；
         // 其余几个框仍按末尾处理。
         let pos = if self.caret_rename() {
             self.rename_cursor.min(len)
+        } else if self.profile_edit_text().is_some() {
+            self.profile_caret.min(len)
         } else {
             len
         };
@@ -17584,7 +19653,7 @@ impl gpui::EntityInputHandler for Settings {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        if !self.caret_rename() {
+        if !self.caret_rename() && self.profile_edit_text().is_none() {
             return None;
         }
         let buffer = self.text_edit()?.to_string();
@@ -17663,11 +19732,20 @@ impl Settings {
             MAX_NAME_CHARS
         };
         let device = self.caret_rename();
+        let profile = self.profile_edit_text().is_some();
         let len = utf16_len(&current);
         let at = self.rename_cursor.min(len);
-        // 设备改名：没在拼字时插入点就是光标那一格（中文候选也落在这里）。
+        // 设备改名 / 配置档名字框：没在拼字时插入点就是光标那一格（中文候选也落在这里）。
         let range = if device && self.text_marked.is_none() {
             Some(at..at)
+        } else if profile && self.text_marked.is_none() {
+            match self.profile_selection() {
+                Some((start, end)) => Some(start..end),
+                None => {
+                    let caret = self.profile_caret.min(len);
+                    Some(caret..caret)
+                }
+            }
         } else {
             range
         };
@@ -17683,6 +19761,12 @@ impl Settings {
             // 插入完光标跟到新字后面。
             let inserted = utf16_len(&next).saturating_sub(len - (end - start));
             self.rename_cursor = start + inserted;
+        }
+        if profile {
+            // 配置档名字框同样把光标挪到新字后面，选区收起。
+            let inserted = utf16_len(&next).saturating_sub(len - (end - start));
+            self.profile_caret = start + inserted;
+            self.profile_anchor = None;
         }
         if let Some(buffer) = self.text_edit_mut() {
             *buffer = next;
@@ -17723,6 +19807,42 @@ mod tests {
                     "{page:?} 的 {key} 不是 Config 的字段"
                 );
             }
+        }
+    }
+
+    /// 方向键挑字体：行号要跟「默认」行、搜索筛选这两种列表都对得上。
+    #[test]
+    fn font_rows_follow_the_filtered_list() {
+        let fonts: Vec<String> = ["Arial", "Consolas", "Segoe UI"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        // 没筛选：第 0 行是「默认（系统字体）」，字体从第 1 行起。
+        assert_eq!(Settings::font_row_of(&fonts, false, ""), Some(0));
+        assert_eq!(Settings::font_row_of(&fonts, false, "Consolas"), Some(2));
+        // 不区分大小写：配置里存的名字跟字体族报告的大小写不一定一致。
+        assert_eq!(Settings::font_row_of(&fonts, false, "consolas"), Some(2));
+        // 筛选后没有「默认」行，下标直接就是字体在结果里的位置。
+        assert_eq!(Settings::font_row_of(&fonts, true, "Consolas"), Some(1));
+        assert_eq!(Settings::font_row_of(&fonts, true, ""), None);
+        // 不在列表里（名字是手改配置写进去的）→ 没有起点，调用方退回第 0 行。
+        assert_eq!(Settings::font_row_of(&fonts, false, "Missing"), None);
+    }
+
+    /// 位置微调：能填负数、超范围夹回去、显示带正负号。
+    #[test]
+    fn tray_digit_offset_roundtrip() {
+        let mut config = Config::default();
+        for field in [NumberField::TrayDigitOffsetX, NumberField::TrayDigitOffsetY] {
+            field.apply(&mut config, -3);
+            assert_eq!(field.value(&config), -3);
+            assert_eq!(field.display(-3, Lang::Zh), "-3 px");
+            assert_eq!(field.display(2, Lang::Zh), "+2 px");
+            // 手改配置文件写了天文数字，也要夹回能画的范围。
+            field.apply(&mut config, 99);
+            assert_eq!(field.value(&config), 8);
+            field.apply(&mut config, -99);
+            assert_eq!(field.value(&config), -8);
         }
     }
 
@@ -18103,5 +20223,45 @@ mod tests {
         // 再 shift 一次会接着扩，不会把锚点挪到 3。
         editor.begin_selection(0, 4, true);
         assert_eq!(editor.selection(), Some(((0, 1), (0, 4))));
+    }
+
+    /// 名字没动就不算改过：清洗后一致 = 静默退出，不写盘也不弹「已改名」。
+    #[test]
+    fn renaming_to_the_same_name_is_a_noop() {
+        assert!(Settings::profile_name_unchanged("直播", "直播"));
+        // 首尾空格、误带的 .json 都会被清洗掉，等同原样 —— 不该当成新名字。
+        assert!(Settings::profile_name_unchanged("直播", "  直播  "));
+        assert!(Settings::profile_name_unchanged("直播", "直播.json"));
+        assert!(!Settings::profile_name_unchanged("直播", "直播 2"));
+        // 清空不是「没改」：那是「名字不能为空」，得提示。
+        assert!(!Settings::profile_name_unchanged("直播", "   "));
+    }
+
+    /// 副本弹窗的默认名字：`X (1)`、`X (2)`…，跳过已经占用的编号。
+    #[test]
+    fn duplicate_names_number_from_one() {
+        let source = Path::new("C:/x/Configs/直播.json");
+        assert_eq!(
+            Settings::duplicate_name(Some(source), &[], Lang::Zh),
+            "直播 (1)"
+        );
+        let taken = vec!["直播 (1)".to_string(), "直播 (2)".to_string()];
+        assert_eq!(
+            Settings::duplicate_name(Some(source), &taken, Lang::Zh),
+            "直播 (3)"
+        );
+        // 编号跟界面语言无关：文件名不跟着中英切换变。
+        assert_eq!(
+            Settings::duplicate_name(Some(source), &taken, Lang::En),
+            "直播 (3)"
+        );
+        assert_eq!(
+            Settings::duplicate_name(None, &[], Lang::Zh),
+            "主配置 (1)"
+        );
+        assert_eq!(
+            Settings::duplicate_name(None, &[], Lang::En),
+            "Main config (1)"
+        );
     }
 }

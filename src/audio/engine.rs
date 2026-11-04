@@ -241,6 +241,38 @@ impl Steady {
     }
 }
 
+/// 同一条端点上的几路接管流共用一份总电平（`room`）。
+///
+/// 每路都按目标满幅输出的话，两条在混音器里叠起来就是两倍 —— 混音器没有余量，
+/// 直接削顶，听感是「开了响度均衡，声音又破又炸」。这里按**端点**分组把总和归到
+/// `room` 以内：只有一路时原样返回，几路一起响时按各自响度分配（谁响谁占得多）。
+///
+/// 不同端点互不影响：一个应用被指到耳机、另一个在音箱时，两边各自满幅是对的。
+fn share_room(devices: &[Option<String>], wants: &[f32], room: f32) -> Vec<f32> {
+    let mut totals: HashMap<Option<String>, f32> = HashMap::new();
+    let mut counts: HashMap<Option<String>, usize> = HashMap::new();
+    for (device, want) in devices.iter().zip(wants) {
+        *totals.entry(device.clone()).or_insert(0.0) += (*want).max(0.0);
+        *counts.entry(device.clone()).or_insert(0) += 1;
+    }
+    devices
+        .iter()
+        .zip(wants)
+        .map(|(device, want)| {
+            // 只有一路：目标是多少就多少（target 本身已经是单路的上限）。
+            if counts.get(device).copied().unwrap_or(1) <= 1 {
+                return *want;
+            }
+            let total = totals.get(device).copied().unwrap_or(*want);
+            if total > room && total > 0.0 {
+                *want * (room / total)
+            } else {
+                *want
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub enum AudioCommand {
     SetVisible(bool),
@@ -517,9 +549,18 @@ struct AppEntry {
     /// 和「增益有没有超过 1」分开记：接管期间增益可能是小于 1 的衰减，
     /// 那也需要由流来做（会话已经被压到 2%），不能靠这个数去判断要不要流。
     boost_on: bool,
-    /// 接管通路要输出的增益（`boost_on` 为 true 时有效）。会话被压到
-    /// [`boost::ATTEN`]，露出部分只能靠这条流补。
-    boost_gain: f32,
+    /// 接管通路**允许输出的峰值**（`boost_on` 为 true 时有效）：
+    /// AGC 估算的「内容峰值 × 增益」，钳在目标以下。
+    ///
+    /// 只给电平、不给倍数。会话已经被压到 [`boost::ATTEN`]，那条流抓到的信号
+    /// 到底在音量之前还是之后因进程而异（乘错就是 50 倍的差），让流自己按抓到的
+    /// 真实峰值反算才不会炸（见 `boost::next_gain`）。
+    boost_cap: f32,
+    /// 这一路**平滑后**的期望输出峰值（分配总电平时用它，不用瞬时的 `raw_peak`）。
+    ///
+    /// 直接用每 15ms 的读数去分，两个应用一交替出声、`cap` 就跟着一跳一跳；
+    /// 流那边「降立即、升慢」，听感是音量被一下一下按住。这里先平滑再分。
+    boost_level: f32,
 }
 
 struct Worker {
@@ -901,7 +942,8 @@ impl Worker {
                         // 用户自己定的音量说了算：接管流收掉，声音回到会话那条路。
                         if app.boost_on {
                             app.boost_on = false;
-                            app.boost_gain = 1.0;
+                            app.boost_cap = 0.0;
+                            app.boost_level = 0.0;
                             releasing.push(app.pid);
                         }
                     }
@@ -1148,7 +1190,8 @@ impl Worker {
                             // `apply_loudness` 会一直走「接管中」那一支、一个字都不写，
                             // 这个应用从此再也调不动（用户说的「调着调着就不行了」）。
                             app.boost_on = false;
-                            app.boost_gain = 1.0;
+                            app.boost_cap = 0.0;
+                            app.boost_level = 0.0;
                             if retry {
                                 app.steady.hold(&config);
                             } else {
@@ -1193,7 +1236,7 @@ impl Worker {
             }
             targets.push(BoostTarget {
                 pid: app.pid,
-                gain: app.boost_gain,
+                cap: app.boost_cap,
                 // 会话实际挂在哪台端点，接管流就接哪台。应用被面板指到别的设备
                 // 之后必须跟着走，否则放大后的那份会留在默认设备上。
                 // 认「最后在出声的那台」（`boost_device`），别被旧设备上的 Expired 会话骗了。
@@ -1210,7 +1253,7 @@ impl Worker {
         if std::env::var_os("BOLUME_TRACE").is_some() {
             let list: Vec<String> = targets
                 .iter()
-                .map(|t| format!("pid {} @ {:.3} dev={:?}", t.pid, t.gain, t.device))
+                .map(|t| format!("pid {} cap {:.3} dev={:?}", t.pid, t.cap, t.device))
                 .collect();
             crate::platform::hotkey::trace(&format!("targets [{}]", list.join(", ")));
         }
@@ -1279,7 +1322,8 @@ impl Worker {
             for app in &mut self.apps {
                 if app.boost_on {
                     app.boost_on = false;
-                    app.boost_gain = 1.0;
+                    app.boost_cap = 0.0;
+                    app.boost_level = 0.0;
                     drops.push(app.pid);
                 }
             }
@@ -1302,7 +1346,10 @@ impl Worker {
         // 每拍给每个应用 `format!` 一次是白花的。
         let tracing = std::env::var_os("BOLUME_TRACE").is_some();
         let mut trace_now: HashMap<String, String> = HashMap::new();
-        for app in &mut self.apps {
+        // 这一拍每路接管流想输出多响（下标、端点、峰值）。接管流的输出会一起进
+        // 同一台设备的混音器，所以要等全部算完再按端点分配（见循环之后那段）。
+        let mut mixes: Vec<(usize, Option<String>, f32)> = Vec::new();
+        for (index, app) in self.apps.iter_mut().enumerate() {
             // 系统声音不参与：那是提示音，不是用户在听的内容。
             if app.is_system {
                 continue;
@@ -1321,7 +1368,8 @@ impl Worker {
                 app.steady.reset();
                 if app.boost_on {
                     app.boost_on = false;
-                    app.boost_gain = 1.0;
+                    app.boost_cap = 0.0;
+                    app.boost_level = 0.0;
                     drops.push(app.pid);
                 }
                 continue;
@@ -1345,7 +1393,8 @@ impl Worker {
             if app.muted {
                 if app.boost_on {
                     app.boost_on = false;
-                    app.boost_gain = 1.0;
+                    app.boost_cap = 0.0;
+                    app.boost_level = 0.0;
                     drops.push(app.pid);
                 }
                 continue;
@@ -1384,7 +1433,28 @@ impl Worker {
             // 而且衰减（增益 < 1）也能由流做，会话保持 2% 就行，没必要退出来。
             if app.boost_on {
                 app.level = 1.0;
-                app.boost_gain = gain.max(0.02);
+                // 要它输出多响 = 「内容峰值 × 增益」，先钳到目标以下；最终值等
+                // 这一拍所有流都算完再定（同一条端点上几条流会一起进混音器）。
+                //
+                // `raw_peak` 是会话电平表读的**音量之前**的峰值（见 `boost` 模块的
+                // 实测表），所以不受「会话被压到 2%」影响，乘出来的就是真实响度。
+                // 静音块（meter 读到 0）不更新：写 0 会让这一块突然断掉，听感是「咔」。
+                if app.raw_peak >= crate::config::LoudnessConfig::MIN_PEAK {
+                    let out = (app.raw_peak * gain).min(global.target());
+                    // 平滑一下再参与分配（见 `boost_level` 的说明）。
+                    app.boost_level += (out - app.boost_level) * 0.25;
+                } else {
+                    // 静音（暂停 / 曲间空白）：把额度让给别的流，别一直占着。
+                    // 一拍（15ms）缩 10%，约 300ms 让干净。
+                    app.boost_level *= 0.9;
+                }
+                mixes.push((
+                    index,
+                    app.boost_device
+                        .clone()
+                        .or_else(|| app.session_devices.first().cloned()),
+                    app.boost_level,
+                ));
                 continue;
             }
 
@@ -1393,12 +1463,22 @@ impl Worker {
             if gain >= crate::config::LoudnessConfig::BOOST_ENGAGE {
                 app.level = 1.0;
                 app.boost_on = true;
-                app.boost_gain = gain;
+                let out = (app.raw_peak * gain).min(global.target());
+                // 开流那一拍直接给目标值，别从 0 爬上来（头半秒会轻）。
+                app.boost_level = out;
+                mixes.push((
+                    index,
+                    app.boost_device
+                        .clone()
+                        .or_else(|| app.session_devices.first().cloned()),
+                    out,
+                ));
                 continue;
             }
 
             // 1.0 上下这点（1.0–1.02，0.17dB）不值得开接管流，直接按 1.0 走。
-            app.boost_gain = 1.0;
+            app.boost_cap = 0.0;
+            app.boost_level = 0.0;
             let target = gain.min(1.0);
             // 会话还停在被接管的位置（[`ATTEN`]）时一律不碰。
             //
@@ -1424,6 +1504,17 @@ impl Worker {
                 app.level = target;
             }
         }
+        // 同一条端点上的几条接管流会一起进混音器：每条都按目标满幅输出，两条
+        // 叠起来就是两倍 —— 混音器里直接削顶，听感是「开了均衡反而又破又炸」。
+        // 按端点把这一拍的总和归到目标以内（见 `share_room`）。
+        // 留 0.5dB 余量给两条流之间的相位叠加。
+        let devices: Vec<Option<String>> = mixes.iter().map(|(_, device, _)| device.clone()).collect();
+        let wants: Vec<f32> = mixes.iter().map(|(_, _, level)| *level).collect();
+        let levels = share_room(&devices, &wants, global.target() * 0.94);
+        for (slot, (index, _, _)) in mixes.iter().enumerate() {
+            self.apps[*index].boost_cap = levels[slot].clamp(0.0, global.target());
+        }
+
         for pid in drops {
             self.boost_releasing.insert(pid, Instant::now());
         }
@@ -1628,10 +1719,10 @@ impl Worker {
             .collect();
         // 接管增益同样要跨扫描搬过去：否则 400ms 重造一次会把增益打回 1.0，
         // 接管流跟着停掉再建一次，面板开着时听感会一顿一顿的。
-        let mut carried_boost: HashMap<String, (bool, f32)> = self
+        let mut carried_boost: HashMap<String, (bool, f32, f32)> = self
             .apps
             .iter()
-            .map(|app| (app.key.clone(), (app.boost_on, app.boost_gain)))
+            .map(|app| (app.key.clone(), (app.boost_on, app.boost_cap, app.boost_level)))
             .collect();
         // 接管端点也是：没在播放的那几轮扫描读不到「活会话」，不搬过去的话
         // 会退回一台瞎猜的设备，接管流白重开一次（声音跳台）。
@@ -1750,7 +1841,9 @@ impl Worker {
                 // 上一轮的 AGC 状态（应用没变就接着用，别从零开始）。
                 let steady = carried.remove(&group_key).unwrap_or_default();
                 // 取在 `key` 被移走之前：同一条会话的接管增益也要接着用。
-                let (boost_on, boost_gain) = carried_boost.remove(&group_key).unwrap_or((false, 1.0));
+                let (boost_on, boost_cap, boost_level) = carried_boost
+                    .remove(&group_key)
+                    .unwrap_or((false, 0.0, 0.0));
                 // 接管流接哪台端点：正在这条设备上出声就认它，静着的应用沿用上一轮记下的。
                 let boost_device = if state == 1 {
                     Some(device_id.to_string())
@@ -1780,7 +1873,8 @@ impl Worker {
                     state,
                     steady,
                     boost_on,
-                    boost_gain,
+                    boost_cap,
+                    boost_level,
                 });
             }
         }
@@ -2011,9 +2105,15 @@ impl Worker {
                 name: app.name.clone(),
                 process_path: app.process_path.clone(),
                 icon_path: app.icon_path.clone(),
-                // 接管期间会话音量被按在 1.0、而且是被**我们**静音的：
-                // 对用户来说它就是满音量在响，别显示成静音。
-                volume: if app.boost_on { 1.0 } else { app.level },
+                // 接管期间会话音量被按在 2%，界面不能照那个画（用户会以为
+                // 我们把他调好的音量清零了）。也不能一律画 1.0 —— 用户本来是
+                // 30% 的话，重启一次程序就变回「满格」，看着像被重置了。
+                // 画回**接管前记下的那个值**：那才是他自己设的。
+                volume: if app.boost_on {
+                    self.loudness_saved.get(&app.key).copied().unwrap_or(1.0)
+                } else {
+                    app.level
+                },
                 muted: !app.boost_on && app.muted,
                 peak: app.peak,
                 is_system: app.is_system,
@@ -2221,5 +2321,38 @@ mod tests {
             "增益超过上限：{}",
             steady.gain
         );
+    }
+
+    /// 一条流时原样给（不压）。
+    #[test]
+    fn share_room_keeps_a_single_stream() {
+        let out = share_room(&[None], &[0.9], 0.85);
+        assert!((out[0] - 0.9).abs() < 1e-6, "{:?}", out);
+    }
+
+    /// 同一条端点上的两条流：总和不能超过 room —— 否则混音器里削顶（「又破又炸」）。
+    #[test]
+    fn share_room_splits_two_streams_on_one_device() {
+        let devices = [None, None];
+        let out = share_room(&devices, &[0.9, 0.9], 0.85);
+        let total: f32 = out.iter().sum();
+        assert!(total <= 0.85 + 1e-5, "总和 {total} 超过了余量");
+        assert!((out[0] - out[1]).abs() < 1e-6, "一样响就该一样分：{out:?}");
+    }
+
+    /// 不同端点各算各的：一个在耳机、一个在音箱，两边各自满幅是对的。
+    #[test]
+    fn share_room_leaves_other_devices_alone() {
+        let devices = [Some("a".to_string()), Some("b".to_string())];
+        let out = share_room(&devices, &[0.9, 0.9], 0.85);
+        assert!(out.iter().all(|level| (level - 0.9).abs() < 1e-6), "{out:?}");
+    }
+
+    /// 总量本来就不满时不动：别因为「有两条流」就把轻的那条压得更轻。
+    #[test]
+    fn share_room_leaves_quiet_mixes_alone() {
+        let devices = [None, None];
+        let out = share_room(&devices, &[0.2, 0.3], 0.85);
+        assert!((out[0] - 0.2).abs() < 1e-6 && (out[1] - 0.3).abs() < 1e-6, "{out:?}");
     }
 }

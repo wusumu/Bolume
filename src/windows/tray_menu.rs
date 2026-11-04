@@ -46,8 +46,11 @@ const ICON_SIZE: f32 = 16.0;
 const TAIL: f32 = 16.0;
 
 /// 菜单里的一行。
+///
+/// `pub`：设置页的托盘菜单编辑器要拿同一份摊平结果做「真实预览」——
+/// 预览和真菜单走同一个 `build_rows`，才不会出现「预览里有的东西弹出来没有」。
 #[derive(Clone, Debug)]
-enum Row {
+pub enum Row {
     Separator,
     /// 一句话占位（没有可用设备时）。
     Notice(String),
@@ -82,7 +85,7 @@ impl Row {
         matches!(self, Row::Folder { .. })
     }
 
-    /// 这一行有多宽（逻辑像素，含内边距）。用来定菜单宽度。
+    /// 这一行有多宽（逻辑像素，含内边距）。菜单宽度按最宽的那一行算。
     fn width(&self) -> f32 {
         PAD * 2.0
             + match self {
@@ -106,6 +109,21 @@ fn text_width(text: &str, size: f32) -> f32 {
     text.chars()
         .map(|ch| if ch.is_ascii() { size * 0.55 } else { size })
         .sum()
+}
+
+/// 一组行按内容算出来的宽度（还没夹上限）。
+fn rows_width(rows: &[Row]) -> f32 {
+    rows.iter().map(Row::width).fold(MIN_WIDTH, f32::max)
+}
+
+/// 菜单实际有多宽：跟着最长的那一行走，超过设置的上限才截断。
+///
+/// 设置项是**上限**而不是固定宽度 —— 条目都短的时候菜单就该窄，
+/// 拉高上限对它没有影响（预览里照实显示，不假装变宽）。
+fn menu_width(content: f32, max_width: u32) -> f32 {
+    content
+        .max(MIN_WIDTH)
+        .min((max_width as f32).max(MIN_WIDTH))
 }
 
 pub struct TrayMenu {
@@ -191,20 +209,18 @@ impl TrayMenu {
         self.hovered_sub = None;
     }
 
-    /// 算窗口尺寸：内容宽度夹到 `tray_menu_max_width`，高度按行数累加。
+    /// 算窗口尺寸：宽度按最宽的一行算、夹到 `tray_menu_max_width`，高度按行数累加。
     fn measure(&mut self) {
         let cfg = self.config.borrow().get().clone();
-        let max_width = (cfg.tray_menu_max_width as f32).max(MIN_WIDTH);
+        let cap = cfg.tray_menu_max_width;
+        let main_width = menu_width(rows_width(&self.rows), cap);
 
-        let mut width = MIN_WIDTH;
         let mut y = PAD;
         self.row_tops.clear();
         for row in &self.rows {
             self.row_tops.push(y);
             y += row.height();
-            width = width.max(row.width());
         }
-        let main_width = width.min(max_width);
         let main_height = y + PAD;
         self.main_width = main_width;
         self.main_height = main_height;
@@ -213,11 +229,8 @@ impl TrayMenu {
         self.open_top = 0.0;
         if let Some(index) = self.open {
             if let Some(Row::Folder { children, .. }) = self.rows.get(index) {
-                let sub_width = children
-                    .iter()
-                    .map(Row::width)
-                    .fold(MIN_WIDTH, f32::max)
-                    .min(max_width);
+                // 子菜单同样按自己的内容定宽、同一个上限。
+                let sub_width = menu_width(rows_width(children), cap);
                 let sub_height = PAD * 2.0 + children.iter().map(Row::height).sum::<f32>();
                 self.open_top = self.row_tops.get(index).copied().unwrap_or(PAD);
                 frame.0 = main_width + GAP + sub_width;
@@ -658,7 +671,6 @@ impl Render for TrayMenu {
     }
 }
 
-/// 把配置里的菜单布局摊平成行列表（设备块会展开成一串设备行）。
 /// 菜单动作对应的图标（`assets/icons/<name>.svg`）。
 ///
 /// 只认 `gui::tray_action_label` 里那张 id 表；配置里混进别的 id 时返回 `None`，
@@ -667,7 +679,7 @@ impl Render for TrayMenu {
 /// 新旧两个入口指向同一样东西，就用同一张图：`音量合成器 [旧]` 和 `音量合成器`
 /// 都是推子，`声音设置 [旧]` 和 `声音设置` 都是那个对话框。同一个功能配两种图形，
 /// 只会让人以为它们干的事不一样。
-fn action_icon(id: &str) -> Option<&'static str> {
+pub fn action_icon(id: &str) -> Option<&'static str> {
     Some(match id {
         // 弹面板用「窗口 + 底栏」：这块东西就是从屏幕底部弹出来的。
         "toggle" => "panel",
@@ -682,7 +694,10 @@ fn action_icon(id: &str) -> Option<&'static str> {
     })
 }
 
-fn build_rows(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo]) -> Vec<Row> {
+/// 把配置里的菜单布局摊平成行列表（设备块会展开成一串设备行）。
+///
+/// `pub`：设置页的编辑器预览直接调它，和真菜单看到的是同一份东西。
+pub fn build_rows(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo]) -> Vec<Row> {
     let lang = cfg.language;
     let mut rows: Vec<Row> = Vec::new();
 
@@ -754,4 +769,167 @@ fn build_rows(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo])
 
     // 「退出」前面那条线不再自动补：要隔开就在菜单编辑器里自己插一条。
     rows
+}
+
+/// 菜单内容本身需要多宽（按最长的那一项算，还没夹上限）。
+pub fn content_width(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo]) -> f32 {
+    rows_width(&build_rows(cfg, devices))
+}
+
+/// 菜单此刻实际多宽（会弹出多少像素），给设置页那个上限行做说明用：
+/// 上限比它大的时候，调上限是看不出变化的。
+pub fn actual_width(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo]) -> f32 {
+    menu_width(content_width(cfg, devices), cfg.tray_menu_max_width)
+}
+
+/// 设置页托盘菜单编辑器的「真实预览」。
+///
+/// 和弹出菜单用**同一份** `build_rows`、同一套行样式（行高、图标槽、勾选点、
+/// 子菜单箭头），所以预览里看到的顺序 / 图标 / 哪些被隐藏，弹出来就是那样。
+///
+/// 只读：没有悬停高亮、点了不执行。子菜单在文件夹下面缩进铺开 —— 真菜单要悬停
+/// 才展开，而编辑器里一屏能看全更有用。
+///
+/// 卡片按**真实像素**画（设多少就是多少，不再按比例缩放），塞不进预览列的部分
+/// 横向滚出去看 —— 数值和眼睛看到的宽度是同一回事。
+pub fn preview(cfg: &crate::config::Config, devices: &[crate::audio::DeviceInfo]) -> AnyElement {
+    let rows = build_rows(cfg, devices);
+    let width = menu_width(rows_width(&rows), cfg.tray_menu_max_width);
+
+    let mut card = div()
+        .w(px(width))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .p(px(PAD))
+        .rounded(px(theme::RADIUS_SMALL + 2.0))
+        .border_1()
+        .border_color(theme::border_strong())
+        .bg(theme::surface_elevated());
+    for row in &rows {
+        card = card.child(preview_row(row));
+        if let Row::Folder { children, .. } = row {
+            for child in children {
+                card = card.child(
+                    div()
+                        .pl(px(ICON_SLOT + ICON_GAP))
+                        .child(preview_row(child)),
+                );
+            }
+        }
+    }
+    card.into_any_element()
+}
+
+fn preview_row(row: &Row) -> AnyElement {
+    match row {
+        Row::Separator => div()
+            .h(px(SEPARATOR_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px(px(6.))
+            .child(div().w_full().h(px(1.)).bg(theme::border()))
+            .into_any_element(),
+        Row::Notice(text) => div()
+            .h(px(ROW_HEIGHT))
+            .flex_none()
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .text_size(theme::fs(11.5))
+            .text_color(theme::text_tertiary())
+            .child(text.clone())
+            .into_any_element(),
+        Row::Device {
+            label,
+            icon: name,
+            checked,
+            ..
+        } => preview_item(
+            Some(name.as_str()),
+            label,
+            if *checked {
+                theme::accent()
+            } else {
+                theme::text_primary()
+            },
+            Some(*checked),
+            None,
+        ),
+        Row::Action {
+            label,
+            icon: action,
+            ..
+        } => preview_item(*action, label, theme::text_primary(), None, None),
+        Row::Folder { label, .. } => {
+            preview_item(Some("folder"), label, theme::text_primary(), None, Some(true))
+        }
+    }
+}
+
+/// 预览里的一行（和 `item_row` 同样的排版，只是没有悬停和点击）。
+fn preview_item(
+    icon_name: Option<&str>,
+    label: &str,
+    color: gpui::Hsla,
+    checked: Option<bool>,
+    arrow: Option<bool>,
+) -> AnyElement {
+    let mut row = div()
+        .h(px(ROW_HEIGHT))
+        .flex_none()
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(ICON_GAP))
+        .rounded(px(theme::RADIUS_SMALL));
+    // 认不出的动作只留同样宽的空坑，文字左沿才不会跟着跳。
+    row = row.child(match icon_name {
+        Some(name) => div()
+            .w(px(ICON_SLOT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(name, ICON_SIZE, color)),
+        None => div().w(px(ICON_SLOT)).flex_none(),
+    });
+    row = row.child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .text_size(theme::fs(12.))
+            .text_color(color)
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(label.to_string()),
+    );
+    if checked == Some(true) {
+        row = row.child(
+            div()
+                .size(px(6.))
+                .flex_none()
+                .rounded_full()
+                .bg(theme::accent()),
+        );
+    }
+    if let Some(open) = arrow {
+        row = row.child(
+            div()
+                .w(px(10.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(theme::fs(11.))
+                .text_color(if open {
+                    theme::accent()
+                } else {
+                    theme::text_tertiary()
+                })
+                .child("›"),
+        );
+    }
+    row.into_any_element()
 }

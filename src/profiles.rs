@@ -23,6 +23,23 @@ const EXTENSION: &str = "json";
 /// 名字最长留多少个字符：太长的文件名在列表里显示不下，Windows 路径也容易撑爆。
 const MAX_NAME: usize = 48;
 
+/// 列表顺序文件（`Configs/` 下）。
+///
+/// 拖出来的顺序得记住，不然每次打开都按修改时间重排，等于白拖一趟。
+/// 用点开头的文件名：`list()` 只收 `.json`，它不会被当成一份配置。
+const ORDER_FILE: &str = ".order";
+
+/// 「现在用的是哪一份」（`Configs/` 下，内容是档名，不含 `.json`）。
+///
+/// 以前这件事是靠**内容比对**猜的：把 `config.json` 和每份档挨个比一遍，哪份
+/// 一样就是哪份在用。可被启用的那一份会跟着主配置一起更新（见 `ConfigStore` 的
+/// 镜像），内容永远跟 `config.json` 一模一样 —— 一比就会把列表里第一份同内容的
+/// 副本标成「正在使用」，看着就像主配置被副本夺舍了。
+///
+/// 所以改成记事实：启用某份就写下它的名字，切回主配置就把文件删掉。
+/// 还是点开头的文件名：`list()` 只收 `.json`，它不会被当成一份配置。
+const ACTIVE_FILE: &str = ".active";
+
 /// 一份副配置。
 #[derive(Clone, Debug)]
 pub struct Profile {
@@ -88,6 +105,69 @@ fn ensure_dir(root: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// `Configs/.order`。
+pub fn order_path(root: &Path) -> PathBuf {
+    dir(root).join(ORDER_FILE)
+}
+
+/// `Configs/.active`。
+pub fn active_path(root: &Path) -> PathBuf {
+    dir(root).join(ACTIVE_FILE)
+}
+
+/// 现在用的是哪一份副配置（`None` = 主配置本身）。
+///
+/// 只认文件里记的名字，不去核对内容：内容一样的两份档本来就分辨不出，
+/// 而「正在用哪一份」是用户的选择，不是一份可以推算出来的事实。
+pub fn read_active(root: &Path) -> Option<String> {
+    let text = fs::read_to_string(active_path(root)).ok()?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// 记住现在用的是哪一份；`None` = 切回主配置（把记录删掉）。
+pub fn write_active(root: &Path, name: Option<&str>) -> std::io::Result<()> {
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return match fs::remove_file(active_path(root)) {
+            // 本来就没有记录 = 已经是主配置，不算失败。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+    };
+    ensure_dir(root)?;
+    fs::write(active_path(root), name)
+}
+
+/// 用户拖出来的顺序（每行一个文件名，不含 `.json`）。
+///
+/// 文件不在 / 读不动就是空表 —— 那就是「全按修改时间排」，老版本的行为。
+pub fn read_order(root: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(order_path(root)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// 记住拖出来的顺序。
+pub fn write_order(root: &Path, names: &[String]) -> std::io::Result<()> {
+    ensure_dir(root)?;
+    fs::write(order_path(root), names.join("\n"))
+}
+
+/// 按修改时间排（新的在前）：顺序表里没有的那些用它兜底。
+fn by_modified(a: &Profile, b: &Profile) -> std::cmp::Ordering {
+    match (a.modified, b.modified) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    }
+}
+
 /// 列出所有副配置：最近改过的排前面。
 ///
 /// 目录不在（用户还没建过档）就是空列表 —— 打开配置页不该顺手建一堆空目录。
@@ -95,6 +175,7 @@ pub fn list(root: &Path) -> Vec<Profile> {
     let Ok(entries) = fs::read_dir(dir(root)) else {
         return Vec::new();
     };
+    let order = read_order(root);
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -112,11 +193,16 @@ pub fn list(root: &Path) -> Vec<Profile> {
             path,
         });
     }
-    out.sort_by(|a, b| match (a.modified, b.modified) {
-        (Some(a), Some(b)) => b.cmp(&a),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    out.sort_by(|a, b| match (
+        order.iter().position(|name| name.eq_ignore_ascii_case(&a.name)),
+        order.iter().position(|name| name.eq_ignore_ascii_case(&b.name)),
+    ) {
+        // 拖过的按拖出来的顺序。
+        (Some(a), Some(b)) => a.cmp(&b),
+        // 没进过顺序表的（刚新建 / 刚导入）排在最前面：最新的在顶上最好找。
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => by_modified(a, b),
     });
     out
 }
@@ -302,6 +388,59 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&root2).ok();
+    }
+
+    /// 拖出来的顺序要记住；没进过顺序表的新档排在最前面。
+    #[test]
+    fn saved_order_wins_over_modification_time() {
+        let root = temp_root("order");
+        let config = Config::default();
+        let _a = create(&root, "a", &config).unwrap();
+        let b = create(&root, "b", &config).unwrap();
+        let _c = create(&root, "c", &config).unwrap();
+        // 让 b 变成最新改过的那一份：不拖的话它排第一。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&b, &config).unwrap();
+        assert_eq!(list(&root)[0].name, "b");
+
+        write_order(&root, &["c".into(), "a".into(), "b".into()]).unwrap();
+        let names: Vec<String> = list(&root).into_iter().map(|profile| profile.name).collect();
+        assert_eq!(names, vec!["c", "a", "b"], "拖过的顺序优先于修改时间");
+
+        // 新建的没进过顺序表：排在最前面，不用滚到底下去找。
+        create(&root, "d", &config).unwrap();
+        let names: Vec<String> = list(&root).into_iter().map(|profile| profile.name).collect();
+        assert_eq!(names.first().map(String::as_str), Some("d"));
+        // 顺序文件本身不是一份配置。
+        assert_eq!(names.len(), 4);
+        assert!(order_path(&root).exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 「正在用哪一份」是记下来的，不是拿内容比出来的：内容一样的两份档也能分得清。
+    #[test]
+    fn active_profile_is_remembered_by_name() {
+        let root = temp_root("active");
+        let config = Config::default();
+        let a = create(&root, "a", &config).unwrap();
+        // 两份内容完全一样：全靠 `.active` 记着才分得出谁在用。
+        let _b = create(&root, "b", &config).unwrap();
+        assert_eq!(read_active(&root), None, "还没启用过：主配置本身");
+
+        write_active(&root, Some("a")).unwrap();
+        assert_eq!(read_active(&root).as_deref(), Some("a"));
+        // `.active` 不是一份配置，列表里不该多出行。
+        assert_eq!(list(&root).len(), 2);
+
+        // 切回主配置：记录删掉，档文件一个不少。
+        write_active(&root, None).unwrap();
+        assert_eq!(read_active(&root), None);
+        assert!(!active_path(&root).exists());
+        assert!(a.exists());
+
+        // 再删一次也不算错（本来就没有记录）。
+        assert!(write_active(&root, None).is_ok());
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

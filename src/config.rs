@@ -42,6 +42,22 @@ impl TrayIconStyle {
     }
 }
 
+/// 软件图标（托盘「软件图标」样式 + 窗口左上角）用哪一套配色。
+///
+/// 两套是同一张图的两个颜色方向，几何完全一样：
+/// - `Cream`（默认）米底红字 —— 编进 exe 当程序图标（`assets/Bolume.ico`）；
+/// - `Red` 红底米字 —— 运行时可选（`assets/Bolume-red.ico`）。
+///
+/// exe 自己的图标只能是编译时那一张，所以「红底」只影响托盘和窗口，
+/// 资源管理器里看到的始终是浅底。这一点在设置页的说明里写清楚。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppIconStyle {
+    #[default]
+    Cream,
+    Red,
+}
+
 /// 动态模式画哪一种律动。
 ///
 /// 这些都只吃一个信号 —— 播放设备的峰值电平 —— 所以一律按「节拍 + 包络」来编：
@@ -1470,13 +1486,15 @@ impl StartupProfile {
 /// （`ui_font_size`，逻辑像素，基准 12.5px），默认比基准大一档（13.5px）；
 /// 界面的字重去掉「半粗」—— 它和「粗」在 UI 字体上几乎看不出差别，
 /// 老配置里存着 600 的按 700 算。
-/// rev 75：快捷键多一个「按下时不发送原始按键」（`hotkey_swallow_raw`，默认关）——
-/// 打开后配过的组合整个从输入队列里拿掉，前台连 Raw Input 也读不到。
-/// 默认关 = 老配置的行为一个字不变，这里只留个记号。
+/// rev 75：快捷键多一个「按下时不发送原始按键」（`hotkey_swallow_raw`，rev 77 起
+/// 默认开）—— 打开后配过的组合整个从输入队列里拿掉，前台连 Raw Input 也读不到。
 /// rev 76：快捷键页两个页签的设置各存一份（`hotkey_screen_*`）—— 以前音量页和
 /// 屏幕页共用「按住连续触发 / 延迟 / 间隔 / 忽略系统重复 / 不发送原始按键」一组值，
 /// 改一边另一边跟着变。老配置由 rev 76 的迁移把旧值抄过去，行为不变。
-const CONFIG_REV: u32 = 76;
+/// rev 77：「按下时不发送原始按键」改成**默认开**。原来的理由（老配置行为不变）在
+/// 实际使用里站不住：配了 `Ctrl+Alt+方向键` 的人几乎都是想独占那颗键，漏给前台
+/// 反而让页面翻一页。这一版连同已经存下来的 `false` 一起翻成 `true`。
+const CONFIG_REV: u32 = 77;
 
 /// 面板弹出动画的风格。
 ///
@@ -1593,6 +1611,11 @@ pub const DEFAULT_POPUP_ANIMATION_MS: u32 = 200;
 /// 2026-10-25 起按用户自己调好的那套（Arial）当默认：Arial 的数字笔画粗细
 /// 在 16px 托盘上比 Segoe UI 更「立」，配下面的 20 点 + 宽高缩放默认值正好。
 pub const DEFAULT_NUMBER_FONT: &str = "Arial";
+
+/// 数字底色块的默认颜色：程序图标用的那支朱红。
+///
+/// 和 `assets/Bolume-red.ico` 同一个色号 —— 托盘上的数字徽章和程序图标是一套。
+pub const DEFAULT_TRAY_NUMBER_BG: &str = "#d6402a";
 
 /// 托盘数字的抗锯齿方式，照 Photoshop 字符面板底部那七档。
 ///
@@ -1752,6 +1775,50 @@ impl TrayDigitMetrics {
     pub const SCALE_RANGE: (u32, u32) = (10, 300);
     /// 字距范围（1/1000 em）。
     pub const TRACKING_RANGE: (i32, i32) = (-500, 1000);
+}
+
+/// 数字左右 / 上下能挪多少（16px 画布上的像素）。
+///
+/// 再大就不是「微调」了：16px 的图标一共才这么宽，挪 8px 数字已经贴到边上。
+pub const TRAY_DIGIT_OFFSET_RANGE: (i32, i32) = (-8, 8);
+
+/// 数字图标的底色块（可选）：数字压在一块圆角底色上，像自带的小徽章。
+///
+/// 色块是**纯装饰**：大小、圆角、颜色怎么调都不碰数字 —— 字号、位置、字形
+/// 跟没开底色时一模一样。色块比数字小就是数字盖住它四周，比数字大就是数字
+/// 稳稳坐在中间。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrayNumberBackground {
+    /// 总开关。关着时数字照旧只有墨迹、没有底。
+    pub enabled: bool,
+    /// 底色（`#rrggbb`）；空串 / 填错 = 用默认的朱红（`DEFAULT_TRAY_NUMBER_BG`）。
+    pub color: String,
+    /// 色块边长占画布的百分比。
+    pub size: u32,
+    /// 圆角占「半边长」的百分比：0 = 方角，100 = 正圆。
+    ///
+    /// 和面板音量条的 `panel_bar_round` 一个口径：存百分比，换画布尺寸时圆角
+    /// 跟着一起缩放，16px 和设置页里那张预览才是同一个形状。
+    pub round: u32,
+}
+
+impl Default for TrayNumberBackground {
+    fn default() -> Self {
+        Self {
+            // 默认关：托盘上那点地方本来就紧，底色是「想要的人才会开」的装饰。
+            enabled: false,
+            color: DEFAULT_TRAY_NUMBER_BG.to_string(),
+            size: 100,
+            round: 42,
+        }
+    }
+}
+
+impl TrayNumberBackground {
+    /// 色块大小 / 圆角的可填范围（百分比）。
+    pub const SIZE_RANGE: (u32, u32) = (50, 100);
+    pub const ROUND_RANGE: (u32, u32) = (0, 100);
 }
 
 /// 旧版本写进配置文件的默认值：读到它就说明用户没主动改过，迁移到新默认。
@@ -4452,8 +4519,10 @@ pub const DEFAULT_PANEL_BAR_ROUND: u32 = 100;
 /// 设备名经常是 `Headphones (Meizu HiFi DAC Headphone Amplifier)` 这种，
 /// 不定上限菜单能横穿半个屏幕，所以默认就压到 420，超出的用 … 收尾。
 pub const DEFAULT_TRAY_MENU_MAX_WIDTH: u32 = 420;
-/// 托盘菜单宽度可调范围（逻辑像素）：下限是「放得下一行设备名」。
-pub const TRAY_MENU_WIDTH_RANGE: (u32, u32) = (168, 640);
+/// 托盘菜单宽度上限的可调范围（逻辑像素）。
+///
+/// 下限是「放得下一行设备名」；上限 400 —— 再宽就不是菜单了。
+pub const TRAY_MENU_WIDTH_RANGE: (u32, u32) = (168, 400);
 
 /// 动态图标的默认灵敏度（百分比）。
 ///
@@ -4825,6 +4894,12 @@ pub struct Config {
     /// 托盘图标样式（后续「更换托盘图标」功能的入口）。
     pub tray_icon_style: TrayIconStyle,
 
+    /// 软件图标的配色：浅底（默认）还是红底。
+    ///
+    /// 只影响托盘「软件图标」样式和窗口图标 —— exe 文件本身的图标在编译时就定了浅底。
+    #[serde(default)]
+    pub app_icon_style: AppIconStyle,
+
     /// 托盘图标的颜色（`#rrggbb`）。
     ///
     /// 空 = 跟随任务栏深浅：深色任务栏画浅墨、浅色任务栏画深墨（系统图标一贯的样子）。
@@ -4873,6 +4948,22 @@ pub struct Config {
     #[serde(default = "default_tray_digit_three")]
     pub tray_digit_three: TrayDigitMetrics,
 
+    /// 数字图标的底色块：开关、颜色、整块大小、圆角。
+    ///
+    /// 只在 `tray_icon_style = number` 时有意义。
+    #[serde(default)]
+    pub tray_number_background: TrayNumberBackground,
+
+    /// 数字在图标里左右偏移多少（正 = 往右）。
+    ///
+    /// 单位是 16px 画布上的像素（高分屏 / 设置页预览按同一倍率放大）。
+    /// 只挪数字，底色块始终居中 —— 数字偏出去一点正是为了跟色块对齐。
+    #[serde(default)]
+    pub tray_digit_offset_x: i32,
+    /// 数字在图标里上下偏移多少（正 = 往下），口径同 `tray_digit_offset_x`。
+    #[serde(default)]
+    pub tray_digit_offset_y: i32,
+
     /// 应用图标从 ICO 里取哪一档（16 / 32 / 64），同时决定列表里的显示尺寸。
     pub app_icon_size: u32,
 
@@ -4914,7 +5005,8 @@ pub struct Config {
     /// 托盘右键菜单的外观：跟随主题（自绘）/ Windows 原生。
     pub tray_menu_style: TrayMenuStyle,
 
-    /// 托盘右键菜单的最大宽度（逻辑像素）。超出部分用 … 截断。
+    /// 托盘右键菜单的宽度**上限**（逻辑像素）：菜单宽度跟着最长的那一项走，
+    /// 只有超过这个值时才会被截断（多出来的字用 … 收尾）。
     ///
     /// 只对自绘菜单（`tray_menu_style = theme`）有效：原生菜单的宽度由系统按文字算，
     /// 改不了。
@@ -5095,7 +5187,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub hotkey_ignore_system_repeat: bool,
 
-    /// 「按下快捷键时不发送原始按键」（默认关）。
+    /// 「按下快捷键时不发送原始按键」（默认开，rev 77 起）。
     ///
     /// 配了 `Ctrl+Alt+方向键` 这样的组合之后，默认行为是只把这一份拿走、方向键本身
     /// 照旧落到前台程序（多半是用户按着 Ctrl/Alt 顺手拨了一下，不该翻页）；
@@ -5106,7 +5198,7 @@ pub struct Config {
     /// `RegisterHotKey` 只是让系统别把按键交给窗口，用 Raw Input 读键盘的程序
     /// （多数游戏）照样看得见；低级钩子返回 1 才算真的没发生过。
     /// 代价是钩子装不上时这些组合会一起失效（媒体键一直如此）。
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub hotkey_swallow_raw: bool,
 
     /// 屏幕页那一套：亮度快捷键的「按住连续触发」（rev 76 起与音频页分开）。
@@ -5127,7 +5219,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub hotkey_screen_ignore_system_repeat: bool,
     /// 屏幕页的「按下快捷键时不发送原始按键」，与音频页各自一份。
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub hotkey_screen_swallow_raw: bool,
 
     /// 配色跟着 Windows 的亮暗走（默认开）。
@@ -5250,6 +5342,7 @@ impl Default for Config {
             // 默认 2 就是「一格 2 dB」。老配置没有这个字段，读进来也落在这里。
             log_scroll_wheel_step: DEFAULT_LOG_SCROLL_STEP_DB,
             tray_icon_style: TrayIconStyle::Arcs,
+            app_icon_style: AppIconStyle::default(),
             tray_icon_color: String::new(),
             tray_icon_custom: String::new(),
             tray_color_by_level: false,
@@ -5261,6 +5354,9 @@ impl Default for Config {
             tray_digit_one: default_tray_digit_one(),
             tray_digit_two: default_tray_digit_two(),
             tray_digit_three: default_tray_digit_three(),
+            tray_number_background: TrayNumberBackground::default(),
+            tray_digit_offset_x: 0,
+            tray_digit_offset_y: 0,
             app_icon_size: 32,
             app_name_capitalize: true,
             popup_animation: true,
@@ -5326,12 +5422,12 @@ impl Default for Config {
             hotkey_repeat_delay: 0,
             hotkey_repeat_actions: default_repeat_actions(),
             hotkey_ignore_system_repeat: true,
-            hotkey_swallow_raw: false,
+            hotkey_swallow_raw: true,
             hotkey_screen_hold_repeat: true,
             hotkey_screen_repeat_interval: DEFAULT_HOTKEY_REPEAT_INTERVAL,
             hotkey_screen_repeat_delay: 0,
             hotkey_screen_ignore_system_repeat: true,
-            hotkey_screen_swallow_raw: false,
+            hotkey_screen_swallow_raw: true,
             theme_follow_system: true,
             theme_light_surface: DEFAULT_LIGHT_SURFACE.to_string(),
             theme_light_accent: String::new(),
@@ -5826,6 +5922,11 @@ pub struct ConfigStore {
     /// 改点东西按「保存」，改动只进 `config.json`，档文件还是旧的 —— 下次启用那份档
     /// 改动就没了，「正在使用」的徽章也认不出当前是哪一份。
     mirror: Option<PathBuf>,
+    /// 临时不参与「有没有未保存的改动」判定的顶层字段。
+    ///
+    /// OSD 布局编辑器自己管那几个字段（见 `hold_fields`）：它在草稿里改来改去，
+    /// 不该把设置窗的「应用」点亮 —— 两边各有自己的出口。
+    held: Vec<&'static str>,
 }
 
 impl ConfigStore {
@@ -5889,6 +5990,14 @@ impl ConfigStore {
         // rev 76：快捷键页两个页签（音频 / 屏幕）的「按住连续触发」拆成各自一份。
         // 老配置只有一份，读进来两份都取那一份 —— 在音量页调过间隔的人，
         // 亮度那边还是原来的手感，等他自己去屏幕页改。
+        // rev 77：「按下时不发送原始按键」改成默认开。老配置里存下来的
+        // `false` 基本都是 rev 75/76 那两版的默认值（那时候默认关），不是
+        // 用户主动关的 —— 一起翻成开。真想要老行为的，在新版里关一次就行。
+        if config.config_rev < 77 {
+            config.hotkey_swallow_raw = true;
+            config.hotkey_screen_swallow_raw = true;
+            migrated = true;
+        }
         if config.config_rev < 76 {
             config.hotkey_screen_hold_repeat = config.hotkey_hold_repeat;
             config.hotkey_screen_repeat_interval = config.hotkey_repeat_interval;
@@ -6270,6 +6379,7 @@ impl ConfigStore {
             draft_base: None,
             draft_dirty: false,
             mirror: None,
+            held: Vec::new(),
         };
         // 首次运行就把默认配置落盘，便携版目录里一眼能看到 config.json。
         if existing.is_none() || !store.path.exists() || migrated {
@@ -6336,6 +6446,32 @@ impl ConfigStore {
         self.draft_base.as_ref()
     }
 
+    /// 把这组字段从「有没有未保存的改动」的判定里摘出来。
+    ///
+    /// OSD 布局编辑器用它：编辑器有自己的「保存」（按下去直接落盘，见
+    /// [`commit_fields`](Self::commit_fields)），它在草稿里改来改去不该把设置窗
+    /// 的「应用」点亮 —— 那边用户其实什么都没动。
+    ///
+    /// **只影响判定**：配置本身照旧进草稿，设置窗点「取消」时整份回退，
+    /// 编辑器里没保存的改动跟着一起没。
+    pub fn hold_fields(&mut self, keys: &[&'static str]) {
+        for key in keys {
+            if !self.held.contains(key) {
+                self.held.push(key);
+            }
+        }
+        self.refresh_dirty();
+    }
+
+    /// 编辑器关了：这组字段重新参与判定。
+    ///
+    /// 保存过的话值已经跟参照点对齐，dirty 不会因为这次释放而亮起来；没保存就关的
+    /// 话（选了「不保存」已经回滚；直接关窗则由设置窗的「取消 / ×」统一丢弃）。
+    pub fn release_fields(&mut self, keys: &[&'static str]) {
+        self.held.retain(|held| !keys.contains(held));
+        self.refresh_dirty();
+    }
+
     /// 整份换成 `src`（跳过 `except` 里那几个），并且**立刻落盘**。
     ///
     /// 切配置档用它：换档是用户按下「启用」的当下就要生效的事，不能因为还在草稿
@@ -6356,6 +6492,42 @@ impl ConfigStore {
         self.save()?;
         self.draft_base = Some(self.config.clone());
         self.draft_dirty = false;
+        Ok(())
+    }
+
+    /// 只把点名的字段写进文件，草稿里其它改动一概留在内存里。
+    ///
+    /// OSD 布局编辑器用它：那边按下「保存」就是要真的存下来（编辑器是独立窗口，
+    /// 不该逼用户回去按设置窗的「确定」），但设置窗里还没按「确定 / 应用」的
+    /// 改动不能被顺带写盘 —— 否则用户点「取消」时磁盘上已经变了，「取消」就成了
+    /// 假动作。所以这里拿**磁盘上的现文件**做底，只覆盖点名的顶层字段。
+    ///
+    /// 写完把草稿参照点里同名字段对齐：那几个字段已经落盘，不该继续算进
+    /// 「有未保存的更改」—— 设置窗的「应用」也就不会被编辑器的操作点亮。
+    pub fn commit_fields(&mut self, keys: &[&str]) -> io::Result<()> {
+        // 以磁盘上那一份为底。文件读不出来（首次运行 / 内容坏了）才退回内存里
+        // 这份：宁可多存，也不写出一份只有几个字段的残缺配置。
+        let on_disk = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Config>(&text).ok());
+        let mut merged = match on_disk {
+            Some(config) => config,
+            None => return self.save(),
+        };
+        let now = self.config.clone();
+        merged.copy_fields(&now, keys);
+        self.write_config(&self.path, &merged)?;
+        if let Some(mirror) = self.mirror.clone() {
+            if mirror != self.path {
+                if let Err(error) = self.write_config(&mirror, &merged) {
+                    log::warn!("配置档写回失败（{}）：{error}", mirror.display());
+                }
+            }
+        }
+        if let Some(base) = self.draft_base.as_mut() {
+            base.copy_fields(&now, keys);
+        }
+        self.refresh_dirty();
         Ok(())
     }
 
@@ -6391,12 +6563,26 @@ impl ConfigStore {
     ///
     /// 走 JSON 比较：`Config` 没派生 `PartialEq`，为了这个给上百个字段补一个不值当。
     /// 只在用户动一下设置时算一次，不在每帧里跑。
+    ///
+    /// `held` 里那几个字段直接剔掉再比：别的窗口（OSD 编辑器）正在管它们，
+    /// 那边有自己的出口，不该在这里也亮一盏「未保存」。
     fn refresh_dirty(&mut self) {
         let Some(base) = &self.draft_base else {
             self.draft_dirty = false;
             return;
         };
-        self.draft_dirty = comparable(&self.config) != comparable(base);
+        let (Some(mut mine), Some(mut theirs)) = (comparable(&self.config), comparable(base)) else {
+            // 序列化不出来就当成有改动：宁可多问一句，也别让改动悄悄没了。
+            self.draft_dirty = true;
+            return;
+        };
+        if let (Some(mine), Some(theirs)) = (mine.as_object_mut(), theirs.as_object_mut()) {
+            for key in &self.held {
+                mine.remove(*key);
+                theirs.remove(*key);
+            }
+        }
+        self.draft_dirty = mine != theirs;
     }
 
     fn save(&self) -> io::Result<()> {
@@ -6414,12 +6600,48 @@ impl ConfigStore {
     }
 
     fn write_file(&self, path: &Path) -> io::Result<()> {
+        self.write_config(path, &self.config)
+    }
+
+    /// 把指定的一份配置写进文件（`commit_fields` 只改其中几个字段时用）。
+    fn write_config(&self, path: &Path, config: &Config) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(&self.config).map_err(io::Error::other)?;
-        std::fs::write(path, json)
+        let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
+        // 只读属性得先摘掉。
+        //
+        // 便携版常见来源：从 U 盘 / QQ 接收的文件夹、解压工具勾了「保留只读」——
+        // `config.json` 带着 FILE_ATTRIBUTE_READONLY 落地，之后每一次保存都是
+        // 「拒绝访问 (os error 5)」。以前这里直接返回错误，再由上面那条路 panic，
+        // 用户看到的就是「点保存闪退、设置改不动」。配置文件是程序自己的东西，
+        // 只读多半不是用户有意设的，静默摘掉比报错更合适。
+        let _ = clear_readonly(path);
+        match std::fs::write(path, &json) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                // 文件本身不是只读，但目录是（或者 ACL 只给了读）：再试一次。
+                if let Some(parent) = path.parent() {
+                    let _ = clear_readonly(parent);
+                }
+                std::fs::write(path, json)
+            }
+            other => other,
+        }
     }
+}
+
+/// 去掉只读属性（Windows 的 `FILE_ATTRIBUTE_READONLY`，别的平台就是权限位）。
+///
+/// 只动「确实只读」的那一个文件/目录，别的权限一概不碰；本来就可写时一次
+/// `metadata` 就返回，没有额外开销。
+fn clear_readonly(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)
 }
 
 #[cfg(test)]
@@ -9471,5 +9693,136 @@ mod tests {
         assert!(footer.index_of("gone").is_some());
         assert!(footer_spec("gone").is_none());
         assert_eq!(footer.items.len(), FOOTER_ITEMS.len() + 1);
+    }
+
+    /// 只读的 config.json 也要能存进去。
+    ///
+    /// 便携版从 U 盘 / QQ 接收的文件夹里解出来时，文件常常带着只读属性；
+    /// 以前 `fs::write` 直接报「拒绝访问 (os error 5)」，设置页再因为这个
+    /// 错误 panic 一次 —— 用户看到的是「点保存就闪退，设置改了不生效」。
+    #[test]
+    fn saving_over_a_readonly_file_works() {
+        let dir = std::env::temp_dir().join(format!("bolume-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let mut store = ConfigStore::load(path.clone());
+        store.begin_draft();
+        store.update(|config| config.ui_opacity = 42).unwrap();
+        store.commit_draft().expect("只读文件也要写进去");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"ui_opacity\": 42"), "改动要落盘：{text}");
+        // 属性顺手摘掉了，下一次保存不用再走一遍。
+        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// rev 77：「按下时不发送原始按键」默认翻成开，老配置存着的 false 也跟着翻。
+    #[test]
+    fn rev77_turns_swallow_raw_on_by_default() {
+        let dir = std::env::temp_dir().join(format!("bolume-rev77-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // rev 76 那版：默认关，存下来就是 false。
+        let old = dir.join("old.json");
+        std::fs::write(
+            &old,
+            r#"{"config_rev": 76, "hotkey_swallow_raw": false, "hotkey_screen_swallow_raw": false}"#,
+        )
+        .unwrap();
+        let config = ConfigStore::load(old).get().clone();
+        assert!(config.hotkey_swallow_raw, "老配置也要翻成开");
+        assert!(config.hotkey_screen_swallow_raw);
+
+        // 新装（文件里的键都不存在）同样默认开。
+        let fresh = dir.join("fresh.json");
+        std::fs::write(&fresh, r#"{"config_rev": 77}"#).unwrap();
+        let config = ConfigStore::load(fresh).get().clone();
+        assert!(config.hotkey_swallow_raw);
+        assert!(config.hotkey_screen_swallow_raw);
+
+        // 用户在新版里主动关掉，读回来要还是关的。
+        let off = dir.join("off.json");
+        std::fs::write(
+            &off,
+            r#"{"config_rev": 77, "hotkey_swallow_raw": false}"#,
+        )
+        .unwrap();
+        let config = ConfigStore::load(off).get().clone();
+        assert!(!config.hotkey_swallow_raw, "用户自己关的要尊重");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `commit_fields` 只落盘点名的字段：草稿里别的改动不能被顺带存下来。
+    ///
+    /// 场景就是 OSD 布局编辑器按「保存」：编辑器那几个字段要真存，
+    /// 设置窗里还没按「确定」的东西必须原样留在内存里（否则「取消」成了假动作）。
+    #[test]
+    fn commit_fields_saves_only_the_named_ones() {
+        let dir = std::env::temp_dir().join(format!("bolume-fields-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let mut store = ConfigStore::load(path.clone());
+        store.begin_draft();
+        store.update(|config| config.ui_opacity = 33).unwrap();
+        store.update(|config| config.osd.rotation = 90).unwrap();
+        assert!(store.is_dirty());
+
+        store.commit_fields(&["osd"]).expect("保存 OSD 那几个字段");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let on_disk: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(on_disk.osd.rotation, 90, "点名的字段要落盘");
+        assert_eq!(on_disk.ui_opacity, 100, "没点名的改动不能跟着写进去");
+        assert_eq!(store.get().ui_opacity, 33, "草稿里那一份还在");
+        assert!(store.is_dirty(), "别的字段还欠着，设置窗的「应用」得亮着");
+        // 参照点对齐之后，再提交一次这些字段不会让 dirty 多算一份。
+        store.commit_fields(&["osd"]).unwrap();
+        assert!(store.is_dirty(), "只对齐了 osd，透明度仍然欠着");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 编辑器托管的字段改了不算「未保存」：设置窗的「应用」不该被点亮。
+    #[test]
+    fn held_fields_stay_out_of_the_dirty_check() {
+        let dir = std::env::temp_dir().join(format!("bolume-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = ConfigStore::load(dir.join("config.json"));
+        store.begin_draft();
+        store.hold_fields(&["osd"]);
+
+        store.update(|config| config.osd.rotation = 90).unwrap();
+        assert!(!store.is_dirty(), "编辑器正在管这几个字段，设置窗不该亮");
+
+        // 别的页照常算。
+        store.update(|config| config.ui_opacity = 55).unwrap();
+        assert!(store.is_dirty());
+
+        // 编辑器关掉、又没保存：这次改动该露出来了。
+        store.release_fields(&["osd"]);
+        assert!(store.is_dirty());
+
+        // 保存过再关则不亮（值已经和参照点一致）。
+        let mut store = ConfigStore::load(dir.join("config.json"));
+        store.begin_draft();
+        store.hold_fields(&["osd"]);
+        store.update(|config| config.osd.rotation = 45).unwrap();
+        store.commit_fields(&["osd"]).unwrap();
+        store.release_fields(&["osd"]);
+        assert!(!store.is_dirty(), "存过的字段不该再算改动");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
