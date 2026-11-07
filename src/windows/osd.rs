@@ -1854,13 +1854,16 @@ impl Osd {
         self.dismissing = false;
         self.hold = None;
         self.fade_from = 0.0;
-        // 不 `set_visible(false)`：隐藏再显示会让 DWM 给窗口补一段出现淡入，
-        // 那一次滑入就变半透明。直接把窗口挪到屏幕外（下面）就是「看不见」。
+        // 「挪到屏幕外 + 全透明」只是看不见，窗口还带着一块固定坐标 ——
+        // 显示器摆放一变就可能落进真实屏幕（面板那边就是这么露馅的）。真藏起来。
+        // 下次 `show` 里先 `set_opacity(0)` 再 `set_visible(true)`，不会闪旧画面：
+        // DWM 的出现过渡在 `configure_osd` 里已关（`DWMWA_TRANSITIONS_FORCEDISABLED`）。
         self.offset = if self.slide > 0.5 { self.slide } else { 0.0 };
         crate::windows::platform::set_opacity(window, 0.0);
         self.last_alpha = 0.0;
         crate::windows::platform::unwatch_osd_top();
         self.sync_position(window);
+        crate::windows::platform::hide_window(window);
         self.ticker = false;
         cx.notify();
         false

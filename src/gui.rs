@@ -499,14 +499,16 @@ pub fn run(
                 }
                 // 光标进出托盘图标：滚轮钩子只在悬停时生效。
                 TrayIconEvent::Enter { rect, .. } => {
-                    crate::platform::mouse_wheel::set_hovering(true);
-                    // 顺便记下图标矩形：Enter/Leave 偶尔会漏，滚轮时用位置兜底核对。
+                    // 先记矩形再置悬停：反过来的话，钩子线程可能读到
+                    // 「悬停 = true、矩形还是 None」，`cursor_on_icon` 会当成
+                    // 「在图标上」，把本该给热区的那一发吞掉。
                     crate::platform::mouse_wheel::set_icon_rect(Some((
                         rect.position.x,
                         rect.position.y,
                         rect.position.x + f64::from(rect.size.width),
                         rect.position.y + f64::from(rect.size.height),
                     )));
+                    crate::platform::mouse_wheel::set_hovering(true);
                 }
                 TrayIconEvent::Leave { .. } => {
                     crate::platform::mouse_wheel::set_hovering(false);
@@ -843,7 +845,7 @@ pub fn run(
             cx.spawn(async move |cx| {
                 while let Ok(action) = action_rx.recv().await {
                     cx.update(|cx| match action {
-                        ShellAction::Toggle => toggle_flyout(cx),
+                        ShellAction::Toggle => toggle_flyout(cx, false),
                         ShellAction::Menu(id) => run_menu_action(cx, &id),
                         ShellAction::TrayMenu => open_tray_menu(cx),
                     });
@@ -999,10 +1001,48 @@ pub fn run(
             .detach();
 
             // 托盘滚轮：悬停在图标上滚动即调当前设备音量。
-            let wheel_rx = crate::platform::mouse_wheel::spawn();
+            let (wheel_rx, zone_rx) = crate::platform::mouse_wheel::spawn();
             cx.spawn(async move |cx| {
                 while let Ok(step) = wheel_rx.recv().await {
                     cx.update(|cx| adjust_device_volume(cx, step));
+                }
+            })
+            .detach();
+
+            // 屏幕边缘 / 指定区域的热区：贴着边滚 = 调音量的那条边按配置来，
+            // 亮度可以先设、也可以按住修饰键临时换过去。
+            cx.spawn(async move |cx| {
+                while let Ok(pulse) = zone_rx.recv().await {
+                    cx.update(|cx| adjust_zone(cx, pulse.step, pulse.horizontal, pulse.target));
+                }
+            })
+            .detach();
+
+            // 热区几何先按当前配置铺一份：钩子线程不读配置，全靠这份快照。
+            {
+                let config = cx.global::<AppState>().config.clone();
+                let cfg = config.borrow().get().clone();
+                refresh_wheel_zones(&cfg);
+            }
+
+            // 显示器排布巡检：热区几何是**快照**，插拔屏、改分辨率、改缩放之后
+            // 那组矩形就落在别处了 —— 用户看到的是「贴着边滚没反应」，跟「热区
+            // 时灵时不灵」一模一样；重启程序会重算，所以「重启就好」。
+            // 这里只算排布指纹（台数 + 逻辑矩形 + 缩放，不读名字 / EDID），
+            // 5 秒一次开销可以忽略；真变了才走一次完整重铺。
+            cx.spawn(async move |cx| {
+                let mut last = crate::platform::monitors::geometry_signature();
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(5))
+                        .await;
+                    let now = crate::platform::monitors::geometry_signature();
+                    if now == last {
+                        continue;
+                    }
+                    last = now;
+                    let cfg = cx.update(|cx| cx.global::<AppState>().config.borrow().get().clone());
+                    refresh_wheel_zones(&cfg);
                 }
             })
             .detach();
@@ -1018,7 +1058,7 @@ pub fn run(
             // 又启动了一次 Bolume：把已存在的面板叫到前台。
             cx.spawn(async move |cx| {
                 while activate_rx.recv().await.is_ok() {
-                    cx.update(|cx| show_flyout(cx));
+                    cx.update(|cx| show_flyout(cx, false));
                 }
             })
             .detach();
@@ -1057,7 +1097,8 @@ pub fn run(
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(400))
                         .await;
-                    cx.update(|cx| toggle_flyout(cx));
+                    // 调试入口 `--show` 当成「用户自己呼出」那一路：位置设置要能看出来。
+                    cx.update(|cx| toggle_flyout(cx, true));
                 })
                 .detach();
             }
@@ -1565,34 +1606,20 @@ pub fn repaint_windows(cx: &mut App) {
     }
 }
 
-/// 音量面板宽度改了：整块重排，跟着它走的亮度面板也重新贴一次。
+/// 音量面板宽度 / 行高 / 字号这类「决定它占多大」的设置改了之后调一次。
 ///
-/// 面板没开着的时候会被「预览」出来（和手动打开一模一样，只是不抢焦点）——
-/// 改外观本来就得看着效果调，这一下是用户预期里的。
+/// **只重排开着的面板**，关着就什么都不做 —— 以前这里会在面板没开时把它「预览」
+/// 出来，结果设置页里随手调一个数，屏幕上就蹦出一块面板（还挡着设置页），
+/// 「恢复更改 / 恢复出厂」更是点一下就冒一块。用户明确不要这种预览：
+/// 关着的时候什么都不用刷，下次真打开时它自己按最新配置排版。
 pub fn refresh_flyout_size(cx: &mut App) {
-    let handle = cx.global::<AppState>().flyout.borrow().clone();
-    if let Some(handle) = handle {
-        let _ = handle.update(cx, |flyout, window, cx| {
-            // 排版一换，融合块的方向和尺寸都跟着变（横排 → 竖排是长高换成占宽）。
-            flyout.sync_brightness_embed(cx);
-            flyout.refresh_layout(window, cx);
-        });
-    }
-    refresh_brightness_window(cx);
-}
-
-/// 同上，但**面板关着就什么都不做**。
-///
-/// 「恢复更改 / 恢复出厂 / 应用」是一次换掉一大片配置，里面未必碰了面板尺寸，也不
-/// 一定是用户正看着面板在调 —— 这时候按上面那条走会把面板预览出来，点一下菜单就
-/// 蹦出一块面板，纯属惊吓。下次真打开面板时它自己会按新配置排版。
-pub fn refresh_flyout_size_if_visible(cx: &mut App) {
     let handle = cx.global::<AppState>().flyout.borrow().clone();
     if let Some(handle) = handle {
         let _ = handle.update(cx, |flyout, window, cx| {
             if !flyout.is_visible() {
                 return;
             }
+            // 排版一换，融合块的方向和尺寸都跟着变（横排 → 竖排是长高换成占宽）。
             flyout.sync_brightness_embed(cx);
             flyout.refresh_layout(window, cx);
         });
@@ -2017,7 +2044,7 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
     }
 
     match action {
-        Some(Action::Flyout) => toggle_flyout(cx),
+        Some(Action::Flyout) => toggle_flyout(cx, true),
         Some(Action::Settings) => open_settings(cx),
         Some(Action::VolumeUp) => absolute_volume(cx, 1.0),
         Some(Action::VolumeDown) => absolute_volume(cx, -1.0),
@@ -2085,7 +2112,17 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
         // 这里弹 OSD 再把键转发给播放器，和配了快捷键时行为一致。
         None => {
             if hotkey.mods == 0 {
-                if let Some(action) = crate::platform::hotkey::media_action(hotkey.key) {
+                if let Some(action) = crate::platform::hotkey::volume_action(hotkey.key) {
+                    // 没配快捷键的音量 / 静音键：钩子只在 OSD 那两项提示开着时才送过来
+                    // （关着就原样还给系统了）。这里按「配了快捷键」一模一样地处理：
+                    // 自己改音量 / 切静音，再弹自己那张卡片。
+                    match action {
+                        Action::VolumeUp => absolute_volume(cx, 1.0),
+                        Action::VolumeDown => absolute_volume(cx, -1.0),
+                        Action::MediaMute => toggle_default_mute(cx),
+                        _ => {}
+                    }
+                } else if let Some(action) = crate::platform::hotkey::media_action(hotkey.key) {
                     let playing = (action == Action::MediaPlayPause).then(|| toggled_playback(cx));
                     crate::platform::hotkey::send_media_key(hotkey.key);
                     let function = match action {
@@ -2114,6 +2151,7 @@ fn dispatch_hotkey_inner(cx: &mut App, hotkey: crate::config::Hotkey, from_repea
     let repeat = action.or_else(|| {
         if hotkey.mods == 0 {
             crate::platform::hotkey::media_action(hotkey.key)
+                .or_else(|| crate::platform::hotkey::volume_action(hotkey.key))
         } else {
             None
         }
@@ -2277,7 +2315,13 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
     let last = list.len() - 1;
     let targets: Vec<usize> = match target {
         BrightnessTarget::All => (0..list.len()).collect(),
-        BrightnessTarget::Cursor => vec![crate::display::monitor_index_at_cursor().min(last)],
+        BrightnessTarget::Cursor => {
+            // 认不出光标在哪块屏就不动：多屏时猜一块会把别的屏调了。
+            let Some(index) = cursor_display_index(&list) else {
+                return;
+            };
+            vec![index]
+        }
         // 编号写大了（换了台少一台的机器）就落到最后一台，别按了没反应。
         BrightnessTarget::Index(number) => vec![(number.saturating_sub(1) as usize).min(last)],
     };
@@ -2297,6 +2341,9 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
             .round()
             .clamp(0.0, 100.0) as u32;
         if next == current {
+            // 顶格 / 触底：DDC 不用再写一遍，但提示条要照弹 —— 和热区那条
+            // 一个道理，按住键到 100% 之后还继续按，得有「到头了」的反馈。
+            shown = Some(next as f32 / 100.0);
             continue;
         }
         engine.send(crate::display::DisplayCommand::SetBrightness {
@@ -2314,11 +2361,14 @@ fn nudge_brightness(cx: &mut App, target: BrightnessTarget, direction: f32) {
         changed = true;
     }
 
-    if !changed {
+    // `changed` 为假也可能要弹提示（全部顶格的那一发）—— 所以退出条件看 `shown`。
+    if !changed && shown.is_none() {
         return;
     }
     // 面板要是正开着（用户自己拉开的），让它按新读数重画一次，滑条不会停在旧位置上。
-    refresh_brightness_window(cx);
+    if changed {
+        refresh_brightness_window(cx);
+    }
     // 亮度的提示条：以前是「屏幕本身就是反馈」，现在跟音量一样弹一条，
     // 外观在布局编辑器里单独调（亮度是第三套模板）。
     // 多台一起调（All）时报最后一台 —— 步进一样，读数也一样。
@@ -2563,6 +2613,301 @@ fn adjust_device_volume(cx: &mut App, step: i32) {
     if (next - display).abs() > 0.0001 {
         crate::platform::sound::step(&cfg, crate::config::VolumeGesture::TrayScroll);
     }
+}
+
+/// 热区滚轮的总入口：先算出这一下该调谁（音量 / 亮度），再分头走。
+///
+/// 「按住某个修饰键换成另一个」判断放在这里而不是钩子线程里：钩子只负责
+/// 「光标在不在热区里、命中的那块调什么」，键盘状态随时会变，等真正要动手时
+/// 再问一次最准。
+///
+/// `target` 由钩子随事件带过来 —— 每条边可以调不同的东西，这里不能自己再
+/// 从配置里猜一块（会跟光标实际贴着的那条边对不上）。
+fn adjust_zone(cx: &mut App, step: i32, horizontal: bool, target: crate::config::WheelZoneTarget) {
+    use crate::config::WheelZoneTarget;
+
+    let cfg = cx.global::<AppState>().config.borrow().get().clone();
+    let zone = cfg.wheel_zone.clone();
+    if !zone.enabled || step == 0 {
+        // 钩子那边命中过才会走到这里，所以「收到但配置关着」只可能是两帧之间
+        // 刚被改掉 —— 记一笔，省得排查时把它当成钩子没收到。
+        crate::platform::hotkey::trace("zone step dropped: zone disabled");
+        return;
+    }
+    let target = zone.effective_target(target, zone.swap.is_down());
+    crate::platform::hotkey::trace(&format!(
+        "zone step {} -> {:?}",
+        if step > 0 { "+1" } else { "-1" },
+        target
+    ));
+    match target {
+        WheelZoneTarget::Volume => adjust_zone_volume(cx, step, horizontal),
+        WheelZoneTarget::Brightness => adjust_zone_brightness(cx, step, horizontal),
+    }
+}
+
+/// 热区滚轮：贴着屏幕边 / 在指定区域里滚，按热区自己的段数调当前设备音量。
+///
+/// 和托盘那条路的区别只有两点：步进换成 `zone_scroll`（热区的段数），以及
+/// 是否弹提示条 / 反向由热区自己那段配置决定。解除静音沿用「托盘滚轮」那一格
+/// —— 用户眼里这两种都是「拿滚轮调音量」，没必要在矩阵里再分一栏。
+/// 音效则单算一格（`VolumeGesture::ZoneScroll`）：贴边滚比托盘滚频繁得多，
+/// 「生效范围」里得能只关它。
+fn adjust_zone_volume(cx: &mut App, step: i32, horizontal: bool) {
+    let (engine, config, _, shared) = cx.global::<AppState>().clone_handles();
+    let cfg = config.borrow().get().clone();
+    let zone = cfg.wheel_zone.clone();
+    if !zone.enabled || step == 0 {
+        return;
+    }
+    // 钩子那边已经按黑名单拦过一次，这里兜底（名单可能在两帧之间变过）。
+    if app_blocked(&cfg) {
+        crate::platform::hotkey::trace("zone volume dropped: blocklist");
+        return;
+    }
+    let _ = horizontal;
+    let snapshot = shared.borrow().clone();
+    // 下面这两条是「滚了半天没反应」最常见的静默出口：设备快照正在重建
+    // （切默认设备 / 插拔声卡 / 音频引擎重启）时 `current_device_id` 会是空，
+    // 过一会儿又好 —— 用户描述成「时灵时不灵」。日志里必须看得见。
+    let Some(device_id) = snapshot.current_device_id.clone() else {
+        crate::platform::hotkey::trace("zone volume dropped: no current device");
+        return;
+    };
+    let Some(device) = snapshot.devices.iter().find(|d| d.id == device_id) else {
+        crate::platform::hotkey::trace("zone volume dropped: device missing from snapshot");
+        return;
+    };
+    let min_db = cfg.logarithmic_min_db as f32;
+    let display = if cfg.use_logarithmic_volume {
+        to_display_volume(device.volume, min_db)
+    } else {
+        device.volume
+    };
+    let ceiling = cap_display(cfg.volume_cap.limit_for(&device.id), &cfg, min_db);
+    let direction = if zone.invert { -step } else { step };
+    let next = cfg.zone_scroll(display, direction as f32).min(ceiling);
+    let raw = if cfg.use_logarithmic_volume {
+        to_log_volume(next, min_db)
+    } else {
+        next
+    };
+    let unmute = cfg
+        .unmute
+        .allows(crate::config::VolumeGesture::ZoneScroll, direction > 0);
+    engine.send(AudioCommand::SetDeviceVolume {
+        device_id,
+        volume: raw,
+        unmute,
+    });
+    if zone.show_osd {
+        show_osd(cx, {
+            let mut request = OsdRequest::device(OsdFunction::Volume).predicted(next);
+            if unmute && device.muted {
+                request = request.muted(false);
+            }
+            request
+        });
+    }
+    if (next - display).abs() > 0.0001 {
+        crate::platform::sound::step(&cfg, crate::config::VolumeGesture::ZoneScroll);
+    }
+}
+
+/// 光标底下那块屏在亮度列表里的下标。
+///
+/// 按 `HMONITOR` 对号，不按序号：亮度列表里一条对应一个**物理显示器**，
+/// 而序号是按**屏**数的 —— 一台屏挂两块物理显示器（很少见，但 DDC 分线器
+/// 能做到）两边的下标就错开了，滚哪块都会落到隔壁。
+fn display_index_at_cursor(list: &[crate::display::DisplayInfo]) -> Option<usize> {
+    let handle = crate::platform::monitors::handle_at_cursor()?;
+    list.iter().position(|entry| entry.handle == handle)
+}
+
+/// 光标底下那块屏在亮度列表里的下标；对不上号时**只有一台**才退回 0。
+///
+/// 多屏时退回 0 号等于把不相干的那块屏调了 —— 用户明明在左边滚，右边亮起来，
+/// 比「没反应」更像 bug。列表和屏是两条枚举链路（DDC 的物理显示器 vs HMONITOR），
+/// 刚插拔 / 刚开机时会短暂对不上，这种时候什么都不做最稳。
+fn cursor_display_index(list: &[crate::display::DisplayInfo]) -> Option<usize> {
+    display_index_at_cursor(list).or_else(|| (list.len() == 1).then_some(0))
+}
+
+/// 热区滚轮调亮度：光标底下那块屏，按亮度页那个「滚轮步进」推一档。
+///
+/// 调哪块屏看光标而不是「设定里认的那台」：热区本来就是「贴在屏幕边上」，
+/// 光标在哪块屏的边上就调哪块，双屏时不用再切一次设置。
+fn adjust_zone_brightness(cx: &mut App, step: i32, horizontal: bool) {
+    let (config, engine, displays) = {
+        let state = cx.global::<AppState>();
+        (
+            state.config.clone(),
+            state.display_engine.clone(),
+            state.displays.clone(),
+        )
+    };
+    let cfg = config.borrow().get().clone();
+    let zone = cfg.wheel_zone.clone();
+    if !zone.enabled || step == 0 {
+        return;
+    }
+    // 同音量那条路：钩子已经按黑名单拦过，这里兜底。
+    if app_blocked(&cfg) {
+        return;
+    }
+    let _ = horizontal;
+    let list = displays.borrow().clone();
+    if list.is_empty() {
+        return;
+    }
+    // 光标底下那块屏：按 `HMONITOR` 认，不按序号（见 `display_index_at_cursor`）。
+    let Some(index) = cursor_display_index(&list) else {
+        return;
+    };
+    let Some(info) = list.get(index) else {
+        return;
+    };
+    // 读不到亮度的（DDC/CI 不通、笔记本内屏、开着 HDR）就别写：画面不会变，
+    // 界面却记下一个新值，下次回读全是对不上的。
+    if !info.adjustable() {
+        return;
+    }
+    let Some(current) = info.brightness else {
+        return;
+    };
+    let direction = if zone.invert { -step } else { step };
+    let next = cfg.brightness_scroll(current as f32, direction as f32);
+    // 顶到 100% / 0% 之后继续往同方向滚：数值不变，但**提示条照样要弹**。
+    // 用户眼里「滚了没反应」和「到头了」是两件事 —— 音量那条路本来就不判等
+    // （照发命令、照弹提示），这里以前直接 return，于是顶格之后整条热区像死了。
+    if next == current {
+        if zone.show_osd {
+            show_osd(
+                cx,
+                OsdRequest::device(OsdFunction::Brightness).predicted(current as f32 / 100.0),
+            );
+        }
+        return;
+    }
+    engine.send(crate::display::DisplayCommand::SetBrightness {
+        key: info.key.clone(),
+        value: next,
+    });
+    // 和快捷键一样先记一笔：DDC 回读要几十毫秒，连滚时下一步不该拿旧读数再算一遍。
+    note_brightness(cx, &info.key, next);
+    if let Some(entry) = displays.borrow_mut().get_mut(index) {
+        entry.brightness = Some(next);
+    }
+    // 亮度面板正开着就跟着重画，滑条不会停在旧位置。
+    refresh_brightness_window(cx);
+    if zone.show_osd {
+        show_osd(
+            cx,
+            OsdRequest::device(OsdFunction::Brightness).predicted(next as f32 / 100.0),
+        );
+    }
+}
+
+/// 按配置算好滚轮热区的**物理像素**矩形，交给低级鼠标钩子线程。
+///
+/// 钩子拿到的 `MSLLHOOKSTRUCT.pt` 是**虚拟化（逻辑）坐标**：低级鼠标钩子跑在
+/// DPI-unaware 的上下文里，实测量到 1919，而这块屏物理是 2560 宽。所以几何
+/// 一律用 `MonitorInfo.bounds`（已经除过缩放比的逻辑矩形），厚度也直接是逻辑
+/// 像素 —— 拿 `physical` 那样比，热区会整块偏出去。
+///
+/// 什么时候调用：启动、配置生效（应用 / 确定 / 取消）、显示器变化。钩子线程
+/// 不读配置，全靠这份快照。
+pub fn refresh_wheel_zones(cfg: &crate::config::Config) {
+    use crate::config::WheelZoneMode;
+    use crate::platform::mouse_wheel::{ZoneBox, clear_zones, set_zones};
+
+    let zone = &cfg.wheel_zone;
+    if !zone.enabled {
+        clear_zones();
+        return;
+    }
+    let list = crate::platform::monitors::monitors();
+    let Some(primary) = list
+        .iter()
+        .find(|info| info.is_primary)
+        .or_else(|| list.first())
+    else {
+        clear_zones();
+        return;
+    };
+    let picked: Vec<&crate::platform::monitors::MonitorInfo> = if zone.all_monitors {
+        list.iter().collect()
+    } else if zone.monitor == 0 {
+        vec![primary]
+    } else {
+        vec![list.get(zone.monitor as usize - 1).unwrap_or(primary)]
+    };
+
+    let mut boxes = Vec::new();
+    for info in picked {
+        let (x, y, w, h) = info.bounds;
+        if w <= 0.0 || h <= 0.0 {
+            continue;
+        }
+        match zone.mode {
+            WheelZoneMode::Edges => {
+                use crate::config::WheelZoneEdge;
+                let thick = (zone.thickness as f32).clamp(1.0, w.min(h) / 2.0);
+                // 顺序 = 边角打架时的优先级：上、下、左、右。push 的顺序就是
+                // `zone_hit` 里 `find` 的顺序，横边先认，见那边的注释。
+                if zone.edges.top {
+                    boxes.push(ZoneBox {
+                        left: x,
+                        top: y,
+                        right: x + w,
+                        bottom: y + thick,
+                        target: zone.target_of(WheelZoneEdge::Top),
+                    });
+                }
+                if zone.edges.bottom {
+                    boxes.push(ZoneBox {
+                        left: x,
+                        top: y + h - thick,
+                        right: x + w,
+                        bottom: y + h,
+                        target: zone.target_of(WheelZoneEdge::Bottom),
+                    });
+                }
+                if zone.edges.left {
+                    boxes.push(ZoneBox {
+                        left: x,
+                        top: y,
+                        right: x + thick,
+                        bottom: y + h,
+                        target: zone.target_of(WheelZoneEdge::Left),
+                    });
+                }
+                if zone.edges.right {
+                    boxes.push(ZoneBox {
+                        left: x + w - thick,
+                        top: y,
+                        right: x + w,
+                        bottom: y + h,
+                        target: zone.target_of(WheelZoneEdge::Right),
+                    });
+                }
+            }
+            WheelZoneMode::Rect => {
+                // 一个屏幕上一块或多块，按配置顺序 push —— 重叠时先画的那块先认。
+                for region in zone.regions() {
+                    let (rx, ry, rw, rh) = region.rect();
+                    boxes.push(ZoneBox {
+                        left: x + w * rx,
+                        top: y + h * ry,
+                        right: x + w * (rx + rw),
+                        bottom: y + h * (ry + rh),
+                        target: region.target,
+                    });
+                }
+            }
+        }
+    }
+    set_zones(true, zone.horizontal, zone.swallow, boxes);
 }
 
 /// 托盘右键菜单。
@@ -2876,7 +3221,7 @@ pub(crate) fn run_menu_action(cx: &mut App, id: &str) {
         return;
     }
     match id {
-        "toggle" => toggle_flyout(cx),
+        "toggle" => toggle_flyout(cx, false),
         "settings" => open_settings(cx),
         "quit" => quit_now(cx),
         "restart" => restart_app(cx),
@@ -3144,10 +3489,14 @@ pub fn cap_display(limit: Option<f32>, cfg: &crate::config::Config, min_db: f32)
     }
 }
 
-fn toggle_flyout(cx: &mut App) {
+fn toggle_flyout(cx: &mut App, from_hotkey: bool) {
     let handle = cx.global::<AppState>().flyout.borrow().clone();
     if let Some(handle) = handle {
-        match handle.update(cx, |flyout, window, cx| flyout.toggle(window, cx)) {
+        match handle.update(cx, |flyout, window, cx| {
+            // 位置那套可以只对快捷键生效，所以先把来路记下来再开关。
+            flyout.set_from_hotkey(from_hotkey);
+            flyout.toggle(window, cx)
+        }) {
             // 面板展开了就把亮度窗口摆到旁边；收起了就跟着一起收。
             Ok(()) => sync_brightness(cx),
             Err(error) => eprintln!("toggle_flyout 失败：{error:?}"),
@@ -3158,10 +3507,11 @@ fn toggle_flyout(cx: &mut App) {
 }
 
 /// 确保面板处于显示状态（重复启动实例时用）。
-fn show_flyout(cx: &mut App) {
+fn show_flyout(cx: &mut App, from_hotkey: bool) {
     let handle = cx.global::<AppState>().flyout.borrow().clone();
     if let Some(handle) = handle {
         let _ = handle.update(cx, |flyout, window, cx| {
+            flyout.set_from_hotkey(from_hotkey);
             if !flyout.is_visible() {
                 flyout.show(window, cx);
             } else {

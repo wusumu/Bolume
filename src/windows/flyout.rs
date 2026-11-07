@@ -93,6 +93,46 @@ pub fn panel_row_height(cfg: &Config) -> f32 {
     (icon + 20.0).max(theme::ROW_HEIGHT)
 }
 
+/// 面板应用列表**最多**能放几行：只看屏幕工作区能塞下多少，行高越小放得越多。
+///
+/// 以前这里是死数 `MAX_VISIBLE_APPS`（6）：行高压到 25px 也不多显示一行 —— 用户
+/// 把行高调小本来就是为了「一屏多放几个应用」，结果第 7 个照样得上下滚，看着像
+/// 行高这个设置根本没生效。现在只受屏幕高度约束（上下各留 `PANEL_MARGIN`），
+/// 真放不下才滚。
+///
+/// `work_height <= 0`（还没量过工作区，第一帧之前）退回 6：拿 0 去算会得出
+/// 「只放 1 行」，第一帧的面板会被压成一条。
+fn app_row_limit(work_height: f32, row_height: f32, device_height: f32, merge_extra: f32) -> usize {
+    if !work_height.is_finite() || work_height <= 0.0 {
+        return theme::MAX_VISIBLE_APPS;
+    }
+    // 行高兜个 8px：填 1 的话「能放几行」会算出几百行，窗口高得离谱。
+    let row = row_height.max(8.0);
+    let fixed = device_height.max(8.0)
+        + theme::APPS_HEADER_HEIGHT
+        + theme::FOOTER_HEIGHT
+        + 1.0
+        + merge_extra.max(0.0)
+        + PANEL_MARGIN * 2.0;
+    let available = (work_height - fixed).max(row);
+    ((available / row).floor() as usize).max(1)
+}
+
+/// 面板顶部「播放设备」那一块的高度（逻辑像素）。
+///
+/// 用户填了 `panel_device_height` 就以它为准（0 = 默认 `theme::DEVICE_ROW_HEIGHT`）。
+/// 和 `panel_row_height` 一样做成自由函数：融合的亮度块、OSD 之类也可能要读，
+/// 而且窗口高度的每一笔都得从同一个来源算。
+pub fn panel_device_height(cfg: &Config) -> f32 {
+    let custom = cfg.panel_device_height;
+    if custom.is_finite() && custom > 0.5 {
+        // 夹一下：手改配置文件写个 10000 上去，面板会整块跑到屏幕外面。
+        custom.clamp(8.0, crate::config::PANEL_DEVICE_HEIGHT_MAX as f32)
+    } else {
+        theme::DEVICE_ROW_HEIGHT
+    }
+}
+
 /// 面板字体族：空串 = 跟随系统默认字体（`None` 就不写这一条）。
 fn panel_font_family(cfg: &Config) -> Option<SharedString> {
     let value = cfg.panel_font.trim();
@@ -156,6 +196,10 @@ fn vertical_columns(visible: usize, hidden: usize, show_hidden: bool) -> usize {
 /// 托盘图标那一下点击会先让面板失焦收起、紧接着才轮到 Toggle，
 /// 两次事件的时间差在这之内就当成同一次点击，不再重新展开。
 const TOGGLE_SUPPRESS: Duration = Duration::from_millis(250);
+
+/// 面板离屏幕工作区边缘留的余量（逻辑像素）：贴任务栏那一档的摆放用它，
+/// 列表能放几行（`max_app_rows`）也拿它上下各留一份。
+const PANEL_MARGIN: f32 = 12.0;
 
 /// 「先声夺人」的静音覆盖最多撑这么久。
 ///
@@ -315,6 +359,277 @@ fn scroll_base(hold: &Rc<RefCell<HashMap<String, ReleaseNote>>>, key: &str, fall
     hold.borrow().get(key).map_or(fallback, |note| note.want)
 }
 
+/// 滑动方向：底 / 顶任务栏是上下，左右任务栏是左右（`offset` 正数 = 还没归位）。
+fn slide_vector(edge: TaskbarEdge, offset: f32) -> (f32, f32) {
+    match edge {
+        TaskbarEdge::Bottom => (0.0, offset),
+        TaskbarEdge::Top => (0.0, -offset),
+        TaskbarEdge::Left => (-offset, 0.0),
+        TaskbarEdge::Right => (offset, 0.0),
+    }
+}
+
+/// 一段动画用哪种驱动。
+///
+/// 两套动作在**单屏**上看起来一模一样，差别只在多屏：整扇窗挪出去时，「屏幕外」
+/// 是邻屏上真实存在的像素，整段动画会在旁边那块屏上播一遍。所以默认走挪窗
+/// （画面跟着窗口走，观感和以前完全一致），只有窗口会越过屏幕边界、落到邻屏上
+/// 的那一次才换成「窗口不动、只挪画面」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlideDriver {
+    /// 整扇窗跟着动画挪（默认，也是 0.92 及以前的做法）。
+    Window,
+    /// 窗口停在终位，只平移合成器里的画面（挪出窗口的那截被窗口自己裁掉）。
+    Content,
+}
+
+/// 正在跑的那段滑动：两种驱动二选一。
+#[derive(Clone)]
+enum RunningSlide {
+    /// 整扇窗在屏幕上平移（独立线程 + 合成帧）。
+    Window(crate::windows::platform::SlideHandle),
+    /// 窗口不动，画面在窗口里平移。
+    Content(ContentSlide),
+}
+
+impl RunningSlide {
+    /// 此刻停在哪（逻辑像素，正数 = 还没归位）：下一段从这里接力。
+    fn offset(&self) -> f32 {
+        match self {
+            Self::Window(handle) => handle.offset(),
+            Self::Content(slide) => slide.offset_at(Instant::now()),
+        }
+    }
+
+    /// 让它别跑了（不动的那个直接丢掉就行 —— 计时循环发现令牌对不上会自己退）。
+    fn cancel(&self) {
+        if let Self::Window(handle) = self {
+            handle.cancel();
+        }
+    }
+
+    /// 是不是同一段挪窗动画（判断「这条完成回调是不是已经过期了」）。
+    fn same_run(&self, other: &crate::windows::platform::SlideHandle) -> bool {
+        match self {
+            Self::Window(handle) => handle.same_run(other),
+            Self::Content(_) => false,
+        }
+    }
+}
+
+/// 一段「画面在窗口里滑」的动画（窗口本身不动）。
+///
+/// 只在窗口会滑到邻屏上的时候才用：`SetWindowRgn` 救不了挪窗那条路 —— gpui 的
+/// 窗口带 `WS_EX_NOREDIRECTIONBITMAP`，画面由合成器直接输出，窗口形状只影响
+/// GDI 那层；一旦合成器提交新帧，内容又按整窗铺满。
+///
+/// 这里换成窗口停在终位、用合成器把**画面**沿滑动方向平移；挪出窗口的那截被
+/// 窗口自己的合成目标裁掉。不重绘、不重新布局，也不跨屏。
+#[derive(Clone, Copy)]
+struct ContentSlide {
+    /// 起点时刻（单调时钟，`saturating_duration_since` 兜住回拨）。
+    ///
+    /// 同时也是这一段滑动的「身份」：喂给计时循环当令牌，谁手上的令牌跟
+    /// `self.slide` 对不上（被新的滑动画顶掉 / 已被收走）谁就自己退。
+    start: Instant,
+    from: f32,
+    end: f32,
+    tau_ms: f32,
+    total_ms: f32,
+    fade_ms: f32,
+    from_alpha: f32,
+    opacity: f32,
+    mode: crate::windows::platform::SlideMode,
+}
+
+impl ContentSlide {
+    fn offset_at(&self, now: Instant) -> f32 {
+        let ms = now.saturating_duration_since(self.start).as_secs_f32() * 1000.0;
+        // 收尾一律精确落在终点：指数曲线在 `ms = total` 时还剩一小截
+        // （384 × e^-2 ≈ 52px），不归位的话面板会往边上偏几十像素、边被裁。
+        if ms >= self.total_ms {
+            return self.end;
+        }
+        let p = (ms / self.total_ms.max(1.0)).clamp(0.0, 1.0);
+        match self.mode {
+            // 指数衰减：一上来就走掉大半、尾巴拖长（系统面板实测就是这条）。
+            crate::windows::platform::SlideMode::Enter => {
+                self.from * (-ms / self.tau_ms.max(1.0)).exp()
+            }
+            // 出场是加速下沉（系统音量条实测约 140ms）。
+            crate::windows::platform::SlideMode::Exit => {
+                self.from + (self.end - self.from) * p * p
+            }
+        }
+    }
+
+    fn alpha_at(&self, now: Instant) -> f32 {
+        if self.fade_ms <= 0.0 {
+            return self.opacity;
+        }
+        let ms = now.saturating_duration_since(self.start).as_secs_f32() * 1000.0;
+        let p = (ms / self.total_ms.max(1.0)).clamp(0.0, 1.0);
+        let a = match self.mode {
+            crate::windows::platform::SlideMode::Enter => self.from_alpha + (1.0 - self.from_alpha) * p,
+            crate::windows::platform::SlideMode::Exit => self.from_alpha * (1.0 - p),
+        };
+        a * self.opacity
+    }
+
+    fn is_done_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start).as_secs_f32() * 1000.0 >= self.total_ms
+    }
+}
+
+/// 把面板画面按当前偏移摆一次（合成器层，窗口不动）。
+fn apply_content_slide(window: &Window, edge: TaskbarEdge, offset: f32) {
+    let (dx, dy) = slide_vector(edge, offset);
+    window.set_content_offset(dx, dy);
+}
+
+/// 逐帧推进一段画面滑动：每跳按合成器偏移摆一次，演完自己收尾。
+///
+/// 不挂在 gpui 的帧回调上 —— 偏移是合成器层的改动，`Commit` 之后 DWM 下一个
+/// vsync 自然就合成出去了，这个窗口**一帧都不用重画**。而 `on_next_frame` 的回调
+/// 只在「这一帧真的要绘制」时才会派发：面板静止时没人标脏，等着帧的滑动画会一直
+/// 停在起点（实测：回调一次都没来过，面板整块空着）。
+///
+/// 也不能用 `Window::request_animation_frame()` 来续命：它内部要 `current_view()`
+/// （当前正在渲染的视图），帧回调跑在渲染栈之外，一调就 `Option::unwrap()` panic
+/// 直接 abort（见 `vendor/gpui-ce/src/window.rs:5013`）。
+///
+/// **节拍交给独立线程 + `DwmFlush`**，和「整扇窗挪」那条路同一个拍子：
+/// `background_executor().timer(4ms)` 在 Windows 上根本走不到 4ms —— 线程池定时器
+/// 的粒度固定 15.6ms，`timeBeginPeriod(1)` 也压不下来（Win11 24H2 实测：4ms 的
+/// 定时器照样 15～16ms 一跳，`dt` 一串 15.x，等于 60fps）。165Hz 屏上 60fps 的
+/// 滑入就是一格一格，用户报的「多屏之间呼出帧数不够」就是它。
+///
+/// 播放线程只算「这一刻该偏多少」，真正动合成器还是回主线程（渲染器不跨线程借）。
+/// 一帧一次 `send_blocking` + 主线程一次唤醒，队列只放 2 帧：主线程一时没空就
+/// 自然丢帧（偏移按时刻现算，不会攒出一串过期的位置）。
+fn pump_content_slide(cx: &mut Context<Flyout>, window: &Window, slide: ContentSlide) {
+    /// 播放线程交出来的一帧：画面偏多少、这一段演完没有。
+    struct Frame {
+        offset: f32,
+        done: bool,
+    }
+
+    // 用起点时刻认「这条循环还算不算数」：中途被新的滑动顶掉（收回半路又弹出、
+    // 收起半路又被喊出来），旧循环看到 `slide` 已经换人就自己退。
+    let token = slide.start;
+    let (frames_tx, frames_rx) = async_channel::bounded::<Frame>(2);
+    std::thread::spawn(move || {
+        // 精度只在演的这一段里提高，guard 一掉就还原（Win10 2004+ 是进程级）。
+        // 只给「合成停摆时的兜底睡眠」用，正常节拍靠 DwmFlush。
+        let _precision = crate::windows::platform::precise_timers();
+        loop {
+            let now = Instant::now();
+            let offset = slide.offset_at(now);
+            let done = slide.is_done_at(now);
+            // 接收端没了（新动画顶掉 / 面板已关）就退。
+            if frames_tx.send_blocking(Frame { offset, done }).is_err() {
+                return;
+            }
+            if done {
+                return;
+            }
+            // 和挪窗那条路同一个节拍：等下一帧合成完成。
+            //
+            // 面板在动的时候 DWM 会把这一拍压到屏幕刷新上；合成闲着时 `DwmFlush`
+            // 会立刻返回（本机实测：合成器里只改 visual 偏移不算「有活干」），那时
+            // 靠下面那个 1ms 睡眠兜住 —— 于是每一跳 ≤3ms，165Hz 的每个 vsync 都能
+            // 拿到一个新位置（原来 15.6ms 一跳，等于 60fps，就是一格一格）。
+            let before = Instant::now();
+            unsafe {
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            }
+            // 合成停摆（独占全屏、显示器休眠）时 DwmFlush 会立刻返回：兜一个 1ms
+            // 的睡眠，别让这个线程空转成 100% 单核。1ms 要真睡到 1ms 得靠上面提升
+            // 的定时器精度（默认粒度下这一睡就是 15.6ms，白改）。
+            if before.elapsed().as_secs_f32() < 0.0005 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+
+    cx.spawn_in(window, async move |this, cx| {
+        // 调试：每跳记一个时刻，演完把间隔一次性写进 trace.log —— 帧率不够时
+        // 先看这里，别靠肉眼猜「卡在哪一跳」。
+        let log = crate::platform::hotkey::trace_enabled();
+        let mut stamps: Vec<f32> = Vec::new();
+        while let Ok(frame) = frames_rx.recv().await {
+            if log {
+                stamps.push(token.elapsed().as_secs_f32() * 1000.0);
+            }
+            let stop = this.update_in(cx, |this, window, _cx| {
+                let Some(RunningSlide::Content(current)) = &this.slide else {
+                    return true;
+                };
+                let current = *current;
+                if current.start != token {
+                    return true;
+                }
+                let now = Instant::now();
+                let offset = frame.offset;
+                let done = frame.done;
+                this.slide_offset = offset;
+                apply_content_slide(window, this.edge, offset);
+                // 阴影跟着画面走：它一到位就挂回去，和「面板停稳」是同一帧；
+                // 等 `is_done` 再挂会晚一拍（曲线尾巴还要磨几像素）。
+                this.set_shadow(window, offset <= 1.0);
+                if current.fade_ms > 0.0 {
+                    crate::windows::platform::set_opacity(window, current.alpha_at(now));
+                }
+                if !done {
+                    return false;
+                }
+                // 收尾：位置精确落到终点（指数曲线到点还剩几十像素），
+                // 该藏的真藏起来。
+                this.slide = None;
+                this.anim.finish();
+                this.rest_offset = if current.mode == crate::windows::platform::SlideMode::Exit {
+                    current.end
+                } else {
+                    0.0
+                };
+                if current.mode == crate::windows::platform::SlideMode::Exit {
+                    crate::windows::platform::hide_window(window);
+                    // 藏完把 alpha 补回满值：淡出那一路停在 0，不补下次弹出是空白。
+                    crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
+                    // 窗口已经藏起来了，把画面偏移也归零 —— 不然下一次「在别的屏弹」
+                    // 走挪窗那条路时，窗口挪到位、画面还偏在窗外：只剩阴影，还能瞎点。
+                    // （隐藏状态下归位画面上不可见，不会闪。）
+                    apply_content_slide(window, this.edge, 0.0);
+                }
+                // 演完画面一定在终位（Enter 收到 0，Exit 刚归零），标志同步清掉。
+                this.content_shifted = false;
+                // 画面到位了，系统阴影这时候挂回去：它和面板同时出现，不会再先空占一块。
+                this.set_shadow(window, true);
+                true
+            });
+            if !matches!(stop, Ok(false)) {
+                if log && stamps.len() > 1 {
+                    let dts: Vec<String> = stamps
+                        .windows(2)
+                        .map(|pair| format!("{:.1}", pair[1] - pair[0]))
+                        .collect();
+                    crate::platform::hotkey::trace(&format!(
+                        "content-slide from={:.0} end={:.0} total={:.0} ticks={} stopped={} dt=[{}]",
+                        slide.from,
+                        slide.end,
+                        slide.total_ms,
+                        stamps.len(),
+                        matches!(stop, Ok(true)),
+                        dts.join(" ")
+                    ));
+                }
+                return;
+            }
+        }
+    })
+    .detach();
+}
+
 pub struct Flyout {
     pub snapshot: Snapshot,
     pub config: Rc<RefCell<ConfigStore>>,
@@ -371,9 +686,34 @@ pub struct Flyout {
     /// 这次弹在哪台显示器的**整块**矩形（逻辑像素）：滑入的起点按它的边算，
     /// 必须和 `base_frame` 是同一次、同一台 —— 中途重新问光标会问到别的屏上去。
     screen: (f32, f32, f32, f32),
-    /// 正在跑的那段滑动（独立线程按合成帧推进）；None = 没动画在跑。
-    slide: Option<crate::windows::platform::SlideHandle>,
-    /// 静止时窗口停在哪：0 = 在位，`slide_distance` = 整个在屏幕外。
+    /// 这块屏的**工作区**高度（扣掉任务栏）：列表最多放几行由它算（见 `max_app_rows`）。
+    /// `0` / 非数 = 还没量过（第一帧之前），先按老规矩 6 行兜着。
+    work_height: f32,
+    /// 正在跑的那段滑动（挪窗 / 挪画面二选一）；None = 没动画在跑。
+    slide: Option<RunningSlide>,
+    /// 这一段用哪种驱动：平时挪窗，只有会越过屏幕边界时才挪画面。
+    ///
+    /// 在 [`Self::update_frame_parked`] 里按面板摆位一次定下来，整个弹出 / 收起
+    /// 周期都用它 —— 中途换驱动会让窗口和画面各挪一半。
+    driver: SlideDriver,
+    /// 此刻相对终位的偏移（正数 = 还没归位）。
+    ///
+    /// 挪窗时它就是「窗口挪出去多远」，挪画面时是「画面在窗口里偏了多少」，
+    /// 所以接力（演到一半被打断）用同一个数就能接着走。
+    slide_offset: f32,
+    /// 合成器的画面偏移此刻是不是非零。
+    ///
+    /// 挪画面那段跑完之后这个偏移还留在 renderer 里（窗口是靠着它「藏」起来的）。
+    /// 下一次换成挪窗驱动时必须先把它归零 —— 否则窗口挪到位了、画面还偏在窗外，
+    /// 屏幕上就只剩 DWM 那圈窗口阴影，而窗口照旧接收点击（能瞎点）。
+    content_shifted: bool,
+    /// 此刻窗口是不是挂着系统阴影（DWM 按「圆角窗口」画的那圈）。
+    ///
+    /// 挪窗驱动时阴影跟着窗口走，没问题；挪画面驱动时窗口不动、阴影钉在终位 ——
+    /// 内容还在窗外，它已经孤零零地先出现，看着就是一个空阴影框等面板来填。
+    /// 所以那条路动画期间关掉，画面到位再打开（见 [`Self::set_shadow`]）。
+    shadow_on: bool,
+    /// 静止时画面停在哪：0 = 在位，`slide_distance` = 整个挪到窗外。
     /// 打断时拿它当「上一段停下的位置」。
     rest_offset: f32,
     /// 上一次「因为失焦而收起」的时刻。
@@ -404,6 +744,11 @@ pub struct Flyout {
     text_marked: Option<std::ops::Range<usize>>,
     /// 改名输入框画在哪：输入法要把候选窗摆到它旁边。
     rename_bounds: Rc<Cell<Option<gpui::Bounds<Pixels>>>>,
+    /// 这一次是**快捷键**呼出来的吗。
+    ///
+    /// 「呼出位置」可以只对快捷键生效（托盘点开仍旧贴着任务栏），所以每次弹出
+    /// 之前把来路记下来，摆位时按它决定用哪一套。
+    from_hotkey: bool,
     /// WiFi 无线电开关状态；`None` = 还没读过。
     wifi_on: Rc<Cell<Option<bool>>>,
     /// 蓝牙无线电开关状态；同上。
@@ -601,8 +946,13 @@ impl Flyout {
             anim: Entrance::new(),
             base_frame: (0.0, 0.0, 0.0, 0.0),
             screen: (0.0, 0.0, 0.0, 0.0),
+            work_height: 0.0,
             slide: None,
+            driver: SlideDriver::Window,
             rest_offset: 0.0,
+            slide_offset: 0.0,
+            content_shifted: false,
+            shadow_on: true,
             blur_hidden_at: None,
             edge: crate::windows::platform::taskbar_edge(),
             visible: false,
@@ -613,6 +963,7 @@ impl Flyout {
             rename: None,
             text_marked: None,
             rename_bounds: Rc::new(Cell::new(None)),
+            from_hotkey: false,
             wifi_on: Rc::new(Cell::new(None)),
             bt_on: Rc::new(Cell::new(None)),
             radio_watch_token: Rc::new(Cell::new(0)),
@@ -1310,6 +1661,23 @@ impl Flyout {
         panel_row_height(&self.cfg())
     }
 
+    /// 顶部「播放设备」那一块的高度：用户填了就以它为准（`panel_device_height`）。
+    fn device_height(&self) -> f32 {
+        panel_device_height(&self.cfg())
+    }
+
+    /// 列表最多能放几行：按**屏幕工作区高度**算，不再固定 6 行（见 `app_row_limit`）。
+    ///
+    /// `merge_extra` 是融合进来的亮度块占掉的高度，得先从可用空间里扣掉。
+    fn max_app_rows(&self, merge_extra: f32) -> usize {
+        app_row_limit(
+            self.work_height,
+            self.row_height(),
+            self.device_height(),
+            merge_extra,
+        )
+    }
+
     /// 窗口高度 = 内容高度，逐项累加，不留弹性空位。
     ///
     /// 面板只显示当前默认设备一行；切换设备在设置页里做，所以高度恒定。
@@ -1327,10 +1695,13 @@ impl Flyout {
         } else {
             0
         };
-        let apps = (visible + extra).clamp(1, theme::MAX_VISIBLE_APPS) as f32;
+        // 上限看屏幕高度（`max_app_rows`）：行高越小、屏越大，一屏就装得越多。
+        let apps = (visible + extra)
+            .max(1)
+            .min(self.max_app_rows(merge_extra)) as f32;
 
-        // 三段固定高度是布局常量，不跟面板字号走。
-        (theme::DEVICE_ROW_HEIGHT + theme::APPS_HEADER_HEIGHT + theme::FOOTER_HEIGHT)
+        // 固定段：设备块（可调）/ 表头 / 页脚，都不跟面板字号走。
+        (self.device_height() + theme::APPS_HEADER_HEIGHT + theme::FOOTER_HEIGHT)
             + 1.0
             + apps * self.row_height()
             + merge_extra
@@ -1571,6 +1942,8 @@ impl Flyout {
             .filter(|device| device.enabled)
             .count();
         // 行高 / 图标行都是固定尺寸（不跟面板字号走）：浮层要刚好挂在它下面。
+        // 高度先算成值再进闭包 —— 闭包是 `'static`，抓 `self` 的借用过不了借用检查。
+        let device_row_height = self.device_height();
         let open_device_menu = cx.listener(
             move |_: &mut Self, _: &MouseDownEvent, window: &mut Window, cx| {
                 // 再点一下设备名就收起来（同一个按钮一开一关）。
@@ -1587,7 +1960,7 @@ impl Flyout {
                 let x = 6.0;
                 // 挂在整条设备行的下方（行内还有滑块，贴在点击处会把自己盖住）；
                 // 下方塞不下就往上收，但至少留 6px。
-                let y = (theme::DEVICE_ROW_HEIGHT + 1.0)
+                let y = (device_row_height + 1.0)
                     .min(size.height.as_f32() - height - 6.0)
                     .max(6.0);
                 *device_menu_slot.borrow_mut() = Some(DeviceMenu { x, y });
@@ -1597,7 +1970,7 @@ impl Flyout {
 
         div()
             .id("current-device")
-            .h(self.su(theme::DEVICE_ROW_HEIGHT))
+            .h(px(self.device_height()))
             .px(px(8.))
             .mx(px(6.))
             .py(px(10.))
@@ -1785,7 +2158,7 @@ impl Flyout {
 
     fn empty_device_row(&self, lang: Lang) -> AnyElement {
         div()
-            .h(self.su(theme::DEVICE_ROW_HEIGHT))
+            .h(px(self.device_height()))
             .px(px(16.))
             .flex()
             .items_center()
@@ -3442,6 +3815,11 @@ impl Flyout {
         self.visible
     }
 
+    /// 记下这次是哪种方式呼出的（快捷键 / 托盘 …），摆位时按它选位置。
+    pub fn set_from_hotkey(&mut self, from_hotkey: bool) {
+        self.from_hotkey = from_hotkey;
+    }
+
     /// 面板钉住了没有（钉住时失焦不自动收起）。
     pub fn is_pinned(&self) -> bool {
         self.pinned
@@ -3474,7 +3852,16 @@ impl Flyout {
                 let height = self.desired_height();
                 // 只在高度真的变了才动窗口：拖动滑条时 snapshot 每 33ms 来一次，
                 // 无条件 SetWindowPos 会让面板跟着抖。
-                if (height - self.last_height).abs() > 0.5 {
+                let relayout = (height - self.last_height).abs() > 0.5;
+                if crate::platform::hotkey::trace_enabled() {
+                    crate::platform::hotkey::trace(&format!(
+                        "flyout content apps={} hidden={} desired={height:.1} last={:.1} relayout={relayout}",
+                        self.visible_apps().len(),
+                        self.hidden_apps().len(),
+                        self.last_height
+                    ));
+                }
+                if relayout {
                     self.update_frame(window, cx);
                 }
             }
@@ -3536,10 +3923,10 @@ impl Flyout {
         }
     }
 
-    /// 系统风格：整扇窗从「完全在屏幕外」滑到目标位置要走多远（正数）。
+    /// 系统风格：画面要从「整块在窗外」平移多远才归位（正数）。
     ///
-    /// 起点就贴着屏幕那条边（任务栏在下面时 = 屏幕底）：窗口顶边对齐屏幕底，
-    /// 整块卡片完全在屏幕外，往上滑的这一路上被任务栏挡住 —— 系统自己就是这么出来的。
+    /// 起点就是画面贴着屏幕那条边（任务栏在下面时 = 屏幕底）：卡片顶边对齐屏幕底，
+    /// 整块卡片正好全在窗外，滑进来的这一路上被任务栏挡住 —— 系统自己就是这么出来的。
     /// 不是「面板高度 + 固定值」：面板高矮差很多时，那种算法会让开口忽高忽低。
     fn slide_distance(&self, cx: &mut Context<Self>) -> f32 {
         // 用摆位时记下的那台屏（不是现问光标）：面板弹在哪台，就从那台的边滑进来。
@@ -3561,34 +3948,80 @@ impl Flyout {
         slide_distance_of(self.base_frame, screen, self.edge)
     }
 
-    /// 把「目标位置 + 当前位移」写进窗口（系统风格专用）。
+    /// 把这一段动画摆到 `offset` 处（正数 = 还没归位）。
     ///
-    /// 位移方向跟着任务栏那一条边走：底 / 顶任务栏是上下，左右任务栏是左右。
-    fn apply_slide(&self, window: &Window, offset: f32) {
-        let (x, y, width, height) = self.base_frame;
-        if width <= 0.0 || height <= 0.0 {
-            return;
+    /// 平时是整扇窗挪出去（以前的观感），只有这一段会落到邻屏上时，才改成
+    /// 窗口不动、只平移合成器里的画面。
+    fn apply_slide(&mut self, window: &Window, offset: f32) {
+        self.slide_offset = offset;
+        match self.driver {
+            SlideDriver::Window => {
+                // 挪窗时阴影本来就跟着窗口走，开着就行。
+                self.set_shadow(window, true);
+                // 上一段如果挪的是**画面**，合成器里的偏移还停在窗外（当初就是靠它
+                // 把面板「藏」起来的）。挪窗这条路完全不碰那个偏移，所以这里必须先
+                // 归零：不然窗口挪到位了、画面还偏在窗外，屏幕上只剩一圈窗口阴影，
+                // 而窗口照旧接收点击 —— 用户看到的就是「不显示，但能瞎点」。
+                if self.content_shifted {
+                    window.set_content_offset(0.0, 0.0);
+                    self.content_shifted = false;
+                }
+                let (x, y, _, _) = self.base_frame;
+                let (dx, dy) = slide_vector(self.edge, offset);
+                crate::windows::platform::set_origin(window, x + dx, y + dy, window.scale_factor());
+            }
+            SlideDriver::Content => {
+                apply_content_slide(window, self.edge, offset);
+                self.content_shifted = true;
+                // 画面还没到位就先别挂系统阴影：窗口是不动的，阴影会钉在终位先出现，
+                // 于是「先看到一个空阴影框、再过一会儿面板才滑进来」。
+                self.set_shadow(window, offset <= 0.5);
+            }
         }
-        let (dx, dy) = match self.edge {
-            TaskbarEdge::Bottom => (0.0, offset),
-            TaskbarEdge::Top => (0.0, -offset),
-            TaskbarEdge::Left => (-offset, 0.0),
-            TaskbarEdge::Right => (offset, 0.0),
-        };
-        crate::windows::platform::set_origin(window, x + dx, y + dy, window.scale_factor());
     }
 
-    /// 起一段「从屏幕外滑进来」的动画。
+    /// 切换系统阴影，状态没变就不惊动 DWM。
+    fn set_shadow(&mut self, window: &Window, on: bool) {
+        if self.shadow_on == on {
+            return;
+        }
+        self.shadow_on = on;
+        crate::windows::platform::set_window_shadow(window, on);
+    }
+
+    /// 这一段滑动的起点（整块贴在屏幕外）会不会压在**别的屏**上。
     ///
-    /// 交给一条独立线程 + `DwmFlush` 按合成帧推进（gpui 自己的定时器是 16ms 粒度，
-    /// 165Hz 屏上看着就是一格一格）。这期间不重绘：内容一帧都不变，只是整扇窗在移动。
-    /// 造一段滑动：`from` → `end`，方向和曲线跟着这一档动画走。
+    /// 单屏 / 屏幕外边没有别的东西时，挪窗这条老路一点问题都没有；多屏并排
+    /// （或者上下叠）时，「屏幕外」是邻屏的真实像素，整段动画会在那儿播一遍 ——
+    /// 只有这种情况才换成「窗口不动、只挪画面」。
     ///
-    /// 三档最终都是「整扇窗平移」这一种物理动作，区别只在曲线和时长：
+    /// 屏的坐标用 gpui 报的同一份（和 `base_frame` 一个坐标系）：跨 DPI 时
+    /// Win32 那套物理矩形对不上，不能拿来比。
+    fn slide_reaches_neighbor(&self, cx: &gpui::App, distance: f32) -> bool {
+        let (x, y, width, height) = self.base_frame;
+        if width <= 0.0 || height <= 0.0 || distance <= 0.0 {
+            return false;
+        }
+        let (dx, dy) = slide_vector(self.edge, distance);
+        let start = (x + dx, y + dy, width, height);
+        cx.displays().iter().any(|display| {
+            let bounds = display.bounds();
+            let (mx, my) = (bounds.origin.x.as_f32(), bounds.origin.y.as_f32());
+            let (mw, mh) = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+            // 起点矩形本来就整块在自己这台屏外面，所以这里根本不用排除「自己」：
+            // 和它相交的只可能是邻屏。严格不等号顺带把「刚好贴边」排除掉。
+            start.0 < mx + mw && mx < start.0 + start.2 && start.1 < my + mh && my < start.1 + start.3
+        })
+    }
+
+    /// 算出这一段滑动的参数：`from` → `end`，曲线和时长跟着这一档动画走。
+    ///
+    /// 三档动作都是「整块平移」（窗口挪 / 画面挪，见 [`SlideDriver`]），
+    /// 区别只在曲线和时长：
     /// - `System`：系统的指数曲线（时间常数按用户设的速度等比缩放）；
     /// - `Unfold`：ease-out，走满用户设的时长（以前那种「内容长出来」，
     ///   现在改成整块滑进来 —— 一样是从任务栏那侧冒出来，但没有裁切容器、
-    ///   也不碰整窗不透明度，帧率跟着屏幕刷新走）；
+    ///   也不碰整窗不透明度）；
     /// - `Fade`：一点位移都不走，只做整窗淡入淡出。
     fn slide_plan(
         &self,
@@ -3658,61 +4091,90 @@ impl Flyout {
 
     /// 起一段滑动，跑完自己收尾。
     ///
-    /// 收尾时先核对「`self.slide` 还是不是这一段」—— 被打断后新一轮已经接管，
-    /// 旧线程的完成回调不能把新动画的状态抹掉。
+    /// 平时整扇窗跟着挪（独立线程 + `DwmFlush`，帧率跟着屏幕刷新走，和以前一样）；
+    /// 只有这一段会滑到邻屏上时，才换成「窗口不动、只挪画面」——那条路每一跳只
+    /// 更新一次合成器偏移（[`pump_content_slide`]），不重绘也不重新布局。
+    /// 两种驱动都从 `from` 起步，所以接力（演到一半被收回 / 又弹出）照样成立。
     fn start_slide(
         &mut self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
         run: crate::windows::platform::SlideRun,
     ) {
-        use crate::windows::platform::SlideMode;
-        let mode = run.mode;
-        let end = run.end;
-        let handle = crate::windows::platform::run_slide(window, run);
-        self.slide = Some(handle.clone());
-        let view = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(20))
-                    .await;
-                if handle.is_done() {
-                    break;
+        if self.driver == SlideDriver::Window {
+            use crate::windows::platform::SlideMode;
+            let (mode, end) = (run.mode, run.end);
+            let handle = crate::windows::platform::run_slide(window, run);
+            self.slide = Some(RunningSlide::Window(handle.clone()));
+            let view = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(20))
+                        .await;
+                    if handle.is_done() {
+                        break;
+                    }
                 }
-            }
-            let _ = view.update(cx, |this, cx| {
-                if this.slide.as_ref().map(|now| now.same_run(&handle)) != Some(true) {
-                    return;
-                }
-                this.slide = None;
-                this.anim.finish();
-                this.rest_offset = if mode == SlideMode::Exit { end } else { 0.0 };
-                cx.notify();
-            });
-        })
-        .detach();
+                let _ = view.update_in(cx, |this, window, cx| {
+                    // 被打断后新一轮已经接管：旧线程的收尾不能把新动画的状态抹掉。
+                    if this.slide.as_ref().map(|now| now.same_run(&handle)) != Some(true) {
+                        return;
+                    }
+                    this.slide = None;
+                    this.anim.finish();
+                    this.rest_offset = if mode == SlideMode::Exit { end } else { 0.0 };
+                    // `slide_offset` 必须跟着归位：挪窗这条路的每一帧是动画线程直接
+                    // `SetWindowPos` 挪的，根本不经过 `apply_slide` —— 字段里留着的还是
+                    // `enter` 当初记下的起点（= 整块在窗外那段距离）。不归零的话，
+                    // 之后任何一次重排（钉住时改宽度 / 行高 / 字号）都会拿这个旧偏移
+                    // 把窗口再挪出去一整段：用户看到的就是「面板消失」（其实还在，
+                    // 只是整块跑到屏幕下面去了）。
+                    this.slide_offset = if mode == SlideMode::Exit { end } else { 0.0 };
+                    if mode == SlideMode::Exit {
+                        // 滑出去了就真藏起来（和「关掉动画」那条路一致）：
+                        // 光停在屏幕外只是看不见，换一次显示器摆放就可能露馅。
+                        crate::windows::platform::hide_window(window);
+                        crate::windows::platform::set_opacity(
+                            window,
+                            crate::ui::theme::ui_opacity(),
+                        );
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
+        let slide = ContentSlide {
+            start: Instant::now(),
+            from: run.from,
+            end: run.end,
+            tau_ms: run.tau_ms,
+            total_ms: run.total_ms,
+            fade_ms: run.fade_ms,
+            from_alpha: run.from_alpha,
+            opacity: run.opacity,
+            mode: run.mode,
+        };
+        self.slide = Some(RunningSlide::Content(slide));
+        self.slide_offset = slide.from;
+        apply_content_slide(window, self.edge, slide.from);
+        self.content_shifted = true;
+        // 从「窗外」起步就先关阴影（否则空阴影框先出现）；淡入那档 from 是 0，
+        // 窗口本来就该带着阴影出现，不用动。
+        self.set_shadow(window, slide.from <= 0.5);
+        pump_content_slide(cx, window, slide);
+        // 偏移已经摆好，但这一帧的内容还是「上一次绘制」的那一份：
+        // 敲一次重绘，让画面在第一跳之前就画到合成表面上。
+        crate::windows::platform::post_repaint(window);
     }
 
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_inner(true, window, cx);
+        self.show_inner(window, cx);
     }
 
-    /// 设置页改外观时把面板弹出来看一眼：**和手动打开完全一样**，只有一点不同 ——
-    /// 不抢焦点（设置窗还得接着用，鼠标还得接着点设置页里的控件）。
-    ///
-    /// 以前这一步是被 `refresh_layout` 里的 `set_frame` 顺手挪上来的：窗口在预热时
-    /// 就停在屏幕外、而且是「可见」的，一 `SetWindowPos` 就露头了，但 `visible`
-    /// 还是 false —— 于是 60Hz 补帧不跑（电平看着一卡一卡）、失焦不自动收、
-    /// 再按快捷键又是从屏幕外重新滑一遍（看着像「先关掉再重开」）。
-    pub fn show_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.visible {
-            return;
-        }
-        self.show_inner(false, window, cx);
-    }
-
-    fn show_inner(&mut self, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         // 融合的亮度块：每次弹出都对一次（开关、排版、显示器台数都可能变过），
         // 尺寸算在 `brightness_room` 里，后面 `enter` 用的就是这一份。
@@ -3735,7 +4197,7 @@ impl Flyout {
         // 窗口几何变更必须放到本帧绘制结束之后：鼠标事件是在绘制期间派发的，
         // 此时直接 SetWindowPos 会撞上 gpui 内部正在借用的渲染器。
         cx.defer_in(window, move |this, window, cx| {
-            this.enter(window, cx, animate, config_ms, motion, activate);
+            this.enter(window, cx, animate, config_ms, motion);
             cx.notify();
         });
         // `defer_in` 要等「下一帧绘制完」才执行；空闲时 gpui 不给帧，
@@ -3751,20 +4213,19 @@ impl Flyout {
         animate: bool,
         config_ms: u32,
         motion: EntranceMotion,
-        activate: bool,
     ) {
         use crate::windows::platform::SlideMode;
         // 上一段还在跑（正在收起 / 正在滑入）：从它停下的位置接力，
         // 不重新摆位 —— 这就是「没出完就能收回」和「收回一半又弹出」的底子。
-        let resume = self.slide.take().map(|handle| {
-            let offset = handle.offset();
-            handle.cancel();
+        let resume = self.slide.take().map(|slide| {
+            let offset = slide.offset();
+            slide.cancel();
             offset
         });
         let from = match resume {
             Some(offset) => offset,
             None => {
-                // 滑入那两档要从屏幕外起步：一步落到屏幕外，
+                // 滑入那两档要从「整块在窗外」起步：一步落到起点，
                 // 中间不留「在目标位置停一帧」的机会（否则会闪一下完整面板）。
                 let parked = animate && motion != EntranceMotion::Fade;
                 self.update_frame_parked(window, cx, parked);
@@ -3776,6 +4237,9 @@ impl Flyout {
             }
         };
         self.anim.begin_with(animate, motion, from);
+        // 显示之前先把画面摆到起点：窗口紧接着就要露出来，晚一步就会闪一帧
+        // 完整面板（用户看到的就是「先闪一下，然后才开始滑」）。
+        self.apply_slide(window, from);
         // 淡入淡出先把不透明度压到 0；滑入那两档**不能**碰整窗 alpha ——
         // 一碰 DWM 就会补一段约 200ms 的出现淡入，动画里卡片一直是半透明的。
         if animate {
@@ -3788,17 +4252,15 @@ impl Flyout {
             crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
         }
         crate::windows::platform::set_visible(window, true);
-        // 预览（设置页弹出来的那一份）不抢焦点：键盘和鼠标都还该留给设置窗。
-        // 其余一切照旧 —— Z 序、滑动、补帧都按「手动打开」那一套走。
-        if activate {
-            crate::windows::platform::activate(window);
-        }
+        // 面板只有「用户自己叫出来」这一条路（托盘 / 快捷键 / 命令行），
+        // 所以一律抢焦点：Z 序、滑动、补帧也都按手动打开那一套走。
+        crate::windows::platform::activate(window);
         // 一直排在任务栏之后：滑过任务栏的那一段和底部那圈阴影都被任务栏挡住。
         crate::windows::platform::present_behind_taskbar(window);
         if animate {
-                let run = self.slide_plan(SlideMode::Enter, motion, config_ms, from, 0.0);
+            let run = self.slide_plan(SlideMode::Enter, motion, config_ms, from, 0.0);
             self.start_slide(window, cx, run);
-            } else {
+        } else {
             self.rest_offset = 0.0;
         }
     }
@@ -3856,15 +4318,15 @@ impl Flyout {
     ) {
         use crate::windows::platform::SlideMode;
         let from = match self.slide.take() {
-            Some(handle) => {
-                let offset = handle.offset();
-                handle.cancel();
+            Some(slide) => {
+                let offset = slide.offset();
+                slide.cancel();
                 offset
             }
             None => self.rest_offset,
         };
         if !animate {
-            // 关掉收起动画：直接把窗口挪到屏幕外，再清掉这一轮的参数。
+            // 关掉收起动画：直接把画面藏到窗外，再清掉这一轮的参数。
             self.park_window(window, cx);
             self.anim.finish();
             return;
@@ -3878,11 +4340,11 @@ impl Flyout {
         self.start_slide(window, cx, run);
     }
 
-    /// 启动时先在屏幕外把窗口「显示」出来一次。
+    /// 启动时先把画面藏到窗外、把窗口「显示」出来一次，然后立刻真隐藏。
     ///
-    /// 目的不是显示面板，是让 DWM 把「窗口第一次出现」那段约 200ms 的淡入
-    /// 在看不见的地方用完 —— 否则用户第一次打开面板时，滑入的整个过程卡片都是
-    /// 半透明的（看起来就像后面垫了一层）。
+    /// 显示那一下是为了把第一帧合成掉（表面创建 / 首帧绘制都在这儿用完），
+    /// 用户第一次打开面板时不至于先白一下。**显示完必须藏回去**：一个「可见的」
+    /// 窗口哪怕画面已经挪到窗外，它也占着屏幕上的那块地方（还吃点击）。
     pub fn warm_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.visible {
             return;
@@ -3891,18 +4353,22 @@ impl Flyout {
         let slide = self.slide_distance(cx);
         self.anim.begin_with(false, self.entrance_motion(), 0.0);
         self.rest_offset = slide;
-        // 屏幕外全程保持**不透明**：整窗 alpha 一动，DWM 就会给窗口补一段
-        // 出现淡入，滑入时卡片就是半透明的。
+        // 先摆到「藏起来」的那一档（挪窗 / 挪画面，看这一段会落到哪儿），
+        // 预热这一步既把首帧合成掉，又不会在屏幕上露出任何东西。
         crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
         self.apply_slide(window, slide);
         crate::windows::platform::set_visible(window, true);
         crate::windows::platform::present_behind_taskbar(window);
+        // 首帧合成完了就真藏起来，下次 `enter` 从画面偏移的起点滑进来。
+        crate::windows::platform::hide_window(window);
         cx.notify();
     }
 
-    /// 把窗口停到「屏幕外」（或全透明）—— 收起的终点。
+    /// 把面板停到「屏幕外」（或整窗全透明），**然后真隐藏**。
     ///
-    /// 不 `ShowWindow(SW_HIDE)`：一隐藏，下次显示 DWM 又会补一段出现淡入。
+    /// 光把画面挪出去是不够的：`WS_VISIBLE` 一直亮着、窗口就是那块矩形，
+    /// 屏幕摆放一变那块地方就可能落进别人的可见区，面板会自己冒出来。
+    /// 所以最后一步一律 `SW_HIDE`（见 [`crate::windows::platform::hide_window`]）。
     ///
     /// 距离**按面板此刻的摆位现算**，不读 `anim.slide()`：关掉弹出动画时
     /// `begin_with` 会把起点归零，读它就成了「挪 0px」—— 面板逻辑上收起了、
@@ -3912,6 +4378,7 @@ impl Flyout {
             EntranceMotion::Fade => {
                 crate::windows::platform::set_opacity(window, 0.0);
                 self.rest_offset = 0.0;
+                self.apply_slide(window, 0.0);
             }
             _ => {
                 let slide = self.slide_distance(cx);
@@ -3919,6 +4386,10 @@ impl Flyout {
                 self.rest_offset = slide;
             }
         }
+        crate::windows::platform::hide_window(window);
+        // 藏好之后把 alpha 补满：淡出那一路会把窗口留在 0，
+        // 而「滑入」那一档不碰整窗 alpha —— 不补的话下次弹出是一片空白。
+        crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
     }
 
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3953,12 +4424,8 @@ impl Flyout {
         self.update_frame_parked(window, cx, false);
     }
 
-    /// 设置页改了面板外观之后调（宽度 / 高度 / 字号 / 行距 / 排版 …）。
-    ///
-    /// 页脚按钮的配置变了：面板开着就立刻重画，关着什么都不用做。
-    ///
-    /// 和 `refresh_layout` 不一样，这里**不预览** —— 改一个页脚按钮的显隐不值得
-    /// 把面板从屏幕底下拉出来；关着的时候下次弹出自然就是新的。
+    /// 页脚按钮的配置变了（放哪些、摆哪边、什么顺序）：面板开着就立刻重画，
+    /// 关着什么都不用做 —— 下次弹出自然就是新的。
     pub fn refresh_footer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
             return;
@@ -3966,18 +4433,23 @@ impl Flyout {
         self.update_frame(window, cx);
     }
 
-    /// 面板没开着就**按手动打开那套弹出来**（预览）；已经开着就跟着新尺寸重排。
+    /// 设置页改了面板外观之后调（宽度 / 高度 / 字号 / 行距 / 排版 …）。
+    /// 面板开着的：跟着新尺寸重排；关着的：**什么都不做**。
+    ///
+    /// 以前这里会在关着时 `show_preview` 把它弹出来 —— 那是「设置页改外观要看着
+    /// 效果调」的年代留下的，代价是每改一个数就蹦一块面板，还挡着设置页。
+    /// 现在一律不预览，下次真弹出时按最新配置排版。
     pub fn refresh_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
-            self.show_preview(window, cx);
             return;
         }
-        // 滑入动画还在跑：滑动线程按它自己记的终点挪窗口，这时候再 `set_frame`
-        // 两边会抢位置（看着就是抖一下）。把这一段收掉，直接一次落到位。
-        if let Some(handle) = self.slide.take() {
-            handle.cancel();
+        // 滑入动画还在跑：动画循环还按自己手上那一段在摆窗口 / 画面，这时候再
+        // `set_frame` 两边会抢（看着就是抖一下）。把这一段收掉，直接一次落到位。
+        if let Some(slide) = self.slide.take() {
+            slide.cancel();
             self.anim.finish();
             self.rest_offset = 0.0;
+            self.slide_offset = 0.0;
             // 半路收掉的要是「淡入」那一档，窗口可能停在半透明上 —— 补回满不透明。
             // （滑入那两档不能碰整窗 alpha，一碰 DWM 就补一段出现淡入。）
             if self.anim.motion() == EntranceMotion::Fade {
@@ -3987,20 +4459,16 @@ impl Flyout {
         self.update_frame(window, cx);
     }
 
-    /// 同上，`parked` = 这次落位直接落到**屏幕外**（系统风格的起点）。
+    /// 同上，`parked` = 这次落位直接落到**动画起点**（系统风格从屏幕外起步）。
     ///
-    /// 面板收起之后窗口停在屏幕外、而且**是可见的**（不隐藏就不会触发 DWM 的出现淡入）。
-    /// 如果打开时先按目标位置摆一次再挪出去，那一帧就会被合成出来 ——
-    /// 用户看到的就是「先闪一下弹出来的面板，然后才开始滑」。
-    /// 所以这里一步到位：算完目标位置，直接按起点落位。
+    /// 顺手把这一段的驱动方式定下来（挪窗还是挪画面，见 [`Self::slide_reaches_neighbor`]）。
+    /// 打开时算完目标位置、一次摆到起点 —— 中间不会有一帧「完整面板先闪一下」。
     pub fn update_frame_parked(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         parked: bool,
     ) {
-        let (width, height) = self.panel_size();
-        self.last_height = height;
         // 弹在**光标所在那台**显示器上：托盘图标在哪台任务栏上点的、快捷键时鼠标
         // 停在哪台，面板就从哪台的角落出来（多屏时不用再跑去主屏找它）。
         // 这两份几何一次认全：`area` 是工作区（摆面板用），`screen` 是整块屏
@@ -4022,30 +4490,63 @@ impl Flyout {
             screen.size.width.as_f32(),
             screen.size.height.as_f32(),
         );
+        // 工作区高度得**先量再算尺寸**：列表能放几行看它（`max_app_rows`），
+        // 顺序反过来的话第一帧会按上一块屏（或默认 1080）算，换屏时高度跳一下。
+        self.work_height = area.size.height.as_f32();
+        let (width, height) = self.panel_size();
+        self.last_height = height;
         // 面板贴任务栏所在的边，并沿垂直/水平方向对齐到屏幕右下角，
         // 与 EarTrumpet 在各任务栏位置下的表现一致。
         self.edge = crate::windows::platform::taskbar_edge();
-        const MARGIN: f32 = 12.0;
         let right = area.origin.x + area.size.width;
         let bottom = area.origin.y + area.size.height;
         let left = area.origin.x;
         let top = area.origin.y;
-        let mut origin = match self.edge {
-            crate::windows::platform::TaskbarEdge::Top => {
-                point(right - px(width) - px(MARGIN), top + px(MARGIN))
+        let cfg = self.cfg();
+        // 这一档位置要不要用：设了「只对快捷键生效」就只认快捷键那一路，
+        // 托盘点开的仍旧贴着任务栏（那儿本来就是任务栏的口子）。
+        let use_anchor = cfg.panel_anchor != crate::config::PanelAnchor::Taskbar
+            && (!cfg.panel_anchor_hotkey_only || self.from_hotkey);
+        let mut origin = if use_anchor {
+            // 屏幕九宫格 / 光标九宫格 / 指定坐标：几何全在 `panel_origin` 里算
+            // （纯函数，单测直接验）。光标位置现问一次。
+            let (x, y) = cfg.panel_origin(
+                (
+                    area.origin.x.as_f32(),
+                    area.origin.y.as_f32(),
+                    area.size.width.as_f32(),
+                    area.size.height.as_f32(),
+                ),
+                (width, height),
+                crate::platform::monitors::cursor_position(),
+            );
+            point(px(x), px(y))
+        } else {
+            match self.edge {
+                crate::windows::platform::TaskbarEdge::Top => {
+                    point(right - px(width) - px(PANEL_MARGIN), top + px(PANEL_MARGIN))
+                }
+                crate::windows::platform::TaskbarEdge::Bottom => point(
+                    right - px(width) - px(PANEL_MARGIN),
+                    bottom - px(height) - px(PANEL_MARGIN),
+                ),
+                crate::windows::platform::TaskbarEdge::Left => {
+                    point(left + px(PANEL_MARGIN), bottom - px(height) - px(PANEL_MARGIN))
+                }
+                crate::windows::platform::TaskbarEdge::Right => point(
+                    right - px(width) - px(PANEL_MARGIN),
+                    bottom - px(height) - px(PANEL_MARGIN),
+                ),
             }
-            crate::windows::platform::TaskbarEdge::Bottom => point(
-                right - px(width) - px(MARGIN),
-                bottom - px(height) - px(MARGIN),
-            ),
-            crate::windows::platform::TaskbarEdge::Left => {
-                point(left + px(MARGIN), bottom - px(height) - px(MARGIN))
-            }
-            crate::windows::platform::TaskbarEdge::Right => point(
-                right - px(width) - px(MARGIN),
-                bottom - px(height) - px(MARGIN),
-            ),
         };
+        // 滑入方向也得跟着走：原来只看任务栏在哪条边，现在面板不一定贴着任务栏了
+        // （弹在屏幕中间、或者跟着光标），就从**离它最近**的那条屏幕边滑进来。
+        if use_anchor {
+            self.edge = nearest_edge(
+                (origin.x.as_f32(), origin.y.as_f32(), width, height),
+                self.screen,
+            );
+        }
         // 亮度面板挨着面板摆的时候，音量面板得往「屏幕内侧」让出那块地方 ——
         // 但只有亮度窗要占的那一侧正好是本面板贴着的屏幕边时才需要让：
         //   任务栏在下 / 右 → 面板贴右下角，「右 / 下」外面没地方，往里让；
@@ -4053,9 +4554,13 @@ impl Flyout {
         //   任务栏在左     → 面板贴左下角，「左」外面没地方，往右让。
         // 反过来的情况（任务栏在上、亮度窗放下面）一格都不用挪：挪了反而会把它
         // 顶到工作区外面去（上半截被任务栏挡住）。
-        let cfg = self.cfg();
         // 融合模式下亮度块就长在本面板里，外面没有别的窗要占地方 —— 不用让位。
-        if cfg.brightness.enabled && !cfg.brightness.merged_with_audio() {
+        // 只有「跟着任务栏」才让位：面板贴着屏幕边时那块地方本来就没处放；
+        // 换成屏幕中间 / 光标旁边之后，亮度窗自己会贴在面板那一侧，不用挪。
+        if !use_anchor
+            && cfg.brightness.enabled
+            && !cfg.brightness.merged_with_audio()
+        {
             const GAP: f32 = 8.0;
             let displays = crate::gui::display_count(cx);
             // 亮度面板多大由它自己那套排版算，这里只负责让出这块地方。
@@ -4085,15 +4590,22 @@ impl Flyout {
             width,
             height,
         );
-        // 起点：整扇窗刚好在屏幕外（底/顶任务栏按高度，左右按宽度）。
-        let placed = if parked {
-            let (sx, sy, sw, sh) = self.screen;
-            match self.edge {
-                TaskbarEdge::Bottom => point(origin.x, px(sy + sh)),
-                TaskbarEdge::Top => point(origin.x, px(sy - height)),
-                TaskbarEdge::Left => point(px(sx - width), origin.y),
-                TaskbarEdge::Right => point(px(sx + sw), origin.y),
-            }
+        // 这一段用哪种驱动，摆完位才定得下来：起点（整块贴在屏幕外）会压到邻屏上
+        // 就挪画面，压在屏幕外的空处就照老样子挪窗 —— 后者才是以前那种观感。
+        let distance = self.slide_distance(cx);
+        self.driver = if self.slide_reaches_neighbor(cx, distance) {
+            SlideDriver::Content
+        } else {
+            SlideDriver::Window
+        };
+        // 挪窗时窗口本来就该停在起点（整块在屏幕外），一步落到位，中间不留
+        // 「在目标位置停一帧」的空档；挪画面时窗口恒定停在终位。
+        let placed = if parked && self.driver == SlideDriver::Window {
+            let (dx, dy) = slide_vector(self.edge, distance);
+            point(
+                px(origin.x.as_f32() + dx),
+                px(origin.y.as_f32() + dy),
+            )
         } else {
             origin
         };
@@ -4102,18 +4614,36 @@ impl Flyout {
             gpui::Bounds::new(placed, size(px(width), px(height))),
             window.scale_factor(),
         );
+        // 没有滑动在跑的时候一律按「已经在终位」算：`slide_offset` 只对正在演的那一段
+        // 有意义，留着旧值会把窗口挪到屏幕外（见 `start_slide` 收尾那段注释）。
+        let offset = if parked {
+            distance
+        } else if self.slide.is_some() {
+            self.slide_offset
+        } else {
+            0.0
+        };
+        self.apply_slide(window, offset);
         // 记一笔自己的位置：亮度面板要贴着这一侧摆。
         crate::gui::set_flyout_frame(cx, (origin.x.as_f32(), origin.y.as_f32(), width, height));
         // 原生窗口尺寸变了 gpui 的 viewport 缓存不一定跟着变：不显式通知，
         // 面板下半截会留在上一次的尺寸里不重绘（QcClip 在同一位置也是这么做的）。
         window.bounds_changed(cx);
+        if crate::platform::hotkey::trace_enabled() {
+            crate::platform::hotkey::trace(&format!(
+                "flyout frame {width:.0}x{height:.0} at {:.0},{:.0} parked={parked} apps={}",
+                origin.x.as_f32(),
+                origin.y.as_f32(),
+                self.visible_apps().len()
+            ));
+        }
     }
 }
 
-/// 面板摆好后要滑出多远（正数）：贴着哪条边，就从那条边滑出去。
+/// 面板摆好之后画面要平移多远才完全藏到窗外（正数）：贴着哪条边，就往那条边滑。
 ///
-/// 起点是「窗口顶边正好贴住屏幕那条边」，整块卡片完全在屏幕外。
-/// 和动画状态无关 —— 收起时现算一次，关掉弹出动画也照样能把窗口停到屏幕外。
+/// 起点是「卡片顶边正好贴住屏幕那条边」，整块卡片全在窗外。
+/// 和动画状态无关 —— 收起时现算一次，关掉弹出动画也照样能把画面藏出去。
 fn slide_distance_of(
     frame: (f32, f32, f32, f32),
     screen: (f32, f32, f32, f32),
@@ -4130,6 +4660,29 @@ fn slide_distance_of(
         TaskbarEdge::Left => (x + width - ax).max(0.0),
         TaskbarEdge::Right => (ax + aw - x).max(0.0),
     }
+}
+
+/// 离这块面板最近的那条屏幕边。
+///
+/// 「从哪条边滑进来」原来只看任务栏在哪 —— 面板弹在屏幕中间、或者跟着光标走
+/// 之后就没有任务栏这条线索了，改成按面板中心到四条边的距离取最近的。
+fn nearest_edge(frame: (f32, f32, f32, f32), screen: (f32, f32, f32, f32)) -> TaskbarEdge {
+    let (x, y, w, h) = frame;
+    let (sx, sy, sw, sh) = screen;
+    let cx = x + w * 0.5;
+    let cy = y + h * 0.5;
+    let mut best = (TaskbarEdge::Bottom, f32::MAX);
+    for (edge, distance) in [
+        (TaskbarEdge::Left, cx - sx),
+        (TaskbarEdge::Right, sx + sw - cx),
+        (TaskbarEdge::Top, cy - sy),
+        (TaskbarEdge::Bottom, sy + sh - cy),
+    ] {
+        if distance < best.1 {
+            best = (edge, distance);
+        }
+    }
+    best.0
 }
 
 impl Render for Flyout {
@@ -4238,7 +4791,7 @@ impl Render for Flyout {
             None
         };
 
-        // 尺寸永远是「完整那一份」：三档动画都是整扇窗在屏幕上滑（或者原地淡），
+        // 尺寸永远是「完整那一份」：三档动画都是整块平移（或者原地淡），
         // 内容一帧都不裁不缩 —— 裁切会多一层容器、还要每帧重绘整块面板。
         let full_height = self.desired_height();
         let full_width = self.panel_width();
@@ -4729,11 +5282,12 @@ impl Flyout {
 mod tests {
     use super::{
         HOLD_SETTLE, MUTE_OVERRIDE_FOR, MuteNote, ReleaseNote, V_FADER_HEIGHT, V_FADER_MIN,
-        VOLUME_HOLD_FOR, note_muted, resolve_held_volume, resolve_muted, shown_muted,
-        slider_unmute, slide_distance_of, split_device_name, vertical_columns,
+        VOLUME_HOLD_FOR, app_row_limit, note_muted, resolve_held_volume, resolve_muted,
+        shown_muted, slider_unmute, slide_distance_of, split_device_name, vertical_columns,
         vertical_fader_height, vertical_panel_height, volume_readout,
     };
     use crate::config::{Config, VolumeGesture};
+    use crate::ui::theme;
 
     /// 点一下滑条（同一次手势的第一下，没有「上一次」）也要按方向解除静音。
     ///
@@ -4797,6 +5351,32 @@ mod tests {
             0.3,
             0.9
         ));
+    }
+
+    /// 列表行数上限跟着工作区高度和行高走：行高越小，一屏装得越多。
+    ///
+    /// 老版本固定 6 行 —— 用户把行高压到 25px 想多放几个应用，第 7 个照样得滚。
+    #[test]
+    fn app_row_limit_follows_screen_not_a_constant() {
+        // 1440 屏、工作区 1392、行高 25、设备块 92、融合亮度块 126：
+        // 1392 - (92 + 28 + 36 + 1 + 126 + 24) = 1085 → 43 行。
+        assert_eq!(app_row_limit(1392.0, 25.0, 92.0, 126.0), 43);
+        // 行高回到默认 44 就装得少了，但仍比老上限多。
+        assert_eq!(app_row_limit(1392.0, 44.0, 92.0, 126.0), 24);
+        // 没融合亮度块时多出来一整块空间。
+        assert_eq!(app_row_limit(1392.0, 25.0, 92.0, 0.0), 48);
+        // 设备块调高（92 → 200）就先吃掉八行空间。
+        assert_eq!(app_row_limit(1392.0, 25.0, 200.0, 0.0), 44);
+        // 还没量过工作区（第一帧）：退回老规矩 6 行，别把面板压成一条。
+        assert_eq!(app_row_limit(0.0, 25.0, 92.0, 0.0), theme::MAX_VISIBLE_APPS);
+        assert_eq!(
+            app_row_limit(f32::NAN, 25.0, 92.0, 0.0),
+            theme::MAX_VISIBLE_APPS
+        );
+        // 屏幕比固定段还矮：至少留一行，不能算出 0。
+        assert_eq!(app_row_limit(200.0, 25.0, 92.0, 0.0), 1);
+        // 行高填了 1px 这种极端值：按 8px 起算，不至于算出几百行。
+        assert!(app_row_limit(1392.0, 1.0, 92.0, 0.0) < 200);
     }
 
     #[test]

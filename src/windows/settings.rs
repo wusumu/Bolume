@@ -94,6 +94,17 @@ const FONT_MENU_HEIGHT: f32 = 320.0;
 const DEVICE_MENU_WIDTH: f32 = 300.0;
 const DEVICE_MENU_HEIGHT: f32 = 280.0;
 
+/// 「每条边调什么」那四组胶囊的 id，按 `WheelZoneEdge::index()` 排（上/下/左/右）。
+///
+/// 写成常量表是因为 `segmented()` 收 `&'static str` —— id 会进点击闭包，
+/// 循环里 `format!` 出来的临时值活不到那时候。
+const ZONE_EDGE_TARGET_IDS: [&str; 4] = [
+    "zone-edge-target-top",
+    "zone-edge-target-bottom",
+    "zone-edge-target-left",
+    "zone-edge-target-right",
+];
+
 /// 设置页：每个大功能单独一页，左栏切换。
 ///
 /// 顺序就是左栏从上到下的顺序，也是「用得多的在上面」这个顺序：
@@ -113,6 +124,8 @@ enum Page {
     /// 托盘：图标样式、右键菜单、悬浮提示。
     Tray,
     Shortcuts,
+    /// 触发：不在窗口里也能触发的入口 —— 目前是「屏幕边缘 / 指定区域滚轮」。
+    Triggers,
     Osd,
     /// 黑名单：哪些应用在前台时整个 Bolume 让路。
     Blocklist,
@@ -121,7 +134,7 @@ enum Page {
     About,
 }
 
-const PAGE_COUNT: usize = 11;
+const PAGE_COUNT: usize = 12;
 
 /// 解除静音矩阵里的一格：开关 id、当前值、点一下怎么改。
 type UnmuteCell = (&'static str, bool, fn(&mut Config));
@@ -135,6 +148,7 @@ impl Page {
         Page::Panel,
         Page::Tray,
         Page::Shortcuts,
+        Page::Triggers,
         Page::Osd,
         Page::Blocklist,
         Page::Profiles,
@@ -154,6 +168,7 @@ impl Page {
             Self::Panel => "panel",
             Self::Tray => "tray",
             Self::Shortcuts => "shortcuts",
+            Self::Triggers => "triggers",
             Self::Osd => "osd",
             Self::Blocklist => "blocklist",
             Self::Profiles => "profiles",
@@ -173,6 +188,9 @@ impl Page {
             Self::Panel => "panel",
             Self::Tray => "tray",
             Self::Shortcuts => "keyboard",
+            // 触发 = 鼠标在屏幕上做的一件事，就用一只鼠标：和「快捷键」的键盘
+            // 一眼分得开，也不会跟「面板」「托盘」那些方块图标混。
+            Self::Triggers => "mouse",
             Self::Osd => "monitor",
             Self::Blocklist => "ban",
             // 配置 = 可以拿去改的东西，一把扳手。别再拿「层叠的几条」：
@@ -191,6 +209,7 @@ impl Page {
             Self::Panel => lang.pick("面板", "Panel"),
             Self::Tray => lang.pick("托盘", "Tray"),
             Self::Shortcuts => lang.pick("快捷键", "Shortcuts"),
+            Self::Triggers => lang.pick("触发", "Triggers"),
             Self::Osd => lang.pick("屏幕提示", "On-screen"),
             Self::Blocklist => lang.pick("黑名单", "Blocklist"),
             Self::Profiles => lang.pick("配置", "Profiles"),
@@ -264,12 +283,18 @@ fn page_fields(page: Page) -> &'static [&'static str] {
             "panel_bar_thickness",
             "panel_bar_round",
             "panel_layout",
+            "panel_anchor",
+            "panel_anchor_hotkey_only",
+            "panel_slot",
+            "panel_x_percent",
+            "panel_y_percent",
             "vertical_app_names",
             "vertical_height",
             "panel_font",
             "panel_font_size",
             "panel_letter_spacing",
             "panel_line_height",
+            "panel_device_height",
             "panel_font_weight",
             "device_name_size",
             "app_icon_size",
@@ -340,6 +365,8 @@ fn page_fields(page: Page) -> &'static [&'static str] {
             "hotkey_screen_ignore_system_repeat",
             "hotkey_screen_swallow_raw",
         ],
+        // 触发目前只有滚轮热区一项；以后加「屏幕角热键」「边缘双击」都归这页。
+        Page::Triggers => &["wheel_zone"],
         Page::Osd => &["osd", "editor_bg", "editor_panel_w"],
         Page::Blocklist => &["app_block"],
         // 配置页管的是「哪一份配置」，不是某一项设置：没有可恢复的字段，
@@ -655,6 +682,134 @@ pub struct Settings {
     tray_motion_state: RefCell<Vec<crate::motion::Motion>>,
     /// 律动预览的时间起点：鼓点节奏按它算（不给 `Instant::now() - Duration`）。
     tray_motion_started: Cell<Option<std::time::Instant>>,
+    /// 触发页那块屏幕画布的实际矩形（窗口坐标），拖动时要拿它换算 0..1。
+    zone_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// 正在画布上拖什么。
+    zone_drag: Option<ZoneDrag>,
+    /// 区域模式里当前选中的是第几块（画布给描边、下面那几行跟着高亮）。
+    zone_selected: usize,
+    /// 屏幕宽高比（宽 / 高），画布按它出屏幕框；打开设置窗时量一次。
+    zone_aspect: f32,
+    /// 每台屏的名字（画布上「哪一块屏」的胶囊用），打开设置窗时量一次。
+    zone_screens: Vec<String>,
+}
+
+/// 触发页画布上正在拖的东西。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ZoneDrag {
+    /// 在边上按下了，还没决定是「点一下切换」还是「拖着改厚度」。
+    ///
+    /// `at` 是按下时的 0..1 位置：移动不足 3px 就当点击，超过才算拖动 ——
+    /// 不这么分，点一下切换边的时候总会顺手把厚度改掉一点点。
+    PressEdge { edge: u8, at: (f32, f32) },
+    /// 边缘模式：拖某条边的内缘改厚度（0 上 / 1 下 / 2 左 / 3 右）。
+    Thickness(u8),
+    /// 区域模式：整块拖着走。
+    Move {
+        /// 拖的是第几块（区域可以有好几块）。
+        index: usize,
+        /// 按下时的窗口坐标（用上一次拖动位置算增量要稳一些，见 `zone_drag_to`）。
+        start: (f32, f32),
+        /// 按下时的矩形 `(x, y, w, h)`（归一化）。
+        orig: (f32, f32, f32, f32),
+    },
+    /// 区域模式：拖角改大小（0 左上 / 1 右上 / 2 左下 / 3 右下）。
+    Resize {
+        index: usize,
+        start: (f32, f32),
+        orig: (f32, f32, f32, f32),
+        corner: u8,
+    },
+}
+
+/// 只干一件事的包装元素：把子元素原样画出来，顺便在 paint 阶段往窗口上挂
+/// 移动 / 抬起监听。
+///
+/// 为什么非得包一层：`Window::on_mouse_event` 只接受**绘制期间**追加的监听，
+/// 而画布是普通 `div` 拼出来的（render 阶段），在那儿挂会一帧一帧地叠加。
+struct ZoneDragSurface {
+    id: ElementId,
+    child: AnyElement,
+    /// (指针位置, 左键还按着没有)
+    on_move: Rc<dyn Fn(gpui::Point<Pixels>, bool, &mut App)>,
+    on_up: Rc<dyn Fn(&mut Window, &mut App)>,
+}
+
+impl IntoElement for ZoneDragSurface {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for ZoneDragSurface {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // 窗口级监听：光标在画布外也照样送进来（gpui 只把元素级事件派给
+        // 光标底下那个元素，这才是「拖出去就僵住」的根子）。
+        let on_move = self.on_move.clone();
+        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _window, cx| {
+            if phase != gpui::DispatchPhase::Bubble {
+                return;
+            }
+            on_move(
+                event.position,
+                event.pressed_button == Some(MouseButton::Left),
+                cx,
+            );
+        });
+        let on_up = self.on_up.clone();
+        window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, window, cx| {
+            if phase != gpui::DispatchPhase::Bubble {
+                return;
+            }
+            on_up(window, cx);
+        });
+
+        self.child.paint(window, cx);
+    }
 }
 
 /// 往黑名单里加一条的结果。
@@ -1284,6 +1439,8 @@ enum NumberField {
     PanelLetterSpacing,
     /// 音量面板的行高（逻辑像素，0 = 跟着字号自动算）。
     PanelLineHeight,
+    /// 音量面板顶部「播放设备」那一块的高度（逻辑像素，0 = 默认 92）。
+    DeviceRowHeight,
     /// 面板弹出动画时长（毫秒）。
     PopupAnimation,
     /// 设置窗的字号（逻辑像素，内部按十分之一像素存：`value = px × 10`）。
@@ -1315,6 +1472,16 @@ enum NumberField {
     LoudnessSmooth,
     /// 音量音效自己的响度（百分比）。
     VolumeSound,
+    /// 滚轮热区：感应带厚度（逻辑像素）。
+    ZoneThickness,
+    /// 滚轮热区：一格滚轮走多少个百分点。
+    ZoneStep,
+    /// 滚轮热区调亮度时，一格走多少个百分点（就是亮度页那个「滚轮步进」）。
+    BrightnessWheelStep,
+    /// 面板自定义位置：横向百分比。
+    PanelXPercent,
+    /// 面板自定义位置：纵向百分比。
+    PanelYPercent,
 }
 
 /// 设置页里那几格 OSD 数值（尺寸 / 圆角 / 元素大小 / 文字）对准的一直是**音量模板**：
@@ -1388,6 +1555,8 @@ impl NumberField {
             Self::AppHotkeyStep | Self::AppHotkeyStepDb => config.hotkey_app_volume_step,
             Self::BrightnessStep => config.brightness.step,
             Self::BrightnessScrollStep => config.brightness.scroll_step,
+            // 0 = 用默认的 92；填了就被夹到上限以内。
+            Self::DeviceRowHeight => config.panel_device_height.round().max(0.0) as u32,
             Self::BrightnessWidth => config.brightness.width,
             Self::BrightnessVerticalHeight => config.brightness.vertical_height,
             Self::FlyoutWidth => config.flyout_width,
@@ -1418,6 +1587,11 @@ impl NumberField {
             Self::LoudnessLevel => config.loudness.level.clamp(1, 100),
             Self::LoudnessSmooth => config.loudness.smoothness.clamp(1, 10),
             Self::VolumeSound => config.volume_sound.volume,
+            Self::ZoneThickness => config.wheel_zone.thickness,
+            Self::ZoneStep => config.wheel_zone.step_percent,
+            Self::BrightnessWheelStep => config.brightness.scroll_step,
+            Self::PanelXPercent => config.panel_x_percent.clamp(0.0, 100.0).round() as u32,
+            Self::PanelYPercent => config.panel_y_percent.clamp(0.0, 100.0).round() as u32,
         }
     }
 
@@ -1487,6 +1661,8 @@ impl NumberField {
             Self::HotkeyStepDb | Self::AppHotkeyStep | Self::AppHotkeyStepDb => (1, 100),
             Self::BrightnessStep => (1, 20),
             Self::BrightnessScrollStep => crate::config::BRIGHTNESS_SCROLL_STEP_RANGE,
+            // 0 = 默认 92，上限只是挡天文数字。
+            Self::DeviceRowHeight => (0, crate::config::PANEL_DEVICE_HEIGHT_MAX),
             Self::BrightnessWidth => crate::config::BRIGHTNESS_WIDTH_RANGE,
             Self::BrightnessVerticalHeight | Self::FlyoutVerticalHeight => {
                 crate::config::VERTICAL_HEIGHT_RANGE
@@ -1530,6 +1706,11 @@ impl NumberField {
             Self::LoudnessSmooth => (1, 10),
             // 0 就是「开了但不出声」，容易让人以为坏了，最低给 5%。
             Self::VolumeSound => (5, 100),
+            Self::ZoneThickness => crate::config::WheelZone::THICKNESS_RANGE,
+            Self::ZoneStep => crate::config::WheelZone::STEP_RANGE,
+            // 和亮度页那个「滚轮步进」是同一个字段，范围也只能是同一套。
+            Self::BrightnessWheelStep => crate::config::BRIGHTNESS_SCROLL_STEP_RANGE,
+            Self::PanelXPercent | Self::PanelYPercent => (0, 100),
             // 参考实现默认 3000ms；少于 100ms 窗口里连一块都攒不满。
 
             // 0 dB = 不提升（参考实现的行为）；+18 dB（8 倍）再往上就没意义了。
@@ -1587,6 +1768,7 @@ impl NumberField {
             Self::AppHotkeyStep | Self::AppHotkeyStepDb => config.hotkey_app_volume_step = value,
             Self::BrightnessStep => config.brightness.step = value,
             Self::BrightnessScrollStep => config.brightness.scroll_step = value,
+            Self::DeviceRowHeight => config.panel_device_height = value as f32,
             Self::BrightnessWidth => config.brightness.width = value,
             Self::BrightnessVerticalHeight => config.brightness.vertical_height = value,
             Self::FlyoutWidth => config.flyout_width = value,
@@ -1619,6 +1801,11 @@ impl NumberField {
             Self::LoudnessLevel => config.loudness.level = value.clamp(1, 100),
             Self::LoudnessSmooth => config.loudness.smoothness = value.clamp(1, 10),
             Self::VolumeSound => config.volume_sound.volume = value.clamp(5, 100),
+            Self::ZoneThickness => config.wheel_zone.thickness = value,
+            Self::ZoneStep => config.wheel_zone.step_percent = value.clamp(1, 100),
+            Self::BrightnessWheelStep => config.brightness.scroll_step = value.clamp(1, 100),
+            Self::PanelXPercent => config.panel_x_percent = value.clamp(0, 100) as f32,
+            Self::PanelYPercent => config.panel_y_percent = value.clamp(0, 100) as f32,
         }
     }
 
@@ -1716,6 +1903,14 @@ impl NumberField {
                 }
             }
             Self::PanelBarThickness => format!("{value} px"),
+            // 0 = 用默认的 92px，和行高一样写成「自动」。
+            Self::DeviceRowHeight => {
+                if value == 0 {
+                    lang.pick("自动", "Auto").to_string()
+                } else {
+                    format!("{value} px")
+                }
+            }
             Self::PanelBarRound => format!("{value}%"),
             Self::OsdWidth | Self::OsdHeight | Self::OsdCorner => format!("{value} px"),
             Self::OsdOpacity => format!("{value}%"),
@@ -1742,6 +1937,10 @@ impl NumberField {
             }
             Self::LoudnessLevel => format!("{value}%"),
             Self::LoudnessSmooth => format!("{value}"),
+            Self::ZoneThickness => format!("{value} px"),
+            Self::ZoneStep => format!("{value}%"),
+            Self::BrightnessWheelStep => format!("{value}%"),
+            Self::PanelXPercent | Self::PanelYPercent => format!("{value}%"),
         }
     }
 
@@ -1868,6 +2067,11 @@ impl NumberField {
             Self::TrayDigitOffsetX | Self::TrayDigitOffsetY => 1,
             // 响度那两个都是小整数，一档一格。
             Self::LoudnessLevel | Self::LoudnessSmooth => 1,
+            // 厚度按 2px 走：一步一像素太磨，一步四像素在 1~10 这一段又跳得太狠
+            // （薄边本来就是靠这一小段调手感的），精确值直接点数字。
+            Self::ZoneThickness => 2,
+            // 位置百分比一格 5%：从贴着右边挪到中间按几下就到，又不至于一按就飞过头。
+            Self::PanelXPercent | Self::PanelYPercent => 5,
             _ => 1,
         }
     }
@@ -1883,6 +2087,72 @@ impl NumberField {
                 | Self::TrayDigitOffsetY
         )
     }
+}
+
+/// 触发页画布用的屏幕信息：主屏宽高比 + 每台屏的名字。
+///
+/// 枚举显示器在外面是「打开设置窗」这一级的动作，不进每帧渲染：它要过一遍
+/// `EnumDisplayMonitors` + 每台读一次 DPI，每帧调会明显卡。
+fn zone_screen_info() -> (f32, Vec<String>) {
+    let list = crate::platform::monitors::monitors();
+    let main = list
+        .iter()
+        .find(|info| info.is_primary)
+        .or_else(|| list.first());
+    let aspect = main
+        .map(|info| {
+            if info.bounds.3 > 1.0 {
+                info.bounds.2 / info.bounds.3
+            } else {
+                16.0 / 9.0
+            }
+        })
+        .unwrap_or(16.0 / 9.0);
+    (aspect, list.iter().map(|info| info.name.clone()).collect())
+}
+
+/// 画布上那个屏幕框的像素尺寸（宽, 高）。
+///
+/// 按屏幕宽高比算，高度夹在 140~230 之间：带鱼屏不至于压成一条线，
+/// 竖屏也不至于把整页撑爆。
+fn zone_canvas_size(aspect: f32) -> (f32, f32) {
+    const MAX_W: f32 = 320.0;
+    let aspect = aspect.clamp(0.6, 3.6);
+    let h = (MAX_W / aspect).clamp(140.0, 230.0);
+    let w = (h * aspect).clamp(180.0, MAX_W + 24.0);
+    (w, h)
+}
+
+/// 画布上厚度的显示上限：短边的 35%，至少 24px。
+fn zone_thick_span(cw: f32, ch: f32) -> f32 {
+    (cw.min(ch) * 0.35).max(24.0)
+}
+
+/// 逻辑厚度（1..400 px）→ 画布上那条带子有多宽。
+///
+/// 两个坑都在这一个函数里：
+/// 1. 不能按真实比例画 —— 2560 宽的屏上 4px 只有 0.16%，折到 320 宽的画布上
+///    连一个像素都没有。
+/// 2. 也不能线性拉 —— 实际最常用的就是 1~60 这一段，线性拉全挤在下限上，
+///    拖半天不带变的。所以用平方根：小值拉开，大值压缩，但始终单调，
+///    拖动还是「拖到哪，数字就是多少」。
+///
+/// 下限只给 2px：画布上再薄就看不见了，但也不至于像以前那样 6px 起步 ——
+/// 那样 4~39 这一段全画成一个样，「最低 4px」看着根本不像 4px。
+fn zone_thick_px(thickness: u32, span: f32) -> f32 {
+    const FLOOR: f32 = 2.0;
+    let (low, high) = crate::config::WheelZone::THICKNESS_RANGE;
+    let t = ((thickness as f32 - low as f32) / (high as f32 - low as f32)).clamp(0.0, 1.0);
+    FLOOR + (span - FLOOR) * t.sqrt()
+}
+
+/// `zone_thick_px` 的反解：画布上离边多远 → 逻辑厚度。
+fn zone_thick_from_px(distance: f32, span: f32) -> u32 {
+    const FLOOR: f32 = 2.0;
+    let (low, high) = crate::config::WheelZone::THICKNESS_RANGE;
+    let t = ((distance - FLOOR) / (span - FLOOR)).clamp(0.0, 1.0);
+    let value = low as f32 + (high as f32 - low as f32) * t * t;
+    value.round().clamp(low as f32, high as f32) as u32
 }
 
 /// 取某一档位数（1 / 2 / 3 位）的托盘数字外观。
@@ -2274,6 +2544,7 @@ impl Settings {
         // 设置页开着的时候是「草稿模式」：改动只留内存，按「应用 / 保存」才落盘。
         // 参照点（`恢复更改` 要退回的那一份）由 `ConfigStore` 自己记。
         config.borrow_mut().begin_draft();
+        let (zone_aspect, zone_screens) = zone_screen_info();
         Self {
             config,
             config_path: config_path.into(),
@@ -2360,6 +2631,11 @@ impl Settings {
             profile_drop: None,
             profile_notice: None,
             profile_notice_seq: 0,
+            zone_bounds: Rc::new(Cell::new(None)),
+            zone_drag: None,
+            zone_selected: 0,
+            zone_aspect,
+            zone_screens,
         }
     }
 
@@ -2434,6 +2710,24 @@ impl Settings {
         let store = self.config.clone();
         move |window, cx| {
             let _ = store.borrow_mut().update(|config| apply(config));
+            refresh_ui(window, cx);
+        }
+    }
+
+    /// 跟 `bind` 一样，改完还要把「哪些系统键归我们管」推给低级钩子。
+    ///
+    /// 屏幕提示这一页的小开关同时兼任「这颗系统键拦不拦」：钩子线程不读配置，
+    /// 只存着一份位图（见 `hotkey::set_takeover`）。不推的话会出现「开关已经关了、
+    /// 按键还是被拦下来」，看着就像开关坏了。
+    fn bind_osd(
+        &self,
+        apply: impl Fn(&mut Config) + 'static,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let store = self.config.clone();
+        move |window, cx| {
+            let _ = store.borrow_mut().update(|config| apply(config));
+            let osd = store.borrow().get().osd.clone();
+            crate::platform::hotkey::set_takeover(&osd);
             refresh_ui(window, cx);
         }
     }
@@ -2743,6 +3037,17 @@ impl Settings {
         value: u32,
         on_pick: impl Fn(u32, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
+        self.segmented_shared(SharedString::from(id), options, value, on_pick)
+    }
+
+    /// 同上，但 id 是运行时拼的（区域可以有好几块，id 得带序号）。
+    fn segmented_shared(
+        &self,
+        id: SharedString,
+        options: Vec<(u32, String)>,
+        value: u32,
+        on_pick: impl Fn(u32, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
         let on_pick = Rc::new(on_pick);
         let mut group = div()
             .flex()
@@ -2760,7 +3065,7 @@ impl Settings {
             let option_value = *option_value;
             group = group.child(
                 div()
-                    .id(SharedString::from(format!("{id}-{option_value}")))
+                    .id(SharedString::from(format!("{}-{option_value}", id.as_ref())))
                     .px(px(7.))
                     .py(px(2.))
                     .rounded(px(4.))
@@ -3698,6 +4003,7 @@ impl Settings {
             NumberField::PanelFontSize
                 | NumberField::PanelLetterSpacing
                 | NumberField::PanelLineHeight
+                | NumberField::DeviceRowHeight
         ) {
             // 面板字号 / 行高直接决定面板宽高，整块要重排（亮度面板跟着挪）；
             // 字间距只影响文字宽度，但重排一次不花什么，一起刷掉。
@@ -7824,9 +8130,8 @@ impl Settings {
                     crate::gui::refresh_tray_icon(cx);
                     crate::gui::refresh_tray_menu(cx);
                     crate::gui::sync_tray_motion(cx);
-                    // 锁在屏幕上的那个预览面板要按退回后的配置重排；没开着的就别去
-                    // 预览了 —— 关设置窗时突然蹦一块面板，比不改还怪。
-                    crate::gui::refresh_flyout_size_if_visible(cx);
+                    // 还开着的面板要按退回后的配置重排；关着的那条路自己会返回。
+                    crate::gui::refresh_flyout_size(cx);
                     crate::gui::repaint_windows(cx);
                 }
                 crate::gui::release_osd_pins(cx);
@@ -9235,6 +9540,1072 @@ impl Settings {
             .into_any_element()
     }
 
+    /// 「触发」页：目前只有滚轮热区一件事。
+    fn triggers_page(
+        &self,
+        config: &Config,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let zone = &config.wheel_zone;
+
+        let master = self.toggle_row(
+            "toggle-wheel-zone",
+            lang.pick(
+                "屏幕边缘 / 指定区域滚轮调音量、亮度",
+                "Scroll at a screen edge or zone to change volume or brightness",
+            ),
+            lang.pick(
+                "光标贴在屏幕边上（或落在框出来的区域里）滚一下滚轮就调音量，也能设成亮度；全屏看片、打游戏时也够得着",
+                "Hover a screen edge (or a zone you draw) and scroll to change the volume — or the brightness, if you prefer. Works in fullscreen video and games too",
+            ),
+            zone.enabled,
+            self.bind(|config| config.wheel_zone.enabled = !config.wheel_zone.enabled),
+        );
+
+        let mut children = vec![master];
+        if zone.enabled {
+            children.push(self.wheel_zone_card(config, lang, cx));
+        }
+
+        vec![self.section(
+            lang.pick("滚轮热区", "Scroll zones"),
+            "mouse",
+            children,
+        )]
+    }
+
+    /// 滚轮热区那张卡：上面的屏幕画布 + 下面几行参数。
+    fn wheel_zone_card(&self, config: &Config, lang: Lang, cx: &mut Context<Self>) -> AnyElement {
+        use crate::config::WheelZoneMode;
+
+        let zone = &config.wheel_zone;
+        let edges_mode = zone.mode == WheelZoneMode::Edges;
+
+        // 形状：贴边 / 框一块。
+        let pick_mode = {
+            let store = self.config.clone();
+            move |value: u32, window: &mut Window, cx: &mut App| {
+                let mode = WheelZoneMode::from_index(value);
+                let _ = store
+                    .borrow_mut()
+                    .update(|config| config.wheel_zone.mode = mode);
+                refresh_ui(window, cx);
+            }
+        };
+        let mode_row = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::fs(13.))
+                    .text_color(theme::text_primary())
+                    .child(lang.pick("形状", "Shape")),
+            )
+            .child(self.segmented(
+                "zone-mode",
+                vec![
+                    (0, lang.pick("屏幕边缘", "Screen edges").to_string()),
+                    (1, lang.pick("指定区域", "Custom zone").to_string()),
+                ],
+                zone.mode.index(),
+                pick_mode,
+            ));
+
+        let canvas = self.wheel_zone_canvas(config, lang, cx);
+
+        let mut rows: Vec<AnyElement> = vec![mode_row.into_any_element(), canvas];
+
+        if edges_mode {
+            rows.push(self.zone_edge_row(lang, zone, cx));
+            rows.push(self.number_row(
+                "zone-thickness",
+                lang.pick("感应厚度", "Edge depth"),
+                lang.pick(
+                    "从屏幕边往里算多深；也可以在画布上把边往里拖",
+                    "How far in from the edge the zone reaches; you can also drag the band inward",
+                ),
+                NumberField::ZoneThickness,
+                config,
+                lang,
+                cx,
+            ));
+            if !zone.edges.any() {
+                rows.push(
+                    div()
+                        .px(px(9.))
+                        .text_size(px(10.5))
+                        .text_color(theme::danger())
+                        .child(lang.pick(
+                            "一条边都没认，滚轮不会触发 —— 在画布上点一条边",
+                            "No edge is selected, so nothing will trigger — click an edge on the canvas",
+                        ))
+                        .into_any_element(),
+                );
+            }
+        } else {
+            // 区域模式：常用摆位是给**选中那一块**用的（好几块的时候，
+            // 「把选中的这块摆成右下角」比「把唯一那块摆好」更常用）。
+            let regions = zone.regions();
+            let selected = self.zone_selected.min(regions.len().saturating_sub(1));
+            let pick_preset = {
+                let store = self.config.clone();
+                move |value: u32, window: &mut Window, cx: &mut App| {
+                    let _ = store.borrow_mut().update(|config| {
+                        let zone = &mut config.wheel_zone;
+                        let current = zone.regions().get(selected).copied().unwrap_or(
+                            crate::config::WheelZoneRegion {
+                                x: 0.68,
+                                y: 0.2,
+                                w: 0.3,
+                                h: 0.6,
+                                target: zone.target,
+                            },
+                        );
+                        let (x, y, w, h) = match value {
+                            0 => (0.0, 0.0, 1.0, 1.0),
+                            1 => (0.5, 0.0, 0.5, 1.0),
+                            2 => (0.5, 0.5, 0.5, 0.5),
+                            _ => (0.68, 0.2, 0.3, 0.6),
+                        };
+                        zone.set_region(
+                            selected,
+                            crate::config::WheelZoneRegion { x, y, w, h, ..current },
+                        );
+                    });
+                    refresh_ui(window, cx);
+                }
+            };
+            let preset_row = div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(9.))
+                .py(px(5.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(theme::fs(13.))
+                        .text_color(theme::text_primary())
+                        .child(lang.pick("常用摆位", "Presets")),
+                )
+                .child(self.segmented(
+                    "zone-preset",
+                    vec![
+                        (0, lang.pick("整屏", "Whole screen").to_string()),
+                        (1, lang.pick("右半边", "Right half").to_string()),
+                        (2, lang.pick("右下角", "Bottom right").to_string()),
+                        (3, lang.pick("右中竖条", "Right strip").to_string()),
+                    ],
+                    99,
+                    pick_preset,
+                ));
+            let (rx, ry, rw, rh) = regions
+                .get(selected)
+                .map(|region| region.rect())
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let readout = div()
+                .px(px(9.))
+                .text_size(px(10.5))
+                .text_color(theme::text_tertiary())
+                .child(format!(
+                    "{}{}：{:.0}% , {:.0}%   {:.0}% × {:.0}%",
+                    lang.pick("区域 ", "Zone "),
+                    selected + 1,
+                    rx * 100.0,
+                    ry * 100.0,
+                    rw * 100.0,
+                    rh * 100.0,
+                ));
+            rows.push(preset_row.into_any_element());
+            rows.push(readout.into_any_element());
+        }
+
+        // 调什么。
+        //
+        // 边缘模式每条边各一档（贴顶调亮度、贴底调音量这种搭配很常见），
+        // 区域模式只有一块，就还是那一行。
+        if edges_mode {
+            use crate::config::{WheelZoneEdge, WheelZoneTarget};
+            // 小标题：上面那行是「认哪几条边」，这几行是「每条边调什么」，
+            // 不标一句容易看成同一个开关的两半。
+            rows.push(
+                div()
+                    .px(px(9.))
+                    .pt(px(4.))
+                    .text_size(px(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick("每条边调什么", "What each edge changes"))
+                    .into_any_element(),
+            );
+            for edge in WheelZoneEdge::ALL {
+                let current = zone.target_of(edge);
+                let on = zone.edges.enabled(edge);
+                let pick_edge_target = {
+                    let store = self.config.clone();
+                    move |value: u32, window: &mut Window, cx: &mut App| {
+                        let target = WheelZoneTarget::from_index(value);
+                        let _ = store
+                            .borrow_mut()
+                            .update(|config| config.wheel_zone.set_target_of(edge, target));
+                        refresh_ui(window, cx);
+                    }
+                };
+                let name = match edge {
+                    WheelZoneEdge::Top => lang.pick("上边", "Top"),
+                    WheelZoneEdge::Bottom => lang.pick("下边", "Bottom"),
+                    WheelZoneEdge::Left => lang.pick("左边", "Left"),
+                    WheelZoneEdge::Right => lang.pick("右边", "Right"),
+                };
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(9.))
+                    .py(px(5.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(theme::fs(13.))
+                            // 没认的边也摆出来（先设好、点开就生效），但要灰下去，
+                            // 免得看着像「设了没反应」。
+                            .text_color(if on {
+                                theme::text_primary()
+                            } else {
+                                theme::text_tertiary()
+                            })
+                            .child(name),
+                    )
+                    .child(self.segmented(
+                        // `segmented` 要的是 `&'static str`（id 要进事件闭包），
+                        // 所以按边索引查一张常量表，别在循环里拼 format!。
+                        ZONE_EDGE_TARGET_IDS[edge.index() as usize],
+                        vec![
+                            (0, lang.pick("音量", "Volume").to_string()),
+                            (1, lang.pick("亮度", "Brightness").to_string()),
+                        ],
+                        current.index(),
+                        pick_edge_target,
+                    ));
+                rows.push(row.into_any_element());
+            }
+        } else {
+            use crate::config::{WheelZoneRegion, WheelZoneTarget};
+
+            // 每块区域一行：名字（点一下选中）+ 调什么 + 删掉。
+            let regions = zone.regions();
+            let selected = self.zone_selected.min(regions.len().saturating_sub(1));
+            rows.push(
+                div()
+                    .px(px(9.))
+                    .pt(px(4.))
+                    .text_size(px(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(lang.pick("每块区域调什么", "What each zone changes"))
+                    .into_any_element(),
+            );
+            for (index, region) in regions.iter().enumerate() {
+                let current = region.target;
+                let here = index == selected;
+                let pick_region_target = {
+                    let store = self.config.clone();
+                    move |value: u32, window: &mut Window, cx: &mut App| {
+                        let target = WheelZoneTarget::from_index(value);
+                        let _ = store.borrow_mut().update(|config| {
+                            let zone = &mut config.wheel_zone;
+                            let Some(base) = zone.regions().get(index).copied() else {
+                                return;
+                            };
+                            zone.set_region(index, WheelZoneRegion { target, ..base });
+                        });
+                        refresh_ui(window, cx);
+                    }
+                };
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(9.))
+                    .py(px(4.))
+                    .rounded(px(theme::RADIUS_ROW))
+                    .when(here, |style| style.bg(theme::muted_fill()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("zone-region-{index}")))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(theme::fs(13.))
+                            .text_color(if here {
+                                theme::text_primary()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, _, cx| {
+                                    this.zone_selected = index;
+                                    cx.notify();
+                                },
+                            ))
+                            .child(format!(
+                                "{} {}",
+                                lang.pick("区域", "Zone"),
+                                index + 1
+                            )),
+                    )
+                    .child(self.segmented_shared(
+                        SharedString::from(format!("zone-region-target-{index}")),
+                        vec![
+                            (0, lang.pick("音量", "Volume").to_string()),
+                            (1, lang.pick("亮度", "Brightness").to_string()),
+                        ],
+                        current.index(),
+                        pick_region_target,
+                    ))
+                    .child({
+                        // 只剩一块时不给删：删光了热区就等于没了，容易以为功能坏了。
+                        // 命中区给到 20×20 —— 一个「×」字形太小，不好点。
+                        let removable = regions.len() > 1;
+                        div()
+                            .id(SharedString::from(format!("zone-region-remove-{index}")))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_none()
+                            .w(px(20.))
+                            .h(px(20.))
+                            .rounded(px(4.))
+                            .when(removable, |style| {
+                                style
+                                    .cursor_pointer()
+                                    .text_color(theme::text_tertiary())
+                                    .hover(|style| {
+                                        style
+                                            .bg(theme::muted_fill())
+                                            .text_color(theme::text_primary())
+                                    })
+                            })
+                            .when(!removable, |style| style.text_color(theme::border_strong()))
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, _, cx| {
+                                    let mut removed = false;
+                                    let _ = this.config.borrow_mut().update(|config| {
+                                        removed = config.wheel_zone.remove_region(index);
+                                    });
+                                    crate::platform::hotkey::trace(&format!(
+                                        "zone remove click index={index} removed={removed}"
+                                    ));
+                                    if removed && this.zone_selected >= index {
+                                        this.zone_selected = this.zone_selected.saturating_sub(1);
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .child("×")
+                    });
+                rows.push(row.into_any_element());
+            }
+            // 想加几块就加几块：新块错开一点摆在画布中间偏左上。
+            rows.push(
+                div()
+                    .px(px(9.))
+                    .py(px(4.))
+                    .child(
+                        div()
+                            .id("zone-region-add")
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(theme::RADIUS_SMALL))
+                            .bg(theme::track())
+                            .cursor_pointer()
+                            .text_size(theme::fs(12.))
+                            .text_color(theme::text_secondary())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                let mut landed = 0;
+                                let _ = this.config.borrow_mut().update(|config| {
+                                    landed = config.wheel_zone.add_region();
+                                });
+                                this.zone_selected = landed;
+                                cx.notify();
+                            }))
+                            .child(lang.pick("+ 加一块区域", "+ Add a zone")),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        // 按住某个修饰键换成另一个目标：一块热区当两块用，屏幕边上不用再多圈一块。
+        let pick_swap = {
+            let store = self.config.clone();
+            move |value: u32, window: &mut Window, cx: &mut App| {
+                let swap = crate::config::WheelSwapKey::from_index(value);
+                let _ = store
+                    .borrow_mut()
+                    .update(|config| config.wheel_zone.swap = swap);
+                refresh_ui(window, cx);
+            }
+        };
+        let swap_row = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::fs(13.))
+                    .text_color(theme::text_primary())
+                    .child(match zone.swap {
+                        crate::config::WheelSwapKey::Off => {
+                            lang.pick("按住一个键换成另一个", "Hold a key for the other one")
+                        }
+                        _ => lang.pick("按住时换成另一个", "Hold this key for the other one"),
+                    }),
+            )
+            .child(self.segmented(
+                "zone-swap",
+                vec![
+                    (0, lang.pick("不用", "Off").to_string()),
+                    (1, "Ctrl".to_string()),
+                    (2, "Alt".to_string()),
+                    (3, "Shift".to_string()),
+                    (4, "Win".to_string()),
+                ],
+                zone.swap.index(),
+                pick_swap,
+            ));
+        rows.push(swap_row.into_any_element());
+
+        // 步进：音量、亮度各有自己的字段，只把用得着的那个摆出来。
+        // 「用不用得着」按**当前认了的边**算（四条边都设成亮度就不必再摆音量步进）；
+        // 挂着换目标的键时两个都在用，就分两行、各带名字。
+        let brightness_in_play = zone.uses(crate::config::WheelZoneTarget::Brightness)
+            || zone.swap != crate::config::WheelSwapKey::Off;
+        let volume_in_play = zone.uses(crate::config::WheelZoneTarget::Volume)
+            || zone.swap != crate::config::WheelSwapKey::Off;
+        let both = volume_in_play && brightness_in_play;
+
+        if volume_in_play {
+            rows.push(self.number_row(
+                "zone-step",
+                if both {
+                    lang.pick("音量一格步进", "Volume step")
+                } else {
+                    lang.pick("一格步进", "Step per notch")
+                },
+                lang.pick(
+                    "滚一格改变多少个百分点；贴着屏幕边滚一般想比面板里粗一些",
+                    "How many percent points one notch moves",
+                ),
+                NumberField::ZoneStep,
+                config,
+                lang,
+                cx,
+            ));
+        }
+        if brightness_in_play {
+            rows.push(self.number_row(
+                "zone-brightness-step",
+                if both {
+                    lang.pick("亮度一格步进", "Brightness step")
+                } else {
+                    lang.pick("一格步进", "Step per notch")
+                },
+                lang.pick(
+                    "和亮度页那个「滚轮步进」是同一个数，在哪儿改都算数",
+                    "The same number as the wheel step on the brightness page",
+                ),
+                NumberField::BrightnessWheelStep,
+                config,
+                lang,
+                cx,
+            ));
+        }
+        // 认哪块屏。
+        let mut monitor_options: Vec<(u32, String)> = vec![(
+            0,
+            lang.pick("全部显示器", "All monitors").to_string(),
+        )];
+        for (index, name) in self.zone_screens.iter().enumerate() {
+            monitor_options.push((
+                index as u32 + 1,
+                format!("{} {}", index + 1, name),
+            ));
+        }
+        let pick_monitor = {
+            let store = self.config.clone();
+            move |value: u32, window: &mut Window, cx: &mut App| {
+                let _ = store.borrow_mut().update(|config| {
+                    let zone = &mut config.wheel_zone;
+                    zone.all_monitors = value == 0;
+                    zone.monitor = value.saturating_sub(1);
+                });
+                refresh_ui(window, cx);
+            }
+        };
+        let monitor_row = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::fs(13.))
+                    .text_color(theme::text_primary())
+                    .child(lang.pick("在哪块屏上认", "Which monitor")),
+            )
+            .child(self.segmented(
+                "zone-monitor",
+                monitor_options,
+                if zone.all_monitors {
+                    0
+                } else {
+                    zone.monitor + 1
+                },
+                pick_monitor,
+            ));
+        rows.push(monitor_row.into_any_element());
+
+        rows.push(self.toggle_row(
+            "zone-osd",
+            lang.pick("调完弹屏幕提示", "Show the on-screen display"),
+            lang.pick(
+                "和快捷键调音量 / 亮度弹的是同一组卡片",
+                "The same cards the volume and brightness hotkeys show",
+            ),
+            zone.show_osd,
+            self.bind(|config| config.wheel_zone.show_osd = !config.wheel_zone.show_osd),
+        ));
+
+        rows.push(self.toggle_row(
+            "zone-swallow",
+            lang.pick("吞掉这次滚动", "Swallow the scroll"),
+            lang.pick(
+                "开着时底下的网页、笔记不会跟着滚；关掉就是调的同时也让它们滚",
+                "On: the page underneath does not scroll. Off: you adjust it and scroll the page too",
+            ),
+            zone.swallow,
+            self.bind(|config| config.wheel_zone.swallow = !config.wheel_zone.swallow),
+        ));
+
+        rows.push(self.toggle_row(
+            "zone-invert",
+            lang.pick("反向", "Invert direction"),
+            lang.pick(
+                "往上滚变小、往下滚变大",
+                "Scroll up to turn it down, scroll down to turn it up",
+            ),
+            zone.invert,
+            self.bind(|config| config.wheel_zone.invert = !config.wheel_zone.invert),
+        ));
+
+        rows.push(self.toggle_row(
+            "zone-horizontal",
+            lang.pick("横向滚轮也调", "Horizontal wheel too"),
+            lang.pick(
+                "滚轮左右摆（鼠标支持的话）同样能调",
+                "Tilting the wheel left / right adjusts it too, if your mouse does that",
+            ),
+            zone.horizontal,
+            self.bind(|config| config.wheel_zone.horizontal = !config.wheel_zone.horizontal),
+        ));
+
+        self.sub_group(rows)
+    }
+
+    /// 「认哪几条边」：四个小胶囊，点一下开 / 关。
+    ///
+    /// 画布上直接点也行，但四条带子在四角会挤在一起，点角落容易落到邻居上；
+    /// 这一行是给「我就要左边」这种确定操作准备的。
+    fn zone_edge_row(
+        &self,
+        lang: Lang,
+        zone: &crate::config::WheelZone,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let labels = [
+            (0u8, lang.pick("上", "Top"), zone.edges.top),
+            (1, lang.pick("下", "Bottom"), zone.edges.bottom),
+            (2, lang.pick("左", "Left"), zone.edges.left),
+            (3, lang.pick("右", "Right"), zone.edges.right),
+        ];
+        let mut group = div().flex().gap(px(4.));
+        for (edge, label, on) in labels {
+            let store = self.config.clone();
+            group = group.child(
+                div()
+                    .id(SharedString::from(format!("zone-edge-{edge}")))
+                    .px(px(11.))
+                    .py(px(4.))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .text_size(theme::fs(11.))
+                    .cursor_pointer()
+                    .when(on, |style| {
+                        style
+                            .bg(theme::accent_soft())
+                            .text_color(theme::text_primary())
+                    })
+                    .when(!on, |style| {
+                        style
+                            .bg(theme::track())
+                            .text_color(theme::text_secondary())
+                            .hover(|style| style.bg(theme::surface_hover()))
+                    })
+                    .child(label)
+                    .on_click(
+                        cx.listener(move |_this, _: &gpui::ClickEvent, window, cx| {
+                            let _ = store.borrow_mut().update(|config| {
+                                let edges = &mut config.wheel_zone.edges;
+                                match edge {
+                                    0 => edges.top = !edges.top,
+                                    1 => edges.bottom = !edges.bottom,
+                                    2 => edges.left = !edges.left,
+                                    _ => edges.right = !edges.right,
+                                }
+                            });
+                            refresh_ui(window, cx);
+                        }),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(9.))
+            .py(px(5.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::fs(13.))
+                    .text_color(theme::text_primary())
+                    .child(lang.pick("认哪几条边", "Which edges")),
+            )
+            .child(group)
+            .into_any_element()
+    }
+
+    /// 触发页那块「屏幕」：贴边 / 区域都在这里画、也在这里拖。
+    fn wheel_zone_canvas(
+        &self,
+        config: &Config,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::config::WheelZoneMode;
+
+        let zone = config.wheel_zone.clone();
+        let (cw, ch) = zone_canvas_size(self.zone_aspect);
+        // 厚度不按真实比例画：2560 宽的屏上 24px 只有 0.9%，折到 320 宽的画布上
+        // 才 3px，看不出「这条边开着」。映射见 `zone_thick_px`，拖动时内缘
+        // 跟手走 —— 拖到哪，数字就是多少。
+        let thick_span = zone_thick_span(cw, ch);
+        let thick = zone_thick_px(zone.thickness, thick_span).clamp(2.0, thick_span);
+        let bounds = self.zone_bounds.clone();
+
+        let mut screen = div()
+            .id("zone-screen")
+            .relative()
+            .w(px(cw))
+            .h(px(ch))
+            .flex_none()
+            .rounded(px(theme::RADIUS_SMALL))
+            .bg(theme::surface_sunken())
+            .border_1()
+            .border_color(theme::border_strong())
+            .overflow_hidden()
+            .child(Self::measure_only_canvas(bounds));
+
+        match zone.mode {
+            WheelZoneMode::Edges => {
+                // 四条带子：位置、大小、横竖（决定光标形状）。
+                // 上下两条让出左右两角：四角重叠时按绘制顺序会被「右」全吃掉，
+                // 用户点右上角想开「上」，结果亮的是「右」。
+                let bands: [(u8, bool, f32, f32, f32, f32, bool); 4] = [
+                    (0, zone.edges.top, thick, 0.0, cw - thick * 2.0, thick, true),
+                    (
+                        1,
+                        zone.edges.bottom,
+                        thick,
+                        ch - thick,
+                        cw - thick * 2.0,
+                        thick,
+                        true,
+                    ),
+                    (2, zone.edges.left, 0.0, 0.0, thick, ch, false),
+                    (3, zone.edges.right, cw - thick, 0.0, thick, ch, false),
+                ];
+                for (edge, on, x, y, w, h, horizontal) in bands {
+                    // 内缘那条细线：贴边本身和画布底一个色系，没有这条线就看不出
+                    // 「感应到哪儿为止」。启用时用强调色，没启用时用边框色。
+                    let mut inner = div().absolute().bg(if on {
+                        theme::accent()
+                    } else {
+                        theme::border_strong()
+                    });
+                    inner = match edge {
+                        0 => inner.left_0().bottom_0().w_full().h(px(1.5)),
+                        1 => inner.left_0().top_0().w_full().h(px(1.5)),
+                        2 => inner.top_0().right_0().h_full().w(px(1.5)),
+                        _ => inner.top_0().left_0().h_full().w(px(1.5)),
+                    };
+                    screen = screen.child(
+                        div()
+                            .id(SharedString::from(format!("zone-band-{edge}")))
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .w(px(w))
+                            .h(px(h))
+                            .when(on, |style| style.bg(theme::accent_soft()))
+                            // 没启用也用 `muted_fill`：和画布底同色的 `track` 会让人
+                            // 以为那里没有东西可点。
+                            .when(!on, |style| style.bg(theme::muted_fill()))
+                            .child(inner)
+                            .cursor(if horizontal {
+                                gpui::CursorStyle::ResizeUpDown
+                            } else {
+                                gpui::CursorStyle::ResizeLeftRight
+                            })
+                            // 只管「按下」：后面的移动 / 抬起由窗口级监听接
+                            // （`zone_drag_surface`）—— 鼠标拖出画布也收得到。
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                    let at = this.zone_pointer(event.position);
+                                    this.zone_drag = Some(ZoneDrag::PressEdge { edge, at });
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                }
+            }
+            WheelZoneMode::Rect => {
+                let regions = zone.regions();
+                let selected = self.zone_selected.min(regions.len().saturating_sub(1));
+                for (index, region) in regions.iter().enumerate() {
+                    let (rx, ry, rw, rh) = region.rect();
+                    let (left, top, width, height) = (rx * cw, ry * ch, rw * cw, rh * ch);
+                    let is_selected = index == selected;
+                    screen = screen.child(
+                        div()
+                            .id(SharedString::from(format!("zone-rect-{index}")))
+                            .absolute()
+                            .left(px(left))
+                            .top(px(top))
+                            .w(px(width))
+                            .h(px(height))
+                            .rounded(px(3.))
+                            .when(is_selected, |style| style.bg(theme::accent_soft()))
+                            .when(!is_selected, |style| style.bg(theme::muted_fill()))
+                            .border_1()
+                            .border_color(if is_selected {
+                                theme::accent()
+                            } else {
+                                theme::border_strong()
+                            })
+                            .cursor(gpui::CursorStyle::OpenHand)
+                            // 按下这一下同时是「选中它」：好几块的时候先点谁就是谁。
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                    let start = this.zone_pointer(event.position);
+                                    this.zone_selected = index;
+                                    this.zone_drag = Some(ZoneDrag::Move {
+                                        index,
+                                        start,
+                                        orig: (rx, ry, rw, rh),
+                                    });
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                    // 四角只画在选中那块上：好几块都画角的话，分不清拖的是谁的。
+                    if !is_selected {
+                        continue;
+                    }
+                    let corners = [
+                        (0u8, left, top),
+                        (1, left + width, top),
+                        (2, left, top + height),
+                        (3, left + width, top + height),
+                    ];
+                    for (corner, corner_x, corner_y) in corners {
+                        screen = screen.child(
+                            div()
+                                .id(SharedString::from(format!("zone-corner-{corner}")))
+                                .absolute()
+                                .left(px(corner_x - 5.0))
+                                .top(px(corner_y - 5.0))
+                                .w(px(10.))
+                                .h(px(10.))
+                                .rounded(px(2.))
+                                .bg(theme::accent())
+                                .border_1()
+                                .border_color(theme::surface_elevated())
+                                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                            let start = this.zone_pointer(event.position);
+                                            this.zone_selected = index;
+                                            this.zone_drag = Some(ZoneDrag::Resize {
+                                                index,
+                                                start,
+                                                orig: (rx, ry, rw, rh),
+                                                corner,
+                                            });
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        },
+                                    ),
+                                ),
+                        );
+                    }
+                }
+            }
+        }
+
+        let hint = if zone.mode == WheelZoneMode::Edges {
+            lang.pick(
+                "点一下边＝启用 / 关掉，往里拖＝改厚度",
+                "Click an edge to toggle it, drag inward to change its depth",
+            )
+        } else {
+            lang.pick(
+                "拖方框移动、拖四角改大小；点一下选中，下面可以再加几块",
+                "Drag a box to move it, drag a corner to resize; click to select, add more below",
+            )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(6.))
+            .py(px(8.))
+            .child(Self::zone_drag_surface(screen, cx))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(theme::text_tertiary())
+                    .child(hint),
+            )
+            .into_any_element()
+    }
+
+    /// 窗口坐标 → 画布上的 0..1 位置。
+    fn zone_pointer(&self, position: gpui::Point<Pixels>) -> (f32, f32) {
+        let (cw, ch) = zone_canvas_size(self.zone_aspect);
+        match self.zone_bounds.get() {
+            // **不夹 0..1**：拖动时鼠标会跑到画布外，夹了就等于「指针一到边上，
+            // 方框立刻贴死墙面、再往外挪多少都不动」—— 松回来看起来像粘住了。
+            // 夹是落点自己该管的事（`WheelZoneRegion::clamped`），不是指针该管的。
+            Some(bounds) => (
+                (position.x - bounds.origin.x).as_f32() / cw,
+                (position.y - bounds.origin.y).as_f32() / ch,
+            ),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// 画布上按住不放时：够 3px 才算拖（不然「点一下切换边」永远触发不了）。
+    ///
+    /// `pressed` 是这一发移动里左键还按着没有。窗口外松手收不到抬起事件，
+    /// 只能等鼠标回到窗口里、下一发 move 带着「没按键」时再收尾。
+    fn zone_drag_to(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        pressed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.zone_drag else {
+            return;
+        };
+        if !pressed {
+            self.zone_drag = None;
+            cx.notify();
+            return;
+        }
+        let (nx, ny) = self.zone_pointer(position);
+        let (cw, ch) = zone_canvas_size(self.zone_aspect);
+
+        match drag {
+            ZoneDrag::PressEdge { edge, at } => {
+                let dx = (nx - at.0) * cw;
+                let dy = (ny - at.1) * ch;
+                if (dx * dx + dy * dy).sqrt() < 3.0 {
+                    return;
+                }
+                self.zone_drag = Some(ZoneDrag::Thickness(edge));
+                self.zone_apply_thickness(edge, nx, ny, cx);
+            }
+            ZoneDrag::Thickness(edge) => self.zone_apply_thickness(edge, nx, ny, cx),
+            ZoneDrag::Move { index, start, orig } => {
+                let (x, y, w, h) = orig;
+                let next_x = (x + (nx - start.0)).clamp(0.0, 1.0 - w);
+                let next_y = (y + (ny - start.1)).clamp(0.0, 1.0 - h);
+                let _ = self.config.borrow_mut().update(|config| {
+                    config.wheel_zone.set_region(
+                        index,
+                        crate::config::WheelZoneRegion {
+                            x: next_x,
+                            y: next_y,
+                            w,
+                            h,
+                            // 位置跟目标无关，读回来那块的就行。
+                            target: config.wheel_zone.regions()[index].target,
+                        },
+                    );
+                });
+                cx.notify();
+            }
+            ZoneDrag::Resize {
+                index,
+                start,
+                orig,
+                corner,
+            } => {
+                let (ox, oy, ow, oh) = orig;
+                let dx = nx - start.0;
+                let dy = ny - start.1;
+                let min = crate::config::WheelZone::MIN_RECT;
+                let mut x = ox;
+                let mut y = oy;
+                let mut w = ow;
+                let mut h = oh;
+                match corner {
+                    // 左上：右下角钉住。
+                    0 => {
+                        x = (ox + dx).clamp(0.0, ox + ow - min);
+                        y = (oy + dy).clamp(0.0, oy + oh - min);
+                        w = ox + ow - x;
+                        h = oy + oh - y;
+                    }
+                    // 右上：左下角钉住。
+                    1 => {
+                        y = (oy + dy).clamp(0.0, oy + oh - min);
+                        w = (ow + dx).clamp(min, 1.0 - ox);
+                        h = oy + oh - y;
+                    }
+                    // 左下：右上角钉住。
+                    2 => {
+                        x = (ox + dx).clamp(0.0, ox + ow - min);
+                        w = ox + ow - x;
+                        h = (oh + dy).clamp(min, 1.0 - oy);
+                    }
+                    // 右下：左上角钉住。
+                    _ => {
+                        w = (ow + dx).clamp(min, 1.0 - ox);
+                        h = (oh + dy).clamp(min, 1.0 - oy);
+                    }
+                }
+                let _ = self.config.borrow_mut().update(|config| {
+                    config.wheel_zone.set_region(
+                        index,
+                        crate::config::WheelZoneRegion {
+                            x,
+                            y,
+                            w,
+                            h,
+                            target: config.wheel_zone.regions()[index].target,
+                        },
+                    );
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// 拖某条边的内缘：离那条边多远就是多厚（换回逻辑像素存）。
+    fn zone_apply_thickness(
+        &mut self,
+        edge: u8,
+        nx: f32,
+        ny: f32,
+        cx: &mut Context<Self>,
+    ) {
+        // 画布上「内缘离边多远」按同一套映射换算回逻辑像素，拖动时带子跟着鼠标走。
+        let (cw, ch) = zone_canvas_size(self.zone_aspect);
+        let thick_span = zone_thick_span(cw, ch);
+        let distance = match edge {
+            0 => ny * ch,
+            1 => (1.0 - ny) * ch,
+            2 => nx * cw,
+            _ => (1.0 - nx) * cw,
+        };
+        let thickness = zone_thick_from_px(distance, thick_span);
+        let _ = self
+            .config
+            .borrow_mut()
+            .update(|config| config.wheel_zone.thickness = thickness);
+        cx.notify();
+    }
+
+    /// 画布上松手：没拖动过就是「切换这条边」，拖动过就只收尾。
+    fn zone_drag_end(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ZoneDrag::PressEdge { edge, .. }) = self.zone_drag {
+            let _ = self.config.borrow_mut().update(|config| {
+                let edges = &mut config.wheel_zone.edges;
+                match edge {
+                    0 => edges.top = !edges.top,
+                    1 => edges.bottom = !edges.bottom,
+                    2 => edges.left = !edges.left,
+                    _ => edges.right = !edges.right,
+                }
+            });
+            cx.notify();
+        }
+        self.zone_drag = None;
+        cx.notify();
+    }
+
+    /// 画布外面包一层：把移动 / 抬起挂到**窗口级**。
+    ///
+    /// gpui 只把 move / up 派给光标底下那个元素：鼠标一离开画布（更别说离开窗口），
+    /// 画布和它的角就都收不到了 —— 拖动僵在原地，松手也结束不了，再回来还是
+    /// 「正在改大小」。项目里 slider / scrollbar 也是一个路子：paint 阶段挂窗口监听，
+    /// gpui 每帧清一次，所以不会越挂越多。
+    fn zone_drag_surface(screen: impl IntoElement, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let move_entity = entity.clone();
+        let up_entity = entity;
+        ZoneDragSurface {
+            id: ElementId::Name("zone-surface".into()),
+            child: screen.into_any_element(),
+            on_move: Rc::new(move |position, pressed, cx| {
+                let _ = move_entity.update(cx, |this, cx| {
+                    this.zone_drag_to(position, pressed, cx);
+                });
+            }),
+            on_up: Rc::new(move |window, cx| {
+                let _ = up_entity.update(cx, |this, cx| {
+                    this.zone_drag_end(window, cx);
+                });
+            }),
+        }
+        .into_any_element()
+    }
+
     fn shortcuts_page(
         &self,
         config: &Config,
@@ -9934,7 +11305,7 @@ impl Settings {
             cx,
         ));
 
-        // 生效范围：三种手势并排，一行放下。
+        // 生效范围：四种手势并排，一行放下。
         let scope = |id: &'static str, label: &'static str, value: bool, toggle: fn(&mut Config)| {
             let store = self.config.clone();
             self.tick_chip(
@@ -9979,6 +11350,14 @@ impl Settings {
                 lang.pick("拖拽", "Drag"),
                 sound.on_drag,
                 |config| config.volume_sound.on_drag = !config.volume_sound.on_drag,
+            ))
+            // 热区单列：贴着屏幕边滚是「随手一直滚」的用法，一分钟几十下，
+            // 想让它安静就得有自己的一格，不能跟托盘滚轮捆在一起。
+            .child(scope(
+                "volume-sound-zone",
+                lang.pick("滚轮热区", "Zone"),
+                sound.on_zone,
+                |config| config.volume_sound.on_zone = !config.volume_sound.on_zone,
             ))
             .into_any_element();
         rows.push(scope_row);
@@ -10813,11 +12192,11 @@ impl Settings {
             "osd-enabled",
             lang.pick("启用屏幕提示", "Enable the on-screen display"),
             lang.pick(
-                "调音量、静音、切歌时在屏幕上闪一下",
-                "Flash a small card when volume, mute or playback changes",
+                "调音量、静音、切歌时闪一下卡片；同时接管键盘上的音量 / 媒体键（不再弹 Windows 自带那条）。关掉就把这些键全部交回系统。",
+                "Flash a card on volume, mute or track changes — and take over the volume and media keys so Windows' own flyout stays away. Turn it off to hand those keys back.",
             ),
             cfg.enabled,
-            self.bind(|config| config.osd.enabled = !config.osd.enabled),
+            self.bind_osd(|config| config.osd.enabled = !config.osd.enabled),
         );
 
         let preview = self.osd_preview(config, lang, cx);
@@ -11005,37 +12384,25 @@ impl Settings {
             },
         );
 
-        // 接管系统媒体键：没配快捷键时也弹提示。
-        let takeover = self.toggle_row(
-            "osd-takeover-media",
-            lang.pick("接管系统媒体键", "Take over media keys"),
-            lang.pick(
-                "没配快捷键时，按上一曲 / 下一曲 / 播放暂停 / 停止也弹提示，键照常转发给播放器。音量与静音键不接管。",
-                "Show the card for prev / next / play-pause / stop even without a shortcut; the key is still forwarded. Volume and mute keys are left alone.",
-            ),
-            config.osd.takeover_media_keys,
-            self.bind(|config| {
-                config.osd.takeover_media_keys = !config.osd.takeover_media_keys;
-                crate::platform::hotkey::set_takeover_media(config.osd.takeover_media_keys);
-            }),
-        );
-
         // 六种操作各一行：本来每种都占两行（标题 + 描述），六项就是半页，
         // 描述也大半重复。现在压成一行一条，提示缩成后面那串小字。
+        //
+        // 这些小开关同时也是「这颗系统键拦不拦」的判据：开着才接管，关掉就把键
+        // 还回系统（见 `hotkey::set_takeover`），所以要走 `bind_osd`。
         let function_toggles: Vec<AnyElement> = vec![
             self.compact_toggle_row(
                 "osd-fn-volume",
                 OsdFunction::Volume.label(lang),
                 lang.pick("音量键 / 托盘滚轮", "Volume keys / tray scroll"),
                 config.osd.volume,
-                self.bind(|config| config.osd.volume = !config.osd.volume),
+                self.bind_osd(|config| config.osd.volume = !config.osd.volume),
             ),
             self.compact_toggle_row(
                 "osd-fn-mute",
                 OsdFunction::Mute.label(lang),
                 lang.pick("静音键", "Mute key"),
                 config.osd.mute,
-                self.bind(|config| config.osd.mute = !config.osd.mute),
+                self.bind_osd(|config| config.osd.mute = !config.osd.mute),
             ),
             self.compact_toggle_row(
                 "osd-fn-brightness",
@@ -11049,28 +12416,28 @@ impl Settings {
                 OsdFunction::PrevTrack.label(lang),
                 lang.pick("媒体键", "Media key"),
                 config.osd.prev_track,
-                self.bind(|config| config.osd.prev_track = !config.osd.prev_track),
+                self.bind_osd(|config| config.osd.prev_track = !config.osd.prev_track),
             ),
             self.compact_toggle_row(
                 "osd-fn-play",
                 OsdFunction::PlayPause.label(lang),
                 lang.pick("媒体键", "Media key"),
                 config.osd.play_pause,
-                self.bind(|config| config.osd.play_pause = !config.osd.play_pause),
+                self.bind_osd(|config| config.osd.play_pause = !config.osd.play_pause),
             ),
             self.compact_toggle_row(
                 "osd-fn-next",
                 OsdFunction::NextTrack.label(lang),
                 lang.pick("媒体键", "Media key"),
                 config.osd.next_track,
-                self.bind(|config| config.osd.next_track = !config.osd.next_track),
+                self.bind_osd(|config| config.osd.next_track = !config.osd.next_track),
             ),
             self.compact_toggle_row(
                 "osd-fn-stop",
                 OsdFunction::Stop.label(lang),
                 lang.pick("媒体键", "Media key"),
                 config.osd.stop,
-                self.bind(|config| config.osd.stop = !config.osd.stop),
+                self.bind_osd(|config| config.osd.stop = !config.osd.stop),
             ),
         ];
 
@@ -11252,7 +12619,7 @@ impl Settings {
             self.section(
                 lang.pick("显示内容", "Content"),
                 "info",
-                vec![takeover, self.sub_group(function_toggles)],
+                vec![self.sub_group(function_toggles)],
             ),
             self.section(
                 lang.pick("应用过滤", "App filter"),
@@ -11274,8 +12641,8 @@ impl Settings {
                 .text_size(theme::fs(10.5))
                 .text_color(theme::text_tertiary())
                 .child(lang.pick(
-                    "提示条不会抢焦点：全屏游戏和视频上照样能弹，游戏也不会被切到后台。\n关掉「静音」这一项时，静音键交回系统处理（会出现 Windows 自带的音量提示）。",
-                    "The card never takes focus, so it can appear over fullscreen games without pulling them out of the foreground.\nWith Mute switched off, the mute key goes back to Windows and its own volume flyout appears.",
+                    "提示条不会抢焦点：全屏游戏和视频上照样能弹，游戏也不会被切到后台。\n上面每一项都管两件事：弹不弹卡片，以及那颗系统键拦不拦。关掉哪一项，对应的键就交回系统处理（比如关掉「静音」，静音键会出现 Windows 自带那条）。",
+                    "The card never takes focus, so it can appear over fullscreen games without pulling them out of the foreground.\nEach switch above does two jobs: whether to show the card, and whether to take the key over. Turn one off and its key goes back to Windows (e.g. with Mute off, its own volume flyout appears).",
                 ))
                 .into_any_element(),
         ]
@@ -13190,6 +14557,18 @@ impl Settings {
             lang,
             cx,
         );
+        let panel_device_height = self.number_row(
+            "panel-device-height",
+            lang.pick("播放设备高度", "Device block height"),
+            lang.pick(
+                "面板顶部「播放设备」那一块的高度（像素）；0 = 默认 92",
+                "Height of the device block at the top of the panel (px); 0 = default 92",
+            ),
+            NumberField::DeviceRowHeight,
+            config,
+            lang,
+            cx,
+        );
         let panel_font_weight = {
             let store = self.config.clone();
             let weight_options = Self::weight_options(lang);
@@ -13212,6 +14591,136 @@ impl Settings {
             )
         };
 
+        // 呼出位置：以前只有「贴任务栏」一种，现在快捷键呼出也能摆到别处。
+        let anchor_row = {
+            let store = self.config.clone();
+            let options: &'static [(u32, &'static str)] = if lang.is_en() {
+                &[(0, "Taskbar"), (1, "Screen"), (2, "Cursor"), (3, "Custom")]
+            } else {
+                &[(0, "任务栏"), (1, "屏幕"), (2, "光标"), (3, "自定义")]
+            };
+            self.choice_row(
+                "panel-anchor",
+                lang.pick("呼出位置", "Where it appears"),
+                lang.pick(
+                    "「任务栏」是原来那样贴着任务栏那头；「屏幕」按九宫格摆（中间就是屏幕中心）；「光标」以鼠标为准；「自定义」直接填百分比",
+                    "Taskbar keeps the original corner spot; Screen and Cursor use a 3×3 grid (the middle cell is the screen centre); Custom takes percentages",
+                ),
+                options,
+                config.panel_anchor.index(),
+                move |value, window, cx| {
+                    let anchor = crate::config::PanelAnchor::from_index(value);
+                    let _ = store
+                        .borrow_mut()
+                        .update(|config| config.panel_anchor = anchor);
+                    refresh_ui(window, cx);
+                },
+            )
+        };
+
+        // 这套位置只管快捷键那一路：托盘点开的面板本来就该从任务栏出来。
+        let anchor_hotkey_only = self.toggle_row(
+            "panel-anchor-hotkey-only",
+            lang.pick("只对快捷键呼出生效", "Only when opened by hotkey"),
+            lang.pick(
+                "开着时从托盘点开仍旧贴着任务栏；关掉的话托盘点开也按这里的位置摆",
+                "On: clicking the tray icon still opens it at the taskbar corner. Off: the tray uses this position too",
+            ),
+            config.panel_anchor_hotkey_only,
+            self.bind(|config| {
+                config.panel_anchor_hotkey_only = !config.panel_anchor_hotkey_only
+            }),
+        );
+
+        // 九宫格：点哪格面板就摆哪（屏幕档 = 屏幕上的位置，光标档 = 相对鼠标的方向）。
+        let slot_row = {
+            let store = self.config.clone();
+            let current = config.panel_slot;
+            let mut grid = div().flex().flex_col().gap(px(3.));
+            for row in 0..3u32 {
+                let mut line = div().flex().gap(px(3.));
+                for col in 0..3u32 {
+                    let slot = crate::config::PanelSlot::from_index(row * 3 + col);
+                    let on = slot == current;
+                    let store = store.clone();
+                    line = line.child(
+                        div()
+                            .id(SharedString::from(format!("panel-slot-{row}-{col}")))
+                            .w(px(26.))
+                            .h(px(15.))
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .when(on, |style| {
+                                style
+                                    .bg(theme::accent_soft())
+                                    .border_1()
+                                    .border_color(theme::accent())
+                            })
+                            .when(!on, |style| {
+                                style
+                                    .bg(theme::track())
+                                    .hover(|style| style.bg(theme::surface_hover()))
+                            })
+                            .on_click(cx.listener(move |_this, _: &gpui::ClickEvent, window, cx| {
+                                let _ = store
+                                    .borrow_mut()
+                                    .update(|config| config.panel_slot = slot);
+                                refresh_ui(window, cx);
+                            })),
+                    );
+                }
+                grid = grid.child(line);
+            }
+            let label = if config.panel_anchor == crate::config::PanelAnchor::Cursor {
+                lang.pick("从鼠标往哪边", "Direction from the cursor")
+            } else {
+                lang.pick("摆在屏幕哪块", "Where on the screen")
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(9.))
+                .py(px(5.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(theme::fs(13.))
+                        .text_color(theme::text_primary())
+                        .child(label),
+                )
+                .child(grid)
+                .into_any_element()
+        };
+
+        // 自定义位置：百分比按「面板还能挪多远」摊开 —— 0 是贴左/贴顶，
+        // 100 是贴右/贴底，50 正好居中。不是按屏幕宽度算的（那样 50 会偏右）。
+        let custom_x = self.number_row(
+            "panel-x-percent",
+            lang.pick("横向位置", "Horizontal"),
+            lang.pick(
+                "面板左右位置；0 贴左边、100 贴右边、50 居中",
+                "Panel's horizontal position; 0 flush left, 100 flush right, 50 centred",
+            ),
+            NumberField::PanelXPercent,
+            config,
+            lang,
+            cx,
+        );
+        let custom_y = self.number_row(
+            "panel-y-percent",
+            lang.pick("纵向位置", "Vertical"),
+            lang.pick(
+                "面板上下位置；0 贴顶、100 贴底、50 居中",
+                "Panel's vertical position; 0 flush top, 100 flush bottom, 50 centred",
+            ),
+            NumberField::PanelYPercent,
+            config,
+            lang,
+            cx,
+        );
+
         // 面板紧跟在「界面」后面：它也是「整个面板长什么样」这一类，
         // 中间隔着一整串托盘设置的话，找宽度 / 特效要往下翻很久。
         let panel_section = self.section(lang.pick("面板", "Panel"), "monitor", {
@@ -13224,10 +14733,24 @@ impl Settings {
                 rows.push(panel_width);
                 // 行高挨着宽度：都是「这一块占多大」。竖排是一列一列摆的，没有行高这回事。
                 rows.push(panel_line_height);
+                // 设备块单独一格高度：想给「播放设备 + 音量条」更多空间就往上调。
+                rows.push(panel_device_height);
             }
             // 条的粗细 / 圆角两种排版都有（横排是横条、竖排是立起来的推子），一律摆上。
             rows.push(bar_thickness);
             rows.push(bar_round);
+            // 呼出位置：贴着任务栏 / 屏幕九宫格 / 光标九宫格 / 指定坐标。
+            rows.push(anchor_row);
+            if config.panel_anchor != crate::config::PanelAnchor::Taskbar {
+                rows.push(anchor_hotkey_only);
+            }
+            if config.panel_anchor.uses_slot() {
+                rows.push(slot_row);
+            }
+            if config.panel_anchor == crate::config::PanelAnchor::Custom {
+                rows.push(custom_x);
+                rows.push(custom_y);
+            }
             // 字体那几项紧跟布局：改字号时宽度 / 高度会自动跟着变，摆在一起好对照。
             rows.push(panel_font);
             rows.push(panel_font_size);
@@ -18273,6 +19796,8 @@ impl Settings {
     ) {
         let touches = |page: Page| scope.is_none_or(|only| only == page);
         crate::platform::hotkey::apply_config(config);
+        // 滚轮热区：钩子线程不读配置，几何得在这儿按新配置重铺一遍。
+        crate::gui::refresh_wheel_zones(config);
         crate::gui::apply_theme_extras(config);
         crate::gui::refresh_tray_icon(cx);
         crate::gui::refresh_tray_menu(cx);
@@ -18282,9 +19807,8 @@ impl Settings {
         crate::platform::app_icon::set_style(config.app_icon_style);
         crate::windows::platform::refresh_app_icons();
         crate::gui::refresh_volume_cap(cx);
-        // 只在面板开着时重排：这里是一次换掉一整页（甚至整份），按「调宽度」那条走
-        // 会把面板预览出来 —— 点一下恢复菜单就蹦一块面板，用户不知道哪来的。
-        crate::gui::refresh_flyout_size_if_visible(cx);
+        // 只在面板开着时重排：这里是一次换掉一整页（甚至整份），关着就等下次弹出。
+        crate::gui::refresh_flyout_size(cx);
         crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
         if touches(Page::Volume) {
             crate::gui::refresh_loudness(cx);
@@ -18929,6 +20453,7 @@ impl Settings {
             Page::Panel => self.panel_page(config, lang, snapshot, cx),
             Page::Tray => self.tray_page(config, lang, snapshot, cx),
             Page::Shortcuts => self.shortcuts_page(config, lang, cx),
+            Page::Triggers => self.triggers_page(config, lang, cx),
             Page::Osd => self.osd_page(config, lang, cx),
             Page::Blocklist => self.blocklist_page(config, lang, cx),
             Page::Profiles => self.profiles_page(lang, cx),

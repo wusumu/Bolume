@@ -908,6 +908,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn tab_bar_visible(&self) -> bool {
         false
     }
+    /// 把整块画面平移 `(x, y)`（逻辑像素，正数向右/向下），窗口本身不动。
+    ///
+    /// 只有能直接操作合成器的后端才做得到（Windows 的 DirectComposition）。
+    /// 默认空实现：拿不到合成器时宁可不动，也不要用「挪窗口」冒充。
+    fn set_content_offset(&self, _x: f32, _y: f32) {}
     fn set_edited(&mut self, _edited: bool) {}
     fn set_document_path(&self, _path: Option<&std::path::Path>) {}
     #[cfg(target_os = "macos")]

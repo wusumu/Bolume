@@ -75,6 +75,7 @@ icon_assets!(
     "dialog",
     "tray",
     "menu",
+    "mouse",
 );
 
 pub struct Assets;

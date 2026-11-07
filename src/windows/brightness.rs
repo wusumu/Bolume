@@ -156,18 +156,34 @@ fn metrics(cfg: &Config) -> Metrics {
     }
 }
 
+/// 「没有可调显示器」那条提示占多高：上下各 8 的内边距 + 两行字（11px / 10px）
+/// 加中间 4px 的缝。
+const EMPTY_HINT_HEIGHT: f32 = 50.0;
+
 /// 横排：每台显示器一块（名称行 + 亮度条），最底下一排共用的预设。
+///
+/// 高度按内容逐项累加。**融合进音量面板时不设下限**：那个 `.max(80)` 地板是给
+/// 独立窗口兜「太矮不好看」的，长在面板里却会变成一条空带 —— 面板行高压到 35
+/// 时一台显示器只要 57px，硬抬到 80 就白留 23px（用户报的「显示器调节下面
+/// 一大片空白」就是这么来的，他的配置正好是行高 35 + 一台可调显示器）。
 fn horizontal_height(cfg: &Config, displays: usize, embedded: bool) -> f32 {
     let m = metrics(cfg);
-    let count = displays.max(1) as f32;
-    let block = m.name_row + ROW_GAP + m.slider_row;
-    // 多台之间还夹一条 1px 分隔线，上下各 BLOCK_GAP。
-    let separators = (count - 1.0).max(0.0);
-    (chrome_height(embedded, false)
-        + count * block
-        + separators * (BLOCK_GAP * 2.0 + 1.0)
-        + preset_bar_extra(cfg, displays))
-    .max(80.0)
+    let body = if displays == 0 {
+        // 一台能调的都没有：画的是 `empty_hint` 那两行提示，高度照提示算。
+        // 以前一律按 `max(1)` 台算，提示只有两行字，下面照样空出一块。
+        EMPTY_HINT_HEIGHT
+    } else {
+        let count = displays as f32;
+        let block = m.name_row + ROW_GAP + m.slider_row;
+        // 多台之间还夹一条 1px 分隔线，上下各 BLOCK_GAP。
+        count * block + (count - 1.0) * (BLOCK_GAP * 2.0 + 1.0)
+    };
+    let height = chrome_height(embedded, false) + body + preset_bar_extra(cfg, displays);
+    if embedded {
+        height
+    } else {
+        height.max(80.0)
+    }
 }
 
 /// 竖排：一台显示器一列，宽 = 内边距 + 若干列。
@@ -944,13 +960,19 @@ impl Brightness {
                     break;
                 }
             }
-            let _ = view.update(cx, |this, cx| {
+            // `update_in`：收尾这一步要拿到窗口，才能真把它藏起来。
+            let _ = view.update_in(cx, |this, window, cx| {
                 if this.slide.as_ref().map(|now| now.same_run(&handle)) != Some(true) {
                     return;
                 }
                 this.slide = None;
                 this.anim.finish();
                 this.rest_offset = if mode == SlideMode::Exit { end } else { 0.0 };
+                // 收起动画播完：真藏起来，别只停在屏幕外（换一次显示器摆放就露馅）。
+                if mode == SlideMode::Exit && !this.visible {
+                    crate::windows::platform::hide_window(window);
+                    crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
+                }
                 cx.notify();
             });
         })
@@ -1080,10 +1102,12 @@ impl Brightness {
         self.start_slide(window, cx, run);
     }
 
-    /// 把窗口停到屏幕外并压成全透明（不隐藏）。
+    /// 把窗口停到屏幕外并压成全透明，**然后真隐藏**。
     ///
     /// 距离现算，不读 `anim.slide()`：关掉弹出动画时它是 0，读它等于「挪 0px」，
     /// 窗口会留在屏幕上（音量面板那边同一个坑）。
+    /// 「屏幕外 + 全透明」只是看不见，窗口还带着一块固定坐标：显示器摆放一变
+    /// 就可能落进真实屏幕里，所以最后一定要 `SW_HIDE`。
     fn park_window(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.anim.motion() == EntranceMotion::Fade {
             crate::windows::platform::set_opacity(window, 0.0);
@@ -1093,6 +1117,9 @@ impl Brightness {
             self.apply_slide(window, slide);
             self.rest_offset = slide;
         }
+        crate::windows::platform::hide_window(window);
+        // 藏好之后把 alpha 补满（淡出这一路会停在 0，而滑入那一档不碰整窗 alpha）。
+        crate::windows::platform::set_opacity(window, crate::ui::theme::ui_opacity());
     }
 
     pub fn update_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2258,8 +2285,43 @@ fn measure_text(text: &str, size: f32, window: &mut Window) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_GAP, CHIP_HEIGHT, HEADER_HEIGHT, panel_size, strip_model};
+    use super::{
+        BLOCK_GAP, CHIP_HEIGHT, EMPTY_HINT_HEIGHT, HEADER_HEIGHT, horizontal_height, panel_size,
+        strip_model,
+    };
     use crate::config::{Config, PanelLayout};
+
+    /// 融合进音量面板时高度要贴着内容，不能留空带。
+    ///
+    /// 用户报的「显示器调节下面一大片空白」：面板行高 35（`metrics` 缩到 0.7 倍）、
+    /// 只有一台可调显示器，内容只要 57px，可 `.max(80)` 那个地板把它抬到 80 ——
+    /// 多出来的 23px 在 300px 宽的面板里就是一条明显的白带。
+    #[test]
+    fn embedded_height_hugs_the_content() {
+        let mut config = Config::default();
+        config.panel_line_height = 35.0;
+        config.flyout_width = 300;
+        config.brightness.presets.clear();
+
+        // 一台：上下内边距 28 + (名称行 14 + 缝 1 + 亮度条 14) = 57。
+        assert_eq!(horizontal_height(&config, 1, true), 57.0);
+        // 两台之间还要夹一条分隔线（上下各 BLOCK_GAP + 1px）。
+        assert_eq!(
+            horizontal_height(&config, 2, true),
+            57.0 + 29.0 + BLOCK_GAP * 2.0 + 1.0
+        );
+        // 独立窗口保留 80 的地板（那是给窗户外框看的），融合档不受它影响。
+        // 独立窗口还多一条标题栏（HEADER_HEIGHT + 分隔线），所以是 86 而不是 57。
+        assert_eq!(
+            horizontal_height(&config, 1, false),
+            28.0 + HEADER_HEIGHT + 1.0 + 29.0
+        );
+        // 一台能调的都没有：按提示那两行算，不再假装有一台显示器。
+        assert_eq!(
+            horizontal_height(&config, 0, true),
+            28.0 + EMPTY_HINT_HEIGHT
+        );
+    }
 
     #[test]
     fn vertical_panel_is_sized_by_the_display_count() {

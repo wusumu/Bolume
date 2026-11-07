@@ -85,19 +85,51 @@ pub fn handle_of(index: u32) -> Option<isize> {
 /// 用 `MonitorFromPoint(MONITOR_DEFAULTTONEAREST)` 而不是自己拿光标坐标去比矩形：
 /// 各屏 DPI 不同，坐标已经是逻辑像素，自己比会算错边界；系统比的是物理坐标，最准。
 pub fn index_at_cursor() -> Option<u32> {
+    let monitor = handle_at_cursor()?;
+    monitors()
+        .iter()
+        .position(|info| info.handle == monitor)
+        .map(|index| index as u32 + 1)
+}
+
+/// 光标此刻的位置（**逻辑像素**，和 `MonitorInfo.bounds` 一个坐标系）。
+///
+/// `GetCursorPos` 给的是物理像素，这里按光标所在那台屏的 DPI 换算一次 ——
+/// 面板摆位用的是 gpui 的逻辑坐标，不换算的话 125% 缩放下会偏出去一截。
+pub fn cursor_position() -> Option<(f32, f32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    let mut cursor = POINT::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor) }.ok()?;
+    let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
+    let mut dpi_x = 96u32;
+    let mut dpi_y = 96u32;
+    if !monitor.is_invalid() {
+        let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    }
+    let scale = ((dpi_x.max(48) as f32) / 96.0).min(8.0);
+    Some((
+        cursor.x as f32 / scale,
+        cursor.y as f32 / scale,
+    ))
+}
+
+/// 光标底下那台显示器的 `HMONITOR`（取不到返回 `None`）。
+///
+/// 亮度那边要拿它去和 `DisplayInfo::handle` 对号 —— 光标的屏幕只有按句柄认才
+/// 不会调错屏，序号在两条枚举链路上排得不一样。
+pub fn handle_at_cursor() -> Option<isize> {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
 
     let mut cursor = POINT::default();
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor) }.ok()?;
     let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
-    if monitor.is_invalid() {
-        return None;
-    }
-    monitors()
-        .iter()
-        .position(|info| info.handle == monitor.0 as isize)
-        .map(|index| index as u32 + 1)
+    (!monitor.is_invalid()).then_some(monitor.0 as isize)
 }
 
 /// 全部显示器，按左上角从先到后排序。
@@ -118,6 +150,59 @@ pub fn monitors() -> Vec<MonitorInfo> {
             )
     });
     list
+}
+
+/// 显示器排布的轻量指纹：台数 + 每台的逻辑矩形 + 缩放比。
+///
+/// 只走 `EnumDisplayMonitors` + `GetMonitorInfoW` + `GetDpiForMonitor`，
+/// **不碰**名字 / EDID / 活动路径 —— `monitors()` 那几个查询碰上 DDC 分析器
+/// 能拖到几十毫秒，不能放进巡检里。
+///
+/// 用途：滚轮热区的几何是**快照**（钩子线程不读配置），插拔屏、改分辨率、
+/// 改缩放都得重铺。这里只回答「排布变没变」，变了再走一次完整的
+/// `gui::refresh_wheel_zones`。
+pub fn geometry_signature() -> Vec<(i32, i32, i32, i32, i32)> {
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let out = unsafe { &mut *(data.0 as *mut Vec<(i32, i32, i32, i32, i32)>) };
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return BOOL(1);
+        }
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+        let scale = ((dpi_x.max(48) as f32) / 96.0).min(8.0);
+        let screen = info.rcMonitor;
+        out.push((
+            (screen.left as f32 / scale).round() as i32,
+            (screen.top as f32 / scale).round() as i32,
+            ((screen.right - screen.left) as f32 / scale).round() as i32,
+            ((screen.bottom - screen.top) as f32 / scale).round() as i32,
+            (scale * 1000.0).round() as i32,
+        ));
+        BOOL(1)
+    }
+
+    let mut out = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut out as *mut Vec<(i32, i32, i32, i32, i32)> as isize),
+        );
+    }
+    // 枚举顺序不保证稳定，排一下再比。
+    out.sort_unstable();
+    out
 }
 
 /// 每台屏的完整信息（含 `HMONITOR` 和型号），按 `EnumDisplayMonitors` 的

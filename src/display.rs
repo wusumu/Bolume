@@ -256,6 +256,11 @@ pub struct DisplayInfo {
     /// 这台开着 HDR。开着的时候 DDC/CI 的亮度照写不误，可画面被系统的色调映射
     /// 吃掉了 —— 界面上一律标出来，并且不给调。
     pub hdr: bool,
+    /// 这条通道属于哪块屏（`HMONITOR`）。
+    ///
+    /// 「光标底下那块屏」只能按它认：`key` 里那个序号来自枚举顺序，和设置页 /
+    /// 亮度面板里排过的顺序不是一回事，拿序号去猜会调错屏。
+    pub handle: isize,
 }
 
 impl DisplayInfo {
@@ -349,6 +354,7 @@ impl Entry {
             name: self.name.clone(),
             brightness: self.readable.then(|| percent_of(self.raw, self.max)),
             hdr: self.hdr,
+            handle: self.handle,
         }
     }
 

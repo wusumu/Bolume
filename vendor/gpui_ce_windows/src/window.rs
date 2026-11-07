@@ -693,6 +693,18 @@ impl PlatformWindow for WindowsWindow {
         self.state.bounds()
     }
 
+    /// 画面整体平移（合成器层，不重绘、不动窗口）。
+    ///
+    /// 滑动动画用它：窗口留在自己那块屏里，画面在窗口内走，界外由窗口裁掉。
+    /// 以前是挪窗口 —— 多屏时「屏幕外」是邻屏的真实像素，整段动画都会在
+    /// 旁边那块屏上播一遍。
+    fn set_content_offset(&self, x: f32, y: f32) {
+        #[cfg(not(feature = "wgpu"))]
+        self.state.renderer.borrow().set_content_offset(x, y);
+        #[cfg(feature = "wgpu")]
+        let _ = (x, y);
+    }
+
     fn is_maximized(&self) -> bool {
         self.state.is_maximized()
     }

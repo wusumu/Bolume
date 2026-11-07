@@ -16,14 +16,14 @@ use std::{
     io::Write,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering},
     },
 };
 
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-        System::LibraryLoader::GetModuleHandleW,
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey, VIRTUAL_KEY,
@@ -32,16 +32,16 @@ use windows::{
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
                 HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PostMessageW,
-                RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
-                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-                WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+                PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
+                UnhookWindowsHookEx, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+                WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
             },
         },
     },
     core::w,
 };
 
-use crate::config::{AppBlockConfig, Config, Hotkey, HotkeySlots};
+use crate::config::{AppBlockConfig, Config, Hotkey, HotkeySlots, OsdConfig, OsdFunction};
 
 /// 修饰符位：与 `RegisterHotKey` 的 MOD_* 数值一致，直接存进配置。
 pub const MOD_ALT: u32 = 0x0001;
@@ -102,8 +102,10 @@ static SINK: AtomicIsize = AtomicIsize::new(0);
 static SENDER: OnceLock<async_channel::Sender<Hotkey>> = OnceLock::new();
 /// 正在录制快捷键：钩子把媒体键也送回来。
 static CAPTURING: AtomicBool = AtomicBool::new(false);
-/// 低级键盘钩子句柄（0 = 没装上）。进程退出前一直有效。
+/// 低级键盘钩子句柄（0 = 没装上）。被系统摘掉时看门狗会重装。
 static HOOK: AtomicIsize = AtomicIsize::new(0);
+/// 叫醒钩子线程去重装钩子的线程消息（`WM_APP + 8`，和鼠标钩子的 `+7` 错开）。
+const WAKE_HOOK: u32 = WM_APP + 8;
 /// 「按住连续触发」开着，而且用户没勾「理会系统的长按重复」：系统补出来的重复
 /// 一律不理会，重复节奏完全由我们自己掌握。
 ///
@@ -243,6 +245,16 @@ pub fn trace(text: &str) {
     {
         let _ = writeln!(file, "{stamp:.3} {text}");
     }
+}
+
+/// 调试日志开着没有（热区滚轮那种每发都打的地方先问一句，别白拼字符串）。
+pub fn trace_enabled() -> bool {
+    trace_path().is_some()
+}
+
+/// 前台进程名（小写、带 `.exe`），调试日志里用来分辨「被谁的窗口挡了」。
+pub fn foreground_name() -> String {
+    crate::platform::fullscreen::foreground_process_name()
 }
 
 impl Action {
@@ -574,22 +586,63 @@ unsafe fn run_message_loop() -> windows::core::Result<()> {
     SINK.store(hwnd.0 as isize, Ordering::SeqCst);
 
     // 低级键盘钩子：媒体键只能这样收。装在本线程，随消息循环派发。
-    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) } {
+    let mut hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) } {
         Ok(hook) => {
             HOOK.store(hook.0 as isize, Ordering::SeqCst);
             trace(&format!("hook installed handle=0x{:X}", hook.0 as isize));
+            Some(hook)
         }
         Err(error) => {
             trace(&format!("hook install FAILED {error:?}"));
             eprintln!("媒体键钩子安装失败，媒体键快捷键不可用：{error}");
+            None
         }
-    }
+    };
+
+    // 看门狗：和鼠标钩子同一个理由 —— 低级钩子回调超过系统的
+    // `LowLevelHooksTimeout`（默认 300ms）会被 Windows **悄悄摘掉**，而且摘了
+    // 不会告诉你。键盘钩子这一摘，媒体键 / 音量键就全部「失效」：键没被吞，
+    // 系统自己处理（音量条照弹），靠 `RegisterHotKey` 绑的组合却还好使 ——
+    // 表现就是「有绑快捷键的正常，没绑的不灵，重启程序又好了」。
+    // 每 5 秒叫醒本线程重装一次：活着等于换了张新票（顺带排到钩子链最前，
+    // 别的程序装了钩子也挡不住），被摘了自动回来。
+    let thread_id = unsafe { GetCurrentThreadId() };
+    std::thread::Builder::new()
+        .name("bolume-key-hook-watch".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if unsafe { PostThreadMessageW(thread_id, WAKE_HOOK, WPARAM(0), LPARAM(0)) }.is_err() {
+                // 队列满 / 线程没了：这一轮跳过，别把看门狗自己弄死。
+                continue;
+            }
+        })
+        .ok();
 
     // 窗口建好之前调用方可能已经写过期望表，先应用一次。
     unsafe { apply_desired(hwnd) };
 
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+        if message.message == WAKE_HOOK {
+            // 先卸再装：句柄可能早就被系统摘了，Unhook 失败无所谓，重装能恢复。
+            if let Some(old) = hook.take() {
+                unsafe {
+                    let _ = UnhookWindowsHookEx(old);
+                }
+                HOOK.store(0, Ordering::SeqCst);
+            }
+            match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) } {
+                Ok(fresh) => {
+                    hook = Some(fresh);
+                    HOOK.store(fresh.0 as isize, Ordering::SeqCst);
+                }
+                Err(error) => {
+                    // 装不上就空转这一轮，5 秒后再试；别把旧句柄留着当挂在链上。
+                    trace(&format!("key hook rearm failed: {error:?}"));
+                }
+            }
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -685,7 +738,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     // 这一发命中的是哪个动作（没绑定就是空）。两项「按页签」的设置都靠它分辨：
     // 音频页和屏幕页各存一份，钩子里只拿得到键码。
     let binding = binding_action(mods, key);
-    let action = binding.or_else(|| media_action(key));
+    // 没绑定快捷键的裸媒体键 / 音量键，动作由这颗键本身决定（发送指令、弹卡片）。
+    let action = binding
+        .or_else(|| media_action(key))
+        .or_else(|| volume_action(key));
     let system_repeat = already_down && ignore_system_repeat_for(action);
 
     // 普通键（字母 / F 键那一类）平时根本不归钩子管。只有开着「按下时不发送
@@ -757,14 +813,20 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         send_hotkey(hotkey);
         return LRESULT(1);
     }
-    // 没配这个键，但开着「接管媒体键」：一样送给主线程，
-    // 由它弹 OSD 再把键转发给播放器。带修饰键的不算（那是用户的组合键）。
-    if mods == 0 && takeover_media() && media_action(key).is_some() {
-        if swallow_system_repeat(already_down, media_action(key)) {
-            return LRESULT(1);
+    // 没配这个键：系统媒体键 / 音量键按「屏幕提示」里对应那一项决定拦不拦。
+    // 拦下来之后一样送给主线程 —— 音量它自己动手改再弹卡片，媒体键弹完卡片
+    // 把键转发给播放器。那一项关着就原样还给系统（Windows 自带那条照旧出现）。
+    // 带修饰键的不算（那是用户的组合键）。
+    if mods == 0 {
+        if let Some(unbound) = media_action(key).or_else(|| volume_action(key)) {
+            if takeover(unbound) {
+                if swallow_system_repeat(already_down, Some(unbound)) {
+                    return LRESULT(1);
+                }
+                send_hotkey(hotkey);
+                return LRESULT(1);
+            }
         }
-        send_hotkey(hotkey);
-        return LRESULT(1);
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
@@ -980,20 +1042,55 @@ fn key_identity(info: &KBDLLHOOKSTRUCT) -> Option<u32> {
     })
 }
 
-/// 「接管媒体键」：没配快捷键的系统媒体键也由我们处理。
+/// 没配快捷键的系统媒体键 / 音量键要不要由我们接管：**只看「屏幕提示」里对应那一项**。
 ///
-/// 典型场景：用户没给「下一曲」配快捷键，按键盘上的媒体键时系统自己处理，
-/// Bolume 根本看不到，于是不弹 OSD。开了这个开关就把这四个键也拦下来，
-/// 弹一条提示后再原样转发给播放器。
-static TAKEOVER_MEDIA: AtomicBool = AtomicBool::new(false);
+/// 以前这里是两套闸门：「接管系统媒体键」管四个媒体键，`osd.volume` / `osd.mute`
+/// 管另外两颗。结果自相矛盾 —— 接管开关关着，按音量键照样被拦下来（因为「音量」
+/// 那一项开着），用户看到的就是「没开开关也给接管了」。
+///
+/// 其实这两件事在用户眼里是同一件事：弹不弹我们这张卡。所以并成一套 ——
+/// 提示开着才拦，提示关掉就把键原样还回系统（Windows 自带那条照旧出现）。
+///
+/// 位下标 = [`OsdFunction::ALL`] 里的位置。
+static TAKEOVER: AtomicU32 = AtomicU32::new(0);
 
-/// 开关「接管媒体键」（配置变更时由 `apply_config` 同步）。
-pub fn set_takeover_media(on: bool) {
-    TAKEOVER_MEDIA.store(on, Ordering::SeqCst);
+/// 同步「哪些系统键归我们管」（`apply_config` 与设置页开关时调用）。
+pub fn set_takeover(osd: &OsdConfig) {
+    let mut mask = 0u32;
+    for (index, function) in OsdFunction::ALL.iter().enumerate() {
+        if osd.shows(*function) {
+            mask |= 1 << index;
+        }
+    }
+    TAKEOVER.store(mask, Ordering::SeqCst);
+    trace(&format!(
+        "takeover enabled={} mask=0x{mask:02X}",
+        osd.enabled
+    ));
 }
 
-fn takeover_media() -> bool {
-    TAKEOVER_MEDIA.load(Ordering::SeqCst)
+/// 这个动作对应「屏幕提示」里的哪一项；不是系统媒体 / 音量键就是 `None`。
+fn osd_function_of(action: Action) -> Option<OsdFunction> {
+    match action {
+        Action::VolumeUp | Action::VolumeDown => Some(OsdFunction::Volume),
+        Action::MediaMute => Some(OsdFunction::Mute),
+        Action::MediaPrev => Some(OsdFunction::PrevTrack),
+        Action::MediaNext => Some(OsdFunction::NextTrack),
+        Action::MediaPlayPause => Some(OsdFunction::PlayPause),
+        Action::MediaStop => Some(OsdFunction::Stop),
+        _ => None,
+    }
+}
+
+/// 这颗键归不归我们管：只有「它的提示此刻会弹」才拦。
+fn takeover(action: Action) -> bool {
+    let Some(function) = osd_function_of(action) else {
+        return false;
+    };
+    let Some(index) = OsdFunction::ALL.iter().position(|item| *item == function) else {
+        return false;
+    };
+    TAKEOVER.load(Ordering::SeqCst) & (1 << index) != 0
 }
 
 /// 音量 / 静音键对应的动作。
@@ -1163,7 +1260,9 @@ pub fn apply(bindings: &[(Action, usize, Hotkey)]) {
 
 /// 按当前配置注册全部快捷键（每个动作最多三组）。
 pub fn apply_config(config: &Config) {
-    set_takeover_media(config.osd.takeover_media_keys);
+    // 系统媒体键 / 音量键拦不拦，跟着「屏幕提示」里每个功能自己那一项走 ——
+    // 和「启用屏幕提示」是同一个开关，没有第二套闸门。
+    set_takeover(&config.osd);
     // 只有「按住连续触发」开着的时候才谈得上「忽略系统的长按重复」：关掉连发时
     // 我们自己是不会补的，再把系统那一路也关掉，按住音量键就彻底不动了。
     // 两个页签各一份，各自受自己那个总闸管。
@@ -1493,12 +1592,54 @@ mod tests {
 
     /// 音量键 → 动作的映射（「禁用 Windows 音量条」用它兜底）。
     #[test]
-    fn volume_keys_map_to_actions() {        assert_eq!(volume_action(VK_VOLUME_UP), Some(Action::VolumeUp));
+    fn volume_keys_map_to_actions() {
+        assert_eq!(volume_action(VK_VOLUME_UP), Some(Action::VolumeUp));
         assert_eq!(volume_action(VK_VOLUME_DOWN), Some(Action::VolumeDown));
         assert_eq!(volume_action(VK_VOLUME_MUTE), Some(Action::MediaMute));
         // 别的键不归它管，免得把媒体键也当成音量。
         assert_eq!(volume_action(VK_MEDIA_NEXT_TRACK), None);
         assert_eq!(volume_action(0x41), None);
+    }
+
+    /// 拦不拦这颗系统键，只看「屏幕提示」里对应那一项 —— 没有第二套开关。
+    #[test]
+    fn takeover_follows_osd_switches() {
+        let mut osd = OsdConfig::default();
+        set_takeover(&osd);
+        for action in [
+            Action::VolumeUp,
+            Action::VolumeDown,
+            Action::MediaMute,
+            Action::MediaPrev,
+            Action::MediaNext,
+            Action::MediaPlayPause,
+            Action::MediaStop,
+        ] {
+            assert!(takeover(action), "默认全开时 {action:?} 该被接管");
+        }
+        // 不是系统媒体 / 音量键的动作永远不归这条路管。
+        assert!(!takeover(Action::Flyout));
+        assert!(!takeover(Action::BrightnessUp));
+
+        // 总开关关掉：一颗都不拦，原样还给系统。
+        osd.enabled = false;
+        set_takeover(&osd);
+        assert!(!takeover(Action::VolumeUp));
+        assert!(!takeover(Action::MediaPlayPause));
+
+        // 总开关开着、只关「静音」：只放过静音键，别的照旧。
+        let mut osd = OsdConfig::default();
+        osd.mute = false;
+        set_takeover(&osd);
+        assert!(!takeover(Action::MediaMute));
+        assert!(takeover(Action::VolumeUp));
+        assert!(takeover(Action::MediaNext));
+
+        // 测完把位图恢复成「全关」，免得影响同一进程里别的用例。
+        set_takeover(&OsdConfig {
+            enabled: false,
+            ..OsdConfig::default()
+        });
     }
 
     #[test]

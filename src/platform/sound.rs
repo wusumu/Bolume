@@ -932,7 +932,7 @@ mod tests {
         }
     }
 
-    /// 三种手势各自看自己的勾，总开关关掉一律不响。
+    /// 四种手势各自看自己的勾，总开关关掉一律不响。
     #[test]
     fn scope_follows_the_ticks() {
         let mut sound = VolumeSoundConfig {
@@ -940,6 +940,7 @@ mod tests {
             on_hotkey: true,
             on_wheel: false,
             on_drag: false,
+            on_zone: false,
             ..Default::default()
         };
         assert!(sound.covers(VolumeGesture::Hotkey));
@@ -947,8 +948,11 @@ mod tests {
         assert!(!sound.covers(VolumeGesture::TrayScroll));
         assert!(!sound.covers(VolumeGesture::AppHoverScroll));
         assert!(!sound.covers(VolumeGesture::Drag));
+        assert!(!sound.covers(VolumeGesture::ZoneScroll));
         sound.on_drag = true;
         assert!(sound.covers(VolumeGesture::AppDrag));
+        sound.on_zone = true;
+        assert!(sound.covers(VolumeGesture::ZoneScroll));
         sound.enabled = false;
         assert!(!sound.covers(VolumeGesture::Hotkey));
     }

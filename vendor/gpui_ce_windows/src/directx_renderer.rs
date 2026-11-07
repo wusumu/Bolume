@@ -441,6 +441,13 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// 整块画面平移（DIP）。窗口不动，超出的部分由窗口裁掉。
+    pub(crate) fn set_content_offset(&self, x: f32, y: f32) {
+        if let Some(composition) = self.direct_composition.as_ref() {
+            let _ = composition.set_content_offset(x, y);
+        }
+    }
+
     pub(crate) fn draw(
         &mut self,
         scene: &Scene,
@@ -1470,6 +1477,20 @@ impl DirectComposition {
         unsafe {
             self.comp_visual.SetContent(swap_chain)?;
             self.comp_target.SetRoot(&self.comp_visual)?;
+            self.comp_device.Commit()?;
+        }
+        Ok(())
+    }
+
+    /// 把整块画面平移 `(x, y)`（DIP，正数向右/向下）。
+    ///
+    /// 走合成器，不重绘：窗口的位置和尺寸一点都不动，只有画面在窗口里挪。
+    /// 挪出窗口的那部分会被 HWND 的合成目标裁掉 —— 正是"画面从屏幕边滑进来、
+    /// 屏幕外的那截看不见"想要的语义（窗口本身不跨屏，多屏也不会画到邻屏上）。
+    pub fn set_content_offset(&self, x: f32, y: f32) -> Result<()> {
+        unsafe {
+            self.comp_visual.SetOffsetX2(x)?;
+            self.comp_visual.SetOffsetY2(y)?;
             self.comp_device.Commit()?;
         }
         Ok(())

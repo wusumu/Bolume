@@ -294,6 +294,11 @@ pub struct VolumeSoundConfig {
     pub on_wheel: bool,
     /// 拖滑条（主音量 / 应用音量 / 屏幕提示里那根）也响。
     pub on_drag: bool,
+    /// 屏幕边缘 / 指定区域的滚轮热区也响。
+    ///
+    /// 和「滚轮」分开勾：热区是「贴着屏幕边随手滚」的用法，一分钟能响几十下，
+    /// 想要托盘那一下却嫌贴边太吵的人，得有地方把它单独关掉。
+    pub on_zone: bool,
 }
 
 impl Default for VolumeSoundConfig {
@@ -308,6 +313,7 @@ impl Default for VolumeSoundConfig {
             on_hotkey: true,
             on_wheel: true,
             on_drag: true,
+            on_zone: true,
         }
     }
 }
@@ -324,6 +330,7 @@ impl VolumeSoundConfig {
             | VolumeGesture::TrayScroll
             | VolumeGesture::AppHoverScroll => self.on_wheel,
             VolumeGesture::Drag | VolumeGesture::AppDrag => self.on_drag,
+            VolumeGesture::ZoneScroll => self.on_zone,
         }
     }
 
@@ -446,6 +453,11 @@ pub enum VolumeGesture {
     AppDrag,
     /// 快捷键调「当前应用」的音量。
     AppHotkey,
+    /// 屏幕边缘 / 指定区域的滚轮热区。
+    ///
+    /// 和 `TrayScroll` 分开：音效的「生效范围」要给热区单独一格，
+    /// 但解除静音仍沿用托盘那一格（用户眼里都是「拿滚轮调音量」）。
+    ZoneScroll,
 }
 
 impl UnmuteOnChange {
@@ -469,6 +481,10 @@ impl UnmuteOnChange {
             (VolumeGesture::AppDrag, false) => self.decrease_app_drag,
             (VolumeGesture::AppHotkey, true) => self.increase_app_hotkey,
             (VolumeGesture::AppHotkey, false) => self.decrease_app_hotkey,
+            // 热区滚轮沿用「托盘滚轮」那一格：用户眼里都是拿滚轮调音量，
+            // 没必要在解除静音的矩阵里再分一栏。
+            (VolumeGesture::ZoneScroll, true) => self.increase_tray,
+            (VolumeGesture::ZoneScroll, false) => self.decrease_tray,
         }
     }
 }
@@ -1782,6 +1798,506 @@ impl TrayDigitMetrics {
 /// 再大就不是「微调」了：16px 的图标一共才这么宽，挪 8px 数字已经贴到边上。
 pub const TRAY_DIGIT_OFFSET_RANGE: (i32, i32) = (-8, 8);
 
+/// 滚轮热区的形状：贴屏幕边，还是自己框一块矩形。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WheelZoneMode {
+    /// 屏幕四边各算一条带子，厚度统一。
+    #[default]
+    Edges,
+    /// 屏幕上自己框出来的一块矩形（相对整块屏的 0..1 坐标）。
+    Rect,
+}
+
+impl WheelZoneMode {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Edges => 0,
+            Self::Rect => 1,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::Rect,
+            _ => Self::Edges,
+        }
+    }
+}
+
+/// 边缘模式下认哪几条边。
+///
+/// 默认只认右边缘：底部容易蹭到任务栏、顶部容易蹭到标题栏和菜单，用户想加
+/// 哪条边自己去点 —— 这个功能的坑就在于「感应区越大越容易误触」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WheelZoneEdges {
+    pub top: bool,
+    pub bottom: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Default for WheelZoneEdges {
+    fn default() -> Self {
+        Self {
+            top: false,
+            bottom: false,
+            left: false,
+            right: true,
+        }
+    }
+}
+
+impl WheelZoneEdges {
+    /// 四边都不认 = 这个热区等于没有，界面上要提示一句。
+    pub fn any(self) -> bool {
+        self.top || self.bottom || self.left || self.right
+    }
+
+    /// 这条边认不认。
+    pub fn enabled(self, edge: WheelZoneEdge) -> bool {
+        match edge {
+            WheelZoneEdge::Top => self.top,
+            WheelZoneEdge::Bottom => self.bottom,
+            WheelZoneEdge::Left => self.left,
+            WheelZoneEdge::Right => self.right,
+        }
+    }
+}
+
+/// 四条边里的哪一条。
+///
+/// 单独列出来是因为「每条边调什么」要一张四条目的表，用 bool 那个结构体当 key
+/// 不好认也不好遍历。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WheelZoneEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl WheelZoneEdge {
+    /// 上下左右，界面和遍历都按这个顺序。
+    pub const ALL: [Self; 4] = [Self::Top, Self::Bottom, Self::Left, Self::Right];
+
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Top => 0,
+            Self::Bottom => 1,
+            Self::Left => 2,
+            Self::Right => 3,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::Bottom,
+            2 => Self::Left,
+            3 => Self::Right,
+            _ => Self::Top,
+        }
+    }
+}
+
+/// 四边各自的滚轮目标。
+///
+/// 每项是 `Option`：`None` = 跟着 `WheelZone::target` 走。老配置里只有那一个
+/// `target`（那时四边共用），读进来四项全 `None`，行为跟以前一模一样，不用迁移。
+/// 用户在某条边上点一下「亮度」，那条边才变成 `Some(Brightness)`，从此各走各的。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WheelZoneEdgeTargets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<WheelZoneTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<WheelZoneTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<WheelZoneTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<WheelZoneTarget>,
+}
+
+impl WheelZoneEdgeTargets {
+    /// 这条边单独设成什么；`None` = 还没单独设过。
+    pub fn get(self, edge: WheelZoneEdge) -> Option<WheelZoneTarget> {
+        match edge {
+            WheelZoneEdge::Top => self.top,
+            WheelZoneEdge::Bottom => self.bottom,
+            WheelZoneEdge::Left => self.left,
+            WheelZoneEdge::Right => self.right,
+        }
+    }
+
+    pub fn set(&mut self, edge: WheelZoneEdge, target: WheelZoneTarget) {
+        let slot = match edge {
+            WheelZoneEdge::Top => &mut self.top,
+            WheelZoneEdge::Bottom => &mut self.bottom,
+            WheelZoneEdge::Left => &mut self.left,
+            WheelZoneEdge::Right => &mut self.right,
+        };
+        *slot = Some(target);
+    }
+}
+
+/// 热区里滚轮调什么。
+///
+/// 音量是主用法（游戏 / 视频里够得着），亮度是第二用法（晚上贴边走一下就把屏幕
+/// 压暗）。两者共用同一块热区几何，不给亮度再画一套 —— 「贴着右下角调亮度」
+/// 这种需求用底下的修饰键换目标就够了。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WheelZoneTarget {
+    #[default]
+    Volume,
+    Brightness,
+}
+
+impl WheelZoneTarget {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Volume => 0,
+            Self::Brightness => 1,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::Brightness,
+            _ => Self::Volume,
+        }
+    }
+
+    /// 另一个（音量 ↔ 亮度）。
+    pub fn other(self) -> Self {
+        match self {
+            Self::Volume => Self::Brightness,
+            Self::Brightness => Self::Volume,
+        }
+    }
+}
+
+/// 按住哪个修饰键时，热区换成「另一个」目标。
+///
+/// 比「再配一块亮度热区」省事：同一块边，平时滚调音量，按住 Ctrl 滚调亮度 ——
+/// 屏幕边上本来就挤，多一块就多一处误触。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WheelSwapKey {
+    #[default]
+    Off,
+    Ctrl,
+    Alt,
+    Shift,
+    Win,
+}
+
+impl WheelSwapKey {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Ctrl => 1,
+            Self::Alt => 2,
+            Self::Shift => 3,
+            Self::Win => 4,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::Ctrl,
+            2 => Self::Alt,
+            3 => Self::Shift,
+            4 => Self::Win,
+            _ => Self::Off,
+        }
+    }
+
+    /// 这个修饰键现在按着没有。
+    ///
+    /// 走 `is_key_down`（`GetAsyncKeyState`）而不是 `is_key_held`：后者在
+    /// 「按下时不发送原始按键」开着时改问钩子自己的按下表，而那张表里没有
+    /// 修饰键的位 —— 实测按住 Ctrl 时它报「没按」，热区就永远换不了目标。
+    /// 修饰键读法跟钩子里 `current_modifiers()` 保持一致。
+    pub fn is_down(self) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT,
+        };
+        let key = match self {
+            Self::Off => return false,
+            Self::Ctrl => VK_CONTROL,
+            Self::Alt => VK_MENU,
+            Self::Shift => VK_SHIFT,
+            Self::Win => VK_LWIN,
+        };
+        crate::platform::hotkey::is_key_down(key.0 as u32)
+    }
+}
+
+/// 区域模式下的一块矩形：位置、大小，以及它自己调什么。
+///
+/// 坐标相对某块屏的 0..1，跟老的 `rect_x/y/w/h` 一个口径；`target` 让每块区域
+/// 各调各的 —— 「左下角那块调亮度、右侧竖条调音量」这种搭配是主用法。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WheelZoneRegion {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    #[serde(default)]
+    pub target: WheelZoneTarget,
+}
+
+impl WheelZoneRegion {
+    /// 夹进 0..1：宽高不小于 `MIN_RECT`，整块不出屏。
+    pub fn clamped(self) -> Self {
+        let w = self.w.clamp(WheelZone::MIN_RECT, 1.0);
+        let h = self.h.clamp(WheelZone::MIN_RECT, 1.0);
+        Self {
+            x: self.x.clamp(0.0, 1.0 - w),
+            y: self.y.clamp(0.0, 1.0 - h),
+            w,
+            h,
+            ..self
+        }
+    }
+
+    /// `(x, y, w, h)`。
+    pub fn rect(self) -> (f32, f32, f32, f32) {
+        let me = self.clamped();
+        (me.x, me.y, me.w, me.h)
+    }
+}
+
+/// 滚轮热区：光标落在屏幕边缘 / 指定区域里时，滚轮直接调音量。
+///
+/// 和「托盘图标上滚」「面板里滚」是并列的第三种入口：那两种都得先把光标挪到
+/// 某个窗口上，这种只要贴着屏幕边就行 —— 全屏游戏、看视频、浏览器里都够得着。
+///
+/// 几何全部用**逻辑像素 / 归一化坐标**存：换显示器、改缩放比都不需要迁移。
+/// 真正拿去和光标比对的是 `platform::mouse_wheel` 里那份物理像素快照。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WheelZone {
+    /// 总开关。
+    pub enabled: bool,
+    /// 贴边还是框一块。
+    pub mode: WheelZoneMode,
+    /// 贴边模式认哪几条边。
+    pub edges: WheelZoneEdges,
+    /// 感应带厚度（逻辑像素）：从屏幕边往里算多少。
+    pub thickness: u32,
+    /// 区域模式：矩形左上角与宽高，相对整块屏的 0..1。
+    ///
+    /// **老字段**，只在 `rects` 空着（升级前只画一块）时当唯一那块用；
+    /// 界面上一动区域就会搬进 `rects`，之后这四个数不再参与计算。
+    pub rect_x: f32,
+    pub rect_y: f32,
+    pub rect_w: f32,
+    pub rect_h: f32,
+    /// 区域模式下的所有矩形，每块各带一个目标。
+    ///
+    /// 空 = 还没分块（老配置 / 刚装上），这时用上面那四个数当唯一一块。
+    /// 为什么不直接把老字段删掉：删了老配置里那块区域的坐标就丢了，用户升级完
+    /// 会发现「我画的框不见了」。留着它们当回落，升级前后长得一模一样。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rects: Vec<WheelZoneRegion>,
+    /// 所有显示器都算（关掉只认 `monitor` 那一台）。
+    pub all_monitors: bool,
+    /// `all_monitors` 关着时用哪台：0 = 主显示器，n = 第 n 台。
+    pub monitor: u32,
+    /// 一格滚轮走多少个百分点。
+    ///
+    /// 只管**音量** —— 亮度沿用亮度页那个「滚轮步进」（`brightness.scroll_step`），
+    /// 一格走多少在哪儿都是同一个数，省得两个地方各调一遍。
+    ///
+    /// 和音量页的「百分比滚轮步进」也是两个字段 —— 那个管托盘 / 面板里的滚轮，
+    /// 这个只管热区。想要「贴着边滚一下走得多一点」就调这个，互不影响。
+    pub step_percent: u32,
+    /// 热区里滚轮调什么：音量 / 亮度。
+    ///
+    /// 区域模式就是它自己的目标；边缘模式是**没单独设过的边**的默认值
+    /// （见 `edge_targets`）。
+    pub target: WheelZoneTarget,
+    /// 四边各自的目标，覆盖 `target`。
+    ///
+    /// 贴顶调亮度、贴底调音量这种搭配很常见（显示器亮度和系统音量本来就常一起
+    /// 动），所以每条边单独给一档。没设过的边跟着 `target` 走。
+    pub edge_targets: WheelZoneEdgeTargets,
+    /// 按住这个修饰键换成另一个目标（音量 ↔ 亮度）。
+    pub swap: WheelSwapKey,
+    /// 反向：往上滚变小。
+    pub invert: bool,
+    /// 横向滚轮（滚轮左右摆）也调音量。
+    pub horizontal: bool,
+    /// 调完弹屏幕提示。
+    pub show_osd: bool,
+    /// 吞掉这次滚动，不传给底下那个窗口。
+    ///
+    /// 默认开：热区贴着屏幕边，底下多半是个网页 / 笔记，滚轮放过去就会同时
+    /// 滚页面。关掉就是「调音量的同时也让页面滚」。
+    pub swallow: bool,
+}
+
+impl Default for WheelZone {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: WheelZoneMode::Edges,
+            edges: WheelZoneEdges::default(),
+            thickness: 24,
+            // 区域模式的出厂位置：屏幕右侧竖着一条，占右半边中间那段。
+            rect_x: 0.68,
+            rect_y: 0.2,
+            rect_w: 0.3,
+            rect_h: 0.6,
+            // 空着 = 就用上面那一块（老配置的读法）。
+            rects: Vec::new(),
+            all_monitors: true,
+            monitor: 0,
+            // 一格 5%：比音量页默认的 2% 粗一档，贴边滚通常想快一点。
+            step_percent: 5,
+            target: WheelZoneTarget::Volume,
+            // 出厂四条边都跟着 `target`（= 音量），要用「上边调亮度」自己去点。
+            edge_targets: WheelZoneEdgeTargets::default(),
+            // 默认不挂修饰键：贴上边滚就该直接调，多按一个键反而是负担。
+            swap: WheelSwapKey::Off,
+            invert: false,
+            horizontal: false,
+            show_osd: true,
+            swallow: true,
+        }
+    }
+}
+
+impl WheelZone {
+    /// 感应带厚度的可填范围（逻辑像素）。
+    ///
+    /// 下限给到 1：贴边调音量本来就不该占地方，1px 就是「准准地压在边上」，
+    /// 想稳一点再往上加。
+    pub const THICKNESS_RANGE: (u32, u32) = (1, 400);
+    /// 一格步进的可填范围（百分点）。
+    pub const STEP_RANGE: (u32, u32) = (1, 100);
+    /// 区域矩形的边至少留这么长（归一化），否则拖成一条线就点不着了。
+    pub const MIN_RECT: f32 = 0.04;
+
+    /// 一格滚轮走多远（0..1）。
+    pub fn step(&self) -> f32 {
+        self.step_percent.clamp(1, 100) as f32 / 100.0
+    }
+
+    /// 这条边的目标：单独设过就用它，没设过跟着 `target`。
+    pub fn target_of(&self, edge: WheelZoneEdge) -> WheelZoneTarget {
+        self.edge_targets.get(edge).unwrap_or(self.target)
+    }
+
+    /// 把某条边单独设成某个目标。
+    pub fn set_target_of(&mut self, edge: WheelZoneEdge, target: WheelZoneTarget) {
+        self.edge_targets.set(edge, target);
+    }
+
+    /// 这一下滚轮到底调什么：按住换目标的键就是另一个，否则是这条边的目标。
+    pub fn effective_target(&self, target: WheelZoneTarget, swap_down: bool) -> WheelZoneTarget {
+        if swap_down && self.swap != WheelSwapKey::Off {
+            target.other()
+        } else {
+            target
+        }
+    }
+
+    /// 当前这套设置里会不会用到 `target`（决定界面上摆哪几个步进）。
+    ///
+    /// 边缘模式只看**认了的那几条边**：四条都设成亮度，就不必再摆音量步进。
+    pub fn uses(&self, target: WheelZoneTarget) -> bool {
+        match self.mode {
+            WheelZoneMode::Rect => self.regions().iter().any(|region| region.target == target),
+            WheelZoneMode::Edges => WheelZoneEdge::ALL
+                .iter()
+                .any(|&edge| self.edges.enabled(edge) && self.target_of(edge) == target),
+        }
+    }
+
+    /// 区域模式对应的所有矩形（夹好、已展开老字段）。
+    ///
+    /// `rects` 空着就用老的单块字段当唯一一块 —— 升级前后行为一样，
+    /// 用户不必重新画一次框。
+    pub fn regions(&self) -> Vec<WheelZoneRegion> {
+        if !self.rects.is_empty() {
+            return self.rects.iter().map(|region| region.clamped()).collect();
+        }
+        vec![WheelZoneRegion {
+            x: self.rect_x,
+            y: self.rect_y,
+            w: self.rect_w,
+            h: self.rect_h,
+            target: self.target,
+        }
+        .clamped()]
+    }
+
+    /// 把老的单块字段搬进 `rects`（只搬一次）。
+    ///
+    /// 界面上任何一次改动区域的动作前先调这个，之后所有读写都走 `rects`。
+    pub fn materialize_regions(&mut self) {
+        if self.rects.is_empty() {
+            self.rects = vec![WheelZoneRegion {
+                x: self.rect_x,
+                y: self.rect_y,
+                w: self.rect_w,
+                h: self.rect_h,
+                target: self.target,
+            }];
+        }
+    }
+
+    /// 改某块区域（超出范围就忽略）。
+    pub fn set_region(&mut self, index: usize, region: WheelZoneRegion) {
+        self.materialize_regions();
+        if let Some(slot) = self.rects.get_mut(index) {
+            *slot = region.clamped();
+        }
+    }
+
+    /// 加一块区域：摆在已有那些的右下方向错开一点，四块之内总能看见。
+    ///
+    /// 返回新块的序号（界面把选中项挪过去）。
+    pub fn add_region(&mut self) -> usize {
+        self.materialize_regions();
+        let n = self.rects.len();
+        // 错开 (n * 4%)：不至于完全盖在上一块上，连点几下也不会堆成一摞。
+        let shift = (n as f32 * 0.04).min(0.3);
+        self.rects.push(WheelZoneRegion {
+            x: 0.1 + shift,
+            y: 0.1 + shift,
+            w: 0.3,
+            h: 0.3,
+            target: self.target,
+        }.clamped());
+        self.rects.len() - 1
+    }
+
+    /// 删掉一块区域（只剩一块时不动，界面上那颗按钮也灰着）。
+    pub fn remove_region(&mut self, index: usize) -> bool {
+        self.materialize_regions();
+        if self.rects.len() <= 1 || index >= self.rects.len() {
+            return false;
+        }
+        self.rects.remove(index);
+        true
+    }
+
+    /// 老的单块矩形 `(x, y, w, h)`：`rects` 空着时就是它自己。
+    pub fn rect(&self) -> (f32, f32, f32, f32) {
+        let w = self.rect_w.clamp(Self::MIN_RECT, 1.0);
+        let h = self.rect_h.clamp(Self::MIN_RECT, 1.0);
+        let x = self.rect_x.clamp(0.0, 1.0 - w);
+        let y = self.rect_y.clamp(0.0, 1.0 - h);
+        (x, y, w, h)
+    }
+}
+
 /// 数字图标的底色块（可选）：数字压在一块圆角底色上，像自带的小徽章。
 ///
 /// 色块是**纯装饰**：大小、圆角、颜色怎么调都不碰数字 —— 字号、位置、字形
@@ -2002,6 +2518,113 @@ impl PanelLayout {
             Self::Horizontal => lang.pick("横向", "Horizontal"),
             Self::Vertical => lang.pick("竖向", "Vertical"),
         }
+    }
+}
+
+/// 面板呼出位置。
+///
+/// 默认「跟着任务栏」，也就是一直以来的样子：贴着任务栏那一头，像系统音量卡片。
+/// 其余几档是给「快捷键呼出、但想让它出现在别处」的人用的。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelAnchor {
+    /// 跟着任务栏（贴任务栏那一头）。
+    #[default]
+    Taskbar,
+    /// 屏幕九宫格：左上 / 上 / … / 右下。
+    Screen,
+    /// 光标九宫格：面板出现在光标的某个方向。
+    Cursor,
+    /// 指定坐标：面板左上角落在工作区百分之几的位置。
+    Custom,
+}
+
+impl PanelAnchor {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Taskbar => 0,
+            Self::Screen => 1,
+            Self::Cursor => 2,
+            Self::Custom => 3,
+        }
+    }
+
+    pub fn from_index(value: u32) -> Self {
+        match value {
+            1 => Self::Screen,
+            2 => Self::Cursor,
+            3 => Self::Custom,
+            _ => Self::Taskbar,
+        }
+    }
+
+    /// 这一档要不要挑九宫格里的一格。
+    pub fn uses_slot(self) -> bool {
+        matches!(self, Self::Screen | Self::Cursor)
+    }
+}
+
+/// 九宫格里的一格。
+///
+/// 屏幕档说的是「面板在屏幕的哪个位置」，光标档说的是「面板在光标的哪个方向」
+/// —— 同一个枚举，两种解释，但九宫格的直觉是一致的：左上就是把东西摆到左上。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelSlot {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    #[default]
+    BottomRight,
+}
+
+impl PanelSlot {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::TopLeft => 0,
+            Self::Top => 1,
+            Self::TopRight => 2,
+            Self::Left => 3,
+            Self::Center => 4,
+            Self::Right => 5,
+            Self::BottomLeft => 6,
+            Self::Bottom => 7,
+            Self::BottomRight => 8,
+        }
+    }
+
+    pub fn from_index(value: u32) -> Self {
+        match value {
+            0 => Self::TopLeft,
+            1 => Self::Top,
+            2 => Self::TopRight,
+            3 => Self::Left,
+            4 => Self::Center,
+            5 => Self::Right,
+            6 => Self::BottomLeft,
+            7 => Self::Bottom,
+            _ => Self::BottomRight,
+        }
+    }
+
+    /// 这一格在 0..1 里的位置：0 = 左 / 上，0.5 = 中，1 = 右 / 下。
+    pub fn fractions(self) -> (f32, f32) {
+        let x = match self {
+            Self::TopLeft | Self::Left | Self::BottomLeft => 0.0,
+            Self::Top | Self::Center | Self::Bottom => 0.5,
+            _ => 1.0,
+        };
+        let y = match self {
+            Self::TopLeft | Self::Top | Self::TopRight => 0.0,
+            Self::Left | Self::Center | Self::Right => 0.5,
+            _ => 1.0,
+        };
+        (x, y)
     }
 }
 
@@ -3365,10 +3988,6 @@ pub struct OsdConfig {
     /// 拖动元素时自动吸附对齐（默认开）。
     pub snap: bool,
 
-    /// 没配快捷键的系统媒体键（上一曲 / 下一曲 / 播放暂停 / 停止）也接管：
-    /// 弹一条提示，再把键原样转发给播放器。默认关（保持系统原生行为）。
-    pub takeover_media_keys: bool,
-
     /// 标题文字。空 = 用自动标题（「音量」「已静音」「下一曲」这种）。
     pub title_text: String,
     /// 自定义文字（一条都没有 = 不显示任何自定义文字）。
@@ -3637,7 +4256,6 @@ impl Default for OsdConfig {
             interactive: true,
             wheel_hover: true,
             snap: true,
-            takeover_media_keys: false,
             title_text: String::new(),
             texts: Vec::new(),
             z_order: Vec::new(),
@@ -4584,6 +5202,11 @@ pub const PANEL_LETTER_SPACING_RANGE: (f32, f32) = (-5.0, 20.0);
 /// 不设实际意义上的限制：填多少就是多少（行高本来就是给人自己排的），
 /// 这一千只是挡住手改配置文件写出天文数字。
 pub const PANEL_LINE_HEIGHT_MAX: u32 = 1000;
+/// 面板顶部「播放设备」那一块的高度上限（逻辑像素）。0 = 用默认的 92。
+///
+/// 和行高一样不设实用意义上的限制：填多少就是多少，上限只挡手写配置文件
+/// 写出天文数字（面板再高也放不下几千像素）。
+pub const PANEL_DEVICE_HEIGHT_MAX: u32 = 600;
 
 /// 按住音量 / 亮度快捷键时连续触发的间隔默认值（毫秒）。
 ///
@@ -4891,6 +5514,11 @@ pub struct Config {
     /// 在不同位置上对应的滑条行程并不一样。
     pub log_scroll_wheel_step: f32,
 
+    /// 屏幕边缘 / 指定区域的滚轮热区（贴在边上滚 = 调音量）。
+    ///
+    /// 单独一段配置，和上面那几个「托盘 / 面板里滚」的开关互不干扰。
+    pub wheel_zone: WheelZone,
+
     /// 托盘图标样式（后续「更换托盘图标」功能的入口）。
     pub tray_icon_style: TrayIconStyle,
 
@@ -5087,6 +5715,35 @@ pub struct Config {
 
     /// 音量面板排版：横向（一路一行）/ 竖向（一路一条推子）。
     pub panel_layout: PanelLayout,
+
+    /// 面板呼出位置：跟着任务栏 / 屏幕九宫格 / 光标九宫格 / 指定坐标。
+    ///
+    /// 默认「跟着任务栏」，也就是一直以来那个样子（贴着任务栏那头，像系统音量
+    /// 卡片）。其余几档是给「快捷键呼出、但想让它出现在别处」的人用的 ——
+    /// 打游戏时面板弹在右下角会挡住准星，放在光标边上反而顺手。
+    pub panel_anchor: PanelAnchor,
+
+    /// `panel_anchor` 是屏幕 / 光标时，九宫格选哪一格。
+    pub panel_slot: PanelSlot,
+
+    /// 这套位置只管**快捷键呼出**的那一次。
+    ///
+    /// 默认开：托盘点开的面板仍旧贴着任务栏（那儿本来就该是任务栏的口子），
+    /// 快捷键呼出的才按上面设的摆 —— 打游戏时正是快捷键这一路会挡视线。
+    /// 想连托盘点开的一起挪，关掉它。
+    pub panel_anchor_hotkey_only: bool,
+
+    /// `panel_anchor` 是「指定位置」时，面板摆在工作区横向的百分之几处（0..100）。
+    ///
+    /// 百分比摊的是**面板还能挪的那段距离**（工作区宽减面板宽），不是工作区全宽：
+    /// 0 贴左边、100 贴右边、50 正好居中。按全宽算的话 50 会偏右半个面板。
+    ///
+    /// 存百分比而不是像素：换分辨率 / 换缩放比之后位置还在那个相对地方。
+    /// 摆的时候会夹回工作区里，不会让面板半个身子跑到屏幕外。
+    pub panel_x_percent: f32,
+
+    /// 同上，纵向。
+    pub panel_y_percent: f32,
 
     /// 竖向排版时要不要在推子下面写应用名。
     ///
@@ -5288,6 +5945,11 @@ pub struct Config {
     ///
     /// 填了就**以它为准**、不再乘字号：字放大而想把行留得紧，就靠这一项。
     pub panel_line_height: f32,
+    /// 音量面板顶部「播放设备」那一块的高度（逻辑像素，0 = 默认 92）。
+    ///
+    /// 设备名 + 音量条整体占的那一格：想给它更多呼吸空间就往上填，想更紧凑
+    /// 就往下填。与应用行的 `panel_line_height` 分开，两块可以各调各的。
+    pub panel_device_height: f32,
     /// 音量面板的字重（100..900，400 = 常规）。
     pub panel_font_weight: u32,
     /// 面板里设备名称的字号（逻辑像素）。
@@ -5341,6 +6003,7 @@ impl Default for Config {
             // 与改动前的行为一致：旧版把 `scroll_wheel_step` 在对数模式下当 dB 用，
             // 默认 2 就是「一格 2 dB」。老配置没有这个字段，读进来也落在这里。
             log_scroll_wheel_step: DEFAULT_LOG_SCROLL_STEP_DB,
+            wheel_zone: WheelZone::default(),
             tray_icon_style: TrayIconStyle::Arcs,
             app_icon_style: AppIconStyle::default(),
             tray_icon_color: String::new(),
@@ -5390,6 +6053,11 @@ impl Default for Config {
             panel_bar_thickness: DEFAULT_PANEL_BAR_THICKNESS,
             panel_bar_round: DEFAULT_PANEL_BAR_ROUND,
             panel_layout: PanelLayout::Horizontal,
+            panel_anchor: PanelAnchor::Taskbar,
+            panel_slot: PanelSlot::BottomRight,
+            panel_anchor_hotkey_only: true,
+            panel_x_percent: 100.0,
+            panel_y_percent: 100.0,
             vertical_app_names: false,
             vertical_height: 0,
             footer: FooterConfig::default(),
@@ -5445,6 +6113,7 @@ impl Default for Config {
             panel_font_size: PANEL_BASE_FONT_SIZE,
             panel_letter_spacing: 0.0,
             panel_line_height: 0.0,
+            panel_device_height: 0.0,
             panel_font_weight: DEFAULT_UI_FONT_WEIGHT,
             device_name_size: 13,
             hidden_apps: Vec::new(),
@@ -5468,11 +6137,87 @@ pub enum HotkeyStepTarget {
     App,
 }
 
+/// 光标档里的一个轴：`f` = 0 面板在光标**前**（左 / 上）、0.5 正中对准、1 在后（右 / 下）。
+///
+/// 0 → 面板整块在光标前面再留一道缝；0.5 → 中心对准；1 → 面板从光标后面
+/// 一个缝的位置开始。中间值线性过渡（实际只会用到这三个）。
+fn slot_axis(cursor: f32, len: f32, f: f32, gap: f32) -> f32 {
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    if f <= 0.5 {
+        lerp(
+            cursor - len - gap,
+            cursor - len * 0.5,
+            (f / 0.5).clamp(0.0, 1.0),
+        )
+    } else {
+        lerp(
+            cursor - len * 0.5,
+            cursor + gap,
+            ((f - 0.5) / 0.5).clamp(0.0, 1.0),
+        )
+    }
+}
+
 impl Config {
     /// 音量面板宽度（逻辑像素）：配置里的数字钳进可调范围。
     pub fn flyout_width(&self) -> f32 {
         self.flyout_width
             .clamp(FLYOUT_WIDTH_RANGE.0, FLYOUT_WIDTH_RANGE.1) as f32
+    }
+
+    /// 面板该落在哪（左上角，逻辑像素）。
+    ///
+    /// `area` 是工作区 `(x, y, w, h)`（已经排掉任务栏），`size` 是面板尺寸，
+    /// `cursor` 是光标的屏幕坐标（逻辑像素；拿不到时按工作区中心算）。
+    ///
+    /// 「跟着任务栏」那一档**不走这里** —— 它要贴着任务栏那一条边，还得给亮度
+    /// 面板让位，仍旧由 `flyout` 自己算；这里只负责另外三档。
+    ///
+    /// 所有结果都会夹回工作区（留 `MARGIN`），不会让面板半个身子跑到屏幕外。
+    pub fn panel_origin(
+        &self,
+        area: (f32, f32, f32, f32),
+        size: (f32, f32),
+        cursor: Option<(f32, f32)>,
+    ) -> (f32, f32) {
+        /// 和 `flyout` 那边贴边用的边距一致。
+        const MARGIN: f32 = 12.0;
+        /// 光标那几档，面板和指针之间留的缝：正对着指针会挡住点击。
+        const GAP: f32 = 18.0;
+
+        let (ax, ay, aw, ah) = area;
+        let (pw, ph) = size;
+        let (fx, fy) = self.panel_slot.fractions();
+        let (x, y) = match self.panel_anchor {
+            // 跟着任务栏：给一个「右下角」的近似值，实际由 flyout 覆盖。
+            PanelAnchor::Taskbar => (
+                ax + aw - pw - MARGIN,
+                ay + ah - ph - MARGIN,
+            ),
+            PanelAnchor::Screen => {
+                let span_x = (aw - pw - 2.0 * MARGIN).max(0.0);
+                let span_y = (ah - ph - 2.0 * MARGIN).max(0.0);
+                (ax + MARGIN + fx * span_x, ay + MARGIN + fy * span_y)
+            }
+            PanelAnchor::Cursor => {
+                let (cx, cy) = cursor.unwrap_or((ax + aw * 0.5, ay + ah * 0.5));
+                (
+                    slot_axis(cx, pw, fx, GAP),
+                    slot_axis(cy, ph, fy, GAP),
+                )
+            }
+            PanelAnchor::Custom => {
+                let px = self.panel_x_percent.clamp(0.0, 100.0) / 100.0;
+                let py = self.panel_y_percent.clamp(0.0, 100.0) / 100.0;
+                (ax + px * (aw - pw).max(0.0), ay + py * (ah - ph).max(0.0))
+            }
+        };
+        // 一律夹回工作区：光标贴着屏幕角的时候，光标档算出来的位置会跑出去。
+        let left = ax + MARGIN;
+        let top = ay + MARGIN;
+        let right = (ax + aw - pw - MARGIN).max(left);
+        let bottom = (ay + ah - ph - MARGIN).max(top);
+        (x.clamp(left, right), y.clamp(top, bottom))
     }
 
     /// 面板里音量条的粗细（逻辑像素）：钳进可调范围。
@@ -5838,6 +6583,15 @@ impl Config {
         } else {
             target
         }
+    }
+
+    /// 滚轮热区走 `notches` 格之后，滑条该落在哪（0..1）。
+    ///
+    /// 用热区自己那个百分比步进，不跟音量页的滚轮步进共用 —— 贴着屏幕边滚一下
+    /// 通常想走得更粗，两者得能分开调。只按百分比算：这一格百分比就是它全部的
+    /// 口径，再叠一层 dB 步进，「一格走 N%」这句话就不成立了。
+    pub fn zone_scroll(&self, display: f32, notches: f32) -> f32 {
+        (display.clamp(0.0, 1.0) + notches * self.wheel_zone.step()).clamp(0.0, 1.0)
     }
     /// 把 `src` 里列出的那几个顶层字段原样搬过来（`keys` 是 serde 的字段名）。
     ///
@@ -6647,6 +7401,273 @@ fn clear_readonly(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 滚轮热区：出厂值、JSON 往返、老配置缺字段都要稳。
+    #[test]
+    fn wheel_zone_defaults_and_roundtrip() {
+        let config = Config::default();
+        let zone = &config.wheel_zone;
+        assert!(!zone.enabled, "新功能默认不开");
+        assert_eq!(zone.mode, WheelZoneMode::Edges);
+        // 默认只认右边缘：底边会蹭任务栏、顶边会蹭标题栏。
+        assert!(zone.edges.right);
+        assert!(!zone.edges.left && !zone.edges.top && !zone.edges.bottom);
+        assert!((zone.step() - 0.05).abs() < 1e-6);
+
+        let json = serde_json::to_string(zone).unwrap();
+        let back: WheelZone = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *zone);
+
+        // 默认调音量、不挂修饰键 —— 贴上边滚就该直接生效。
+        assert_eq!(zone.target, WheelZoneTarget::Volume);
+        assert_eq!(zone.swap, WheelSwapKey::Off);
+        assert_eq!(WheelZone::THICKNESS_RANGE.0, 1, "厚度最低要能到 1px");
+        // 四条边默认都跟着 `target` 走，没有哪条是单独设过的。
+        for edge in WheelZoneEdge::ALL {
+            assert_eq!(zone.edge_targets.get(edge), None);
+            assert_eq!(zone.target_of(edge), WheelZoneTarget::Volume);
+        }
+    }
+
+    /// 每条边可以单独调不同东西；老配置（没有 `edge_targets`）四边跟着 `target`。
+    #[test]
+    fn wheel_zone_edges_can_pick_their_own_target() {
+        let mut zone = WheelZone::default();
+        zone.target = WheelZoneTarget::Volume;
+        zone.edges = WheelZoneEdges {
+            top: true,
+            bottom: true,
+            left: false,
+            right: false,
+        };
+
+        // 只往上边点「亮度」，其它边不动。
+        zone.set_target_of(WheelZoneEdge::Top, WheelZoneTarget::Brightness);
+        assert_eq!(zone.target_of(WheelZoneEdge::Top), WheelZoneTarget::Brightness);
+        assert_eq!(zone.target_of(WheelZoneEdge::Bottom), WheelZoneTarget::Volume);
+        assert_eq!(zone.target_of(WheelZoneEdge::Left), WheelZoneTarget::Volume);
+
+        // 步进只摆用得着的：认了的边里有音量也有亮度 → 两个都要。
+        assert!(zone.uses(WheelZoneTarget::Volume));
+        assert!(zone.uses(WheelZoneTarget::Brightness));
+
+        // 两条认了的边都设成亮度 → 音量步进就不必摆了。
+        zone.set_target_of(WheelZoneEdge::Bottom, WheelZoneTarget::Brightness);
+        assert!(!zone.uses(WheelZoneTarget::Volume));
+        assert!(zone.uses(WheelZoneTarget::Brightness));
+
+        // 没认的那条边设了也不算数（`uses` 只看认了的边）。
+        zone.edges.left = true;
+        zone.set_target_of(WheelZoneEdge::Left, WheelZoneTarget::Volume);
+        assert!(zone.uses(WheelZoneTarget::Volume));
+
+        // 落盘再读回来，四边的独立设置不丢。
+        let json = serde_json::to_string(&zone).unwrap();
+        let back: WheelZone = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, zone);
+        assert!(json.contains("\"top\":\"brightness\""), "json: {json}");
+        // 没设过的边不写进 json（保持文件干净）。
+        assert!(!json.contains("\"left\":null"), "json: {json}");
+
+        // 老配置只有那一个 `target`：读进来四边全跟着它，行为跟升级前一致。
+        let old = r#"{"enabled":true,"edges":{"top":true,"bottom":true,"right":false},"target":"brightness"}"#;
+        let parsed: WheelZone = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.edge_targets, WheelZoneEdgeTargets::default());
+        assert_eq!(parsed.target_of(WheelZoneEdge::Top), WheelZoneTarget::Brightness);
+        assert_eq!(parsed.target_of(WheelZoneEdge::Bottom), WheelZoneTarget::Brightness);
+        assert_eq!(parsed.target_of(WheelZoneEdge::Right), WheelZoneTarget::Brightness);
+    }
+
+    /// 面板呼出位置：出厂「跟着任务栏」，其余几档的几何都落在工作区里。
+    #[test]
+    fn panel_anchor_geometry_stays_on_screen() {
+        // 1920×1080 的工作区，面板 320×240。
+        let area = (0.0, 0.0, 1920.0, 1080.0);
+        let size = (320.0, 240.0);
+        let mut config = Config::default();
+        assert_eq!(config.panel_anchor, PanelAnchor::Taskbar, "默认还是贴任务栏");
+        assert_eq!(config.panel_slot, PanelSlot::BottomRight);
+        // 位置默认只管快捷键呼出的那一次：托盘点开还是任务栏口子。
+        assert!(config.panel_anchor_hotkey_only);
+        assert!((config.panel_x_percent - 100.0).abs() < f32::EPSILON);
+
+        // 屏幕九宫格：右下 = 右下角留 12px，左上 = 左上角留 12px，中间 = 正中。
+        config.panel_anchor = PanelAnchor::Screen;
+        config.panel_slot = PanelSlot::BottomRight;
+        assert_eq!(config.panel_origin(area, size, None), (1920.0 - 320.0 - 12.0, 1080.0 - 240.0 - 12.0));
+        config.panel_slot = PanelSlot::TopLeft;
+        assert_eq!(config.panel_origin(area, size, None), (12.0, 12.0));
+        config.panel_slot = PanelSlot::Center;
+        assert_eq!(config.panel_origin(area, size, None), ((1920.0 - 320.0) / 2.0, (1080.0 - 240.0) / 2.0));
+
+        // 光标档：右键附近的面板放在光标右边，左上就整块挪到左上方。
+        config.panel_anchor = PanelAnchor::Cursor;
+        config.panel_slot = PanelSlot::Right;
+        let (x, y) = config.panel_origin(area, size, Some((800.0, 500.0)));
+        assert_eq!(x, 800.0 + 18.0, "面板从光标右边起");
+        assert_eq!(y, 500.0 - 120.0, "纵向居中在光标上");
+        config.panel_slot = PanelSlot::TopLeft;
+        let (x, y) = config.panel_origin(area, size, Some((800.0, 500.0)));
+        assert_eq!((x, y), (800.0 - 320.0 - 18.0, 500.0 - 240.0 - 18.0));
+
+        // 光标贴着屏幕角：算出来会跑出去，必须夹回工作区。
+        let (x, y) = config.panel_origin(area, size, Some((1910.0, 1070.0)));
+        assert!(x <= 1920.0 - 320.0 - 12.0 + 0.01 && x >= 12.0);
+        assert!(y <= 1080.0 - 240.0 - 12.0 + 0.01 && y >= 12.0);
+
+        // 指定位置：百分比落在工作区里，100% 也是「贴右下再留一道边」（末了一步会夹）。
+        config.panel_anchor = PanelAnchor::Custom;
+        config.panel_x_percent = 100.0;
+        config.panel_y_percent = 100.0;
+        assert_eq!(
+            config.panel_origin(area, size, None),
+            (1920.0 - 320.0 - 12.0, 1080.0 - 240.0 - 12.0)
+        );
+        config.panel_x_percent = 0.0;
+        config.panel_y_percent = 0.0;
+        assert_eq!(config.panel_origin(area, size, None), (12.0, 12.0));
+
+        // 九宫格编号能往返（设置页按它摆那 3×3 的小格子）。
+        for index in 0..9 {
+            assert_eq!(PanelSlot::from_index(index).index(), index);
+        }
+        for index in 0..4 {
+            assert_eq!(PanelAnchor::from_index(index).index(), index);
+        }
+    }
+
+    /// 面板九宫格的 0..1 分数：左上 (0,0)、中间 (0.5,0.5)、右下 (1,1)。
+    #[test]
+    fn panel_slot_fractions_match_the_grid() {
+        assert_eq!(PanelSlot::TopLeft.fractions(), (0.0, 0.0));
+        assert_eq!(PanelSlot::Top.fractions(), (0.5, 0.0));
+        assert_eq!(PanelSlot::TopRight.fractions(), (1.0, 0.0));
+        assert_eq!(PanelSlot::Left.fractions(), (0.0, 0.5));
+        assert_eq!(PanelSlot::Center.fractions(), (0.5, 0.5));
+        assert_eq!(PanelSlot::Right.fractions(), (1.0, 0.5));
+        assert_eq!(PanelSlot::BottomLeft.fractions(), (0.0, 1.0));
+        assert_eq!(PanelSlot::Bottom.fractions(), (0.5, 1.0));
+        assert_eq!(PanelSlot::BottomRight.fractions(), (1.0, 1.0));
+    }
+
+    /// 按住换目标那个键时，热区调的是另一个；没按（或没配）就是那条边设的那个。
+    #[test]
+    fn wheel_zone_swap_key_flips_the_target() {
+        let mut zone = WheelZone::default();
+        let volume = zone.target_of(WheelZoneEdge::Top);
+        assert_eq!(
+            zone.effective_target(volume, true),
+            WheelZoneTarget::Volume,
+            "没配键就不换"
+        );
+
+        zone.swap = WheelSwapKey::Ctrl;
+        assert_eq!(zone.effective_target(volume, false), WheelZoneTarget::Volume);
+        assert_eq!(
+            zone.effective_target(volume, true),
+            WheelZoneTarget::Brightness,
+            "按住 Ctrl 换成亮度"
+        );
+
+        // 换目标跟着**那条边**走：上边本来就设成亮度时，按住 Ctrl 得到音量。
+        zone.set_target_of(WheelZoneEdge::Top, WheelZoneTarget::Brightness);
+        let top = zone.target_of(WheelZoneEdge::Top);
+        assert_eq!(top, WheelZoneTarget::Brightness);
+        assert_eq!(zone.effective_target(top, false), WheelZoneTarget::Brightness);
+        assert_eq!(
+            zone.effective_target(top, true),
+            WheelZoneTarget::Volume,
+            "反过来也一样"
+        );
+
+        // 下拉框的编号能往返（设置页按这个索引画胶囊）。
+        for key in [WheelSwapKey::Off, WheelSwapKey::Ctrl, WheelSwapKey::Alt, WheelSwapKey::Shift, WheelSwapKey::Win] {
+            assert_eq!(WheelSwapKey::from_index(key.index()), key);
+        }
+        for target in [WheelZoneTarget::Volume, WheelZoneTarget::Brightness] {
+            assert_eq!(WheelZoneTarget::from_index(target.index()), target);
+        }
+    }
+
+    /// 老配置里根本没有 `wheel_zone` 这一整段：读进来就是出厂值。
+    #[test]
+    fn wheel_zone_reads_from_configs_without_it() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.wheel_zone.enabled);
+        assert_eq!(config.wheel_zone.step_percent, 5);
+        assert_eq!(config.wheel_zone.thickness, 24);
+    }
+
+    /// 一格滚轮按「段数」走，撞到两头就停住。
+    #[test]
+    fn wheel_zone_scroll_uses_its_own_segments() {
+        let mut config = Config::default();
+        config.wheel_zone.step_percent = 10; // 一格 10%
+        assert!((config.zone_scroll(0.5, 1.0) - 0.6).abs() < 1e-6);
+        assert!((config.zone_scroll(0.5, -2.0) - 0.3).abs() < 1e-6);
+        assert!((config.zone_scroll(0.95, 2.0) - 1.0).abs() < 1e-6);
+        assert!((config.zone_scroll(0.05, -3.0) - 0.0).abs() < 1e-6);
+    }
+
+    /// 区域矩形永远落在屏幕里，长宽也不会缩成一条线。
+    #[test]
+    fn wheel_zone_rect_stays_on_screen() {
+        let zone = WheelZone {
+            rect_x: 0.9,
+            rect_y: -0.2,
+            rect_w: 0.5,
+            rect_h: 0.001,
+            ..Default::default()
+        };
+        let (x, y, w, h) = zone.rect();
+        assert!((x + w - 1.0).abs() < 1e-6, "右边不能越界");
+        assert_eq!(y, 0.0);
+        assert!(h >= WheelZone::MIN_RECT);
+    }
+
+    /// 区域模式可以有好几块，每块各自调什么；老配置（只有四个数）还是当一块用。
+    #[test]
+    fn wheel_zone_regions_start_from_the_legacy_rect_and_grow() {
+        let mut zone = WheelZone::default();
+        zone.mode = WheelZoneMode::Rect;
+        zone.target = WheelZoneTarget::Volume;
+        zone.rect_x = 0.6;
+        zone.rect_y = 0.1;
+        zone.rect_w = 0.2;
+        zone.rect_h = 0.3;
+
+        // 没有 `rects` 时就是老那一块，目标跟着 `target`。
+        let regions = zone.regions();
+        assert_eq!(regions.len(), 1);
+        assert!((regions[0].x - 0.6).abs() < 1e-6);
+        assert_eq!(regions[0].target, WheelZoneTarget::Volume);
+
+        // 加一块：老那块先搬进 `rects`，新块错开摆在别处。
+        let added = zone.add_region();
+        assert_eq!(added, 1);
+        assert_eq!(zone.rects.len(), 2);
+        assert!((zone.rects[0].x - 0.6).abs() < 1e-6, "老那块的位置不能丢");
+        assert_ne!(zone.rects[1].x, zone.rects[0].x);
+
+        // 第二块改成亮度：两块各调各的，`uses` 两个都算。
+        let mut second = zone.rects[1];
+        second.target = WheelZoneTarget::Brightness;
+        zone.set_region(1, second);
+        assert_eq!(zone.regions()[1].target, WheelZoneTarget::Brightness);
+        assert_eq!(zone.regions()[0].target, WheelZoneTarget::Volume);
+        assert!(zone.uses(WheelZoneTarget::Volume));
+        assert!(zone.uses(WheelZoneTarget::Brightness));
+
+        // 只剩一块时不给删（删光了热区就没了）。
+        assert!(zone.remove_region(0));
+        assert_eq!(zone.rects.len(), 1);
+        assert!(!zone.remove_region(0));
+
+        // 落盘再读回来，多块 + 各自的目标都不丢。
+        let json = serde_json::to_string(&zone).unwrap();
+        let back: WheelZone = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rects, zone.rects);
+    }
 
     /// 草稿模式：改动只留内存，`commit_draft` 才落盘；丢弃能退回参照点。
     #[test]
@@ -8358,6 +9379,7 @@ mod tests {
             VolumeGesture::AppHoverScroll,
             VolumeGesture::AppDrag,
             VolumeGesture::AppHotkey,
+            VolumeGesture::ZoneScroll,
         ] {
             assert!(config.unmute.allows(gesture, true), "{gesture:?} 增大");
             assert!(config.unmute.allows(gesture, false), "{gesture:?} 减小");
@@ -8399,6 +9421,7 @@ mod tests {
             VolumeGesture::AppHoverScroll,
             VolumeGesture::AppDrag,
             VolumeGesture::AppHotkey,
+            VolumeGesture::ZoneScroll,
         ] {
             assert!(!config.unmute.allows(gesture, true));
             assert!(!config.unmute.allows(gesture, false));
@@ -9416,7 +10439,7 @@ mod tests {
         assert_eq!(VolumeSoundStyle::from_index(99), VolumeSoundStyle::Click);
     }
 
-    /// 三种手势的范围映射：快捷键 / 滚轮 / 拖拽各管各的，应用那几种跟主设备同类。
+    /// 四种手势的范围映射：快捷键 / 滚轮 / 拖拽 / 热区各管各的，应用那几种跟主设备同类。
     #[test]
     fn volume_sound_scope_maps_every_gesture() {
         let mut sound = VolumeSoundConfig {
@@ -9424,24 +10447,32 @@ mod tests {
             on_hotkey: true,
             on_wheel: false,
             on_drag: false,
+            on_zone: false,
             ..Default::default()
         };
         assert!(sound.covers(VolumeGesture::Hotkey));
         assert!(sound.covers(VolumeGesture::AppHotkey));
         assert!(!sound.covers(VolumeGesture::HoverScroll));
         assert!(!sound.covers(VolumeGesture::AppDrag));
+        assert!(!sound.covers(VolumeGesture::ZoneScroll));
 
+        // 滚轮开着也不带热区：两格是分开的。
         sound.on_wheel = true;
         assert!(sound.covers(VolumeGesture::TrayScroll));
         assert!(sound.covers(VolumeGesture::AppHoverScroll));
         assert!(!sound.covers(VolumeGesture::Drag));
+        assert!(!sound.covers(VolumeGesture::ZoneScroll));
 
         sound.on_drag = true;
         assert!(sound.covers(VolumeGesture::Drag));
         assert!(sound.covers(VolumeGesture::AppDrag));
 
+        sound.on_zone = true;
+        assert!(sound.covers(VolumeGesture::ZoneScroll));
+
         sound.enabled = false;
         assert!(!sound.covers(VolumeGesture::Hotkey));
+        assert!(!sound.covers(VolumeGesture::ZoneScroll));
     }
 
     #[test]

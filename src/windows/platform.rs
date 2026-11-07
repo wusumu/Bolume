@@ -166,6 +166,35 @@ pub fn configure_osd(window: &Window) {
     }
 }
 
+/// 开关窗口的系统阴影。
+///
+/// Windows 11 是**按「圆角窗口」给窗口画那圈阴影的**（实测：`DWMWA_WINDOW_CORNER_PREFERENCE`
+/// 设成 `DONOTROUND` 阴影立刻消失，设回 `ROUND` 又回来；`DWMWA_NCRENDERING_POLICY`
+/// 和 `WS_EX_LAYERED` 都动不了它）。面板的四角是**自己画的**，DWM 那个圆角设置只影响
+/// 阴影，所以关掉阴影不会改变外观。
+///
+/// 用途：跨屏那一段「窗口不动、只挪画面」的动画里，阴影是钉在窗口矩形上的 ——
+/// 内容还在窗外时它已经孤零零地出现在终位，看着就是一个空阴影框慢慢被内容填满。
+/// 动画期间关掉、画面到位再打开，阴影就和面板一起出现了。
+pub fn set_window_shadow(window: &Window, on: bool) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    let corner = if on {
+        DWMWCP_ROUND
+    } else {
+        DWMWCP_DONOTROUND
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const _ as _,
+            std::mem::size_of_val(&corner) as u32,
+        );
+    }
+}
+
 /// 光标是不是正压在这个窗口上（两边都用物理像素，不用换算缩放）。
 ///
 /// gpui 的 `on_hover` 只在「鼠标移动」时更新：光标直接划出窗口时平台只发
@@ -307,6 +336,64 @@ pub fn set_visible(window: &Window, visible: bool) {
     }
 }
 
+/// 收起终点：真把窗口藏起来（`SW_HIDE`），而不是「挪到屏幕外」或「压成全透明」。
+///
+/// 后两种做法只是**看不见**：窗口的 `WS_VISIBLE` 一直亮着、矩形和一个固定坐标绑在一起。
+/// 屏幕摆放一变（改主屏、插拔显示器、把某台屏挪到另一侧），那块「屏幕外」的坐标
+/// 就可能正好落进某块真实屏幕 —— 面板原地现身，看着就像「隐藏是假的」。
+/// 真隐藏和屏幕布局彻底无关。
+///
+/// 再 `SW_SHOWNA` 出来不会补 DWM 的出现淡入：`configure_popup` / `configure_osd`
+/// 都设了 `DWMWA_TRANSITIONS_FORCEDISABLED`。隐藏期间 gpui 也不重绘
+/// （vendored 里那两处 `IsWindowVisible` 补丁），重新显示后第一个 vsync 会把它置脏。
+pub fn hide_window(window: &Window) {
+    set_visible(window, false);
+}
+
+/// 把本进程的系统定时器精度提到 1ms，drop 时还回去。
+///
+/// Windows 的线程池定时器精度跟着系统定时器走，默认 **15.6ms** —— 不论请求 4ms
+/// 还是 1ms，实测都是每 15～16ms 才醒一次（`pump_content_slide` 的 trace 里 dt
+/// 清一色 15.x）。「整扇窗挪」那条动画走独立线程 + `DwmFlush`，帧率跟着屏幕刷新
+/// 走；「窗口不动、只挪画面」这一档只能靠定时器推进，于是同一段动画在跨屏时看着
+/// 就是一格一格（165Hz 屏上最多 60fps）。
+///
+/// `timeBeginPeriod` 在 Windows 10 2004 之后是**进程级**的（不再拖慢整机），
+/// 只在动画那两三百毫秒里开着，演完立刻还回去。
+///
+/// 计数而不是「有开就关」：收起演到一半又被弹出时，旧循环的 guard 比新循环的晚
+/// 掉一拍 —— 各自一对一地 `timeEndPeriod` 会把还没演完的那一段的精度提前收走，
+/// 这里等最后一个 guard 走了才真的还原。
+pub struct TimerPrecision;
+
+static PRECISE_HOLDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for TimerPrecision {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Media::timeEndPeriod;
+
+        if PRECISE_HOLDERS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            unsafe {
+                timeEndPeriod(1);
+            }
+        }
+    }
+}
+
+/// 临时把定时器精度提到 1ms（返回的 guard 活着期间有效）。
+pub fn precise_timers() -> TimerPrecision {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Media::timeBeginPeriod;
+
+    if PRECISE_HOLDERS.fetch_add(1, Ordering::SeqCst) == 0 {
+        unsafe {
+            timeBeginPeriod(1);
+        }
+    }
+    TimerPrecision
+}
+
 /// 滑动动画的方向：滑进来，还是滑出去。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlideMode {
@@ -425,41 +512,14 @@ pub fn run_slide(window: &Window, run: SlideRun) -> SlideHandle {
     let flag = done.clone();
 
     std::thread::spawn(move || {
-        use windows::Win32::Foundation::COLORREF;
         use windows::Win32::Graphics::Dwm::DwmFlush;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
-        };
 
         let hwnd = HWND(raw as *mut _);
-        unsafe {
-            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            if run.fade_ms > 0.0 {
-                // 要淡入才挂分层属性，后面每帧只改 alpha。
-                if style & WS_EX_LAYERED.0 as isize == 0 {
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
-                }
-            } else if style & WS_EX_LAYERED.0 as isize != 0 {
-                // 纯位移：把分层属性摘掉。带着它，DWM 会把这个「刚显示出来的分层
-                // 窗口」当成一次出现，补一段约 200ms 的淡入 —— 动画里格子一直
-                // 半透明，就是「后面那层半透明」的真身。摘掉之后窗口就是不透明的。
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
-                // 改扩展样式必须再来一次 FRAMECHANGED 才真的生效。
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_FRAMECHANGED
-                        | SWP_NOMOVE
-                        | SWP_NOSIZE
-                        | SWP_NOZORDER
-                        | SWP_NOACTIVATE
-                        | SWP_NOOWNERZORDER,
-                );
-            }
+        // 纯位移：把分层属性摘掉。带着它，DWM 会把这个「刚显示出来的分层窗口」
+        // 当成一次出现，补一段约 200ms 的淡入 —— 动画里卡片一直半透明，看起来
+        // 就像后面垫了一层。要淡入的那一路由 `set_window_alpha` 自己挂回去。
+        if run.fade_ms <= 0.0 {
+            unsafe { set_window_layered(hwnd, false) };
         }
 
         let place = |offset: f32, alpha: f32| {
@@ -477,11 +537,7 @@ pub fn run_slide(window: &Window, run: SlideRun) -> SlideHandle {
                 );
                 // 只有真的要淡入淡出（`fade_ms > 0`）才碰分层 alpha。
                 if run.fade_ms > 0.0 {
-                    let byte = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), byte, LWA_ALPHA);
-                    // 淡出收尾那一帧 alpha 到 0：窗口从此看不见，可它还留在屏幕上
-                    // （这一档本来就不挪窗口）—— 不挂穿透就会把那块地方的点击吃掉。
-                    sync_click_through(hwnd, byte);
+                    set_window_alpha(hwnd, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8);
                 }
             }
         };
@@ -537,7 +593,7 @@ pub fn run_slide(window: &Window, run: SlideRun) -> SlideHandle {
             0.0
         };
         alpha.store(last_alpha.to_bits(), Ordering::SeqCst);
-        place(last, if run.mode == SlideMode::Enter { run.opacity } else { 0.0 });
+        place(last, last_alpha * run.opacity);
         flag.store(true, Ordering::SeqCst);
     });
 
@@ -874,28 +930,75 @@ unsafe fn sync_click_through(hwnd: HWND, alpha: u8) {
     apply_click_through(hwnd, alpha == 0 || hollow);
 }
 
+/// 挂上 / 摘掉 `WS_EX_LAYERED`（改完必须再来一次 FRAMECHANGED 才真的生效）。
+///
+/// 分层窗口和不分层窗口在 DWM 里走两条合成路径：**挂着的窗口每次显示都会被
+/// 当成「一次出现」**，DWM 补一段约 200ms 的淡入 —— 滑入 / 滑出的全程卡片都
+/// 是半透明的，看起来就像后面垫了一层。纯位移的动画必须把它摘掉。
+unsafe fn set_window_layered(hwnd: HWND, layered: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED;
+
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let has = style & WS_EX_LAYERED.0 as isize != 0;
+    if has == layered {
+        return;
+    }
+    let next = if layered {
+        style | WS_EX_LAYERED.0 as isize
+    } else {
+        style & !(WS_EX_LAYERED.0 as isize)
+    };
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED
+            | SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOZORDER
+            | SWP_NOACTIVATE
+            | SWP_NOOWNERZORDER,
+    );
+}
+
+/// 改整窗不透明度（0 ~ 255 的字节）。
+///
+/// **满不透明就摘掉分层属性**：`alpha = 255` 的窗口和不分层窗口画面上一样，
+/// 但分层那一路会被 DWM 补出现淡入（见 [`set_window_layered`]）。
+/// 所以不透明的窗口一律不留 `WS_EX_LAYERED`，只有真的半透明（用户把界面
+/// 不透明度调低、或者正在淡入淡出）才挂着它。
+unsafe fn set_window_alpha(hwnd: HWND, alpha: u8) {
+    use windows::Win32::{
+        Foundation::COLORREF,
+        UI::WindowsAndMessaging::{LWA_ALPHA, SetLayeredWindowAttributes},
+    };
+
+    if alpha >= 255 {
+        set_window_layered(hwnd, false);
+    } else {
+        set_window_layered(hwnd, true);
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+    }
+    // 全透明 = 看不见，却还占着那块屏幕：不挂穿透的话点击会被它吃掉。
+    sync_click_through(hwnd, alpha);
+}
+
 /// 整个窗口的不透明度（0.0 ~ 1.0），照搬 QcClip 的 `set_window_opacity`。
 ///
 /// 弹出时必须先把窗口设成全透明再 `ShowWindow`：窗口一露头，DWM 会立刻画出
 /// 圆角框和一圈阴影，此时内容还没提交，看着就是「先闪一个透明的空框」。
+/// （全透明那一路挂的是分层窗口，所以这两个动作要一起看：[`set_window_alpha`]。）
 pub fn set_opacity(window: &Window, opacity: f32) {
-    use windows::Win32::{
-        Foundation::COLORREF,
-        UI::WindowsAndMessaging::{LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED},
-    };
-
     let Some(hwnd) = hwnd_of(window) else {
         return;
     };
     let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
     unsafe {
-        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        if ex_style & WS_EX_LAYERED.0 as isize == 0 {
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED.0 as isize);
-        }
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-        // 全透明 = 看不见，却还占着那块屏幕：不挂穿透的话点击会被它吃掉。
-        sync_click_through(hwnd, alpha);
+        set_window_alpha(hwnd, alpha);
     }
 }
 

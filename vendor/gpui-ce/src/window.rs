@@ -2420,6 +2420,15 @@ impl Window {
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
 
+    /// 把整块画面平移多少（逻辑像素，正数向右/向下），窗口自身不动。
+    ///
+    /// 走合成器，不重绘、不重新布局。挪出窗口的那部分被窗口裁掉 —— 这就是
+    /// 「画面从屏幕边滑进来」的正确做法：窗口始终留在自己那块屏里，多屏时
+    /// 不会把动画画到邻屏上（`SetWindowRgn` 对 DirectComposition 的内容无效）。
+    pub fn set_content_offset(&self, x: f32, y: f32) {
+        self.platform_window.set_content_offset(x, y);
+    }
+
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
     ///
     /// Tests have no platform frame loop, so this simulates the delivery of the
